@@ -2,6 +2,7 @@
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
 anyio>=4.0.0
+windows-curses>=2.4.0; sys_platform == "win32"
 
 # Week 2: Cython matching-engine build dependency
 Cython>=3.0.0
