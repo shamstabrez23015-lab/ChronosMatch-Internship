@@ -13,6 +13,7 @@ from chronos.protocol import (
     unpack_order_raw,
 )
 from chronos.ring_buffer import MmapRingBuffer, RingBufferFullError
+from chronos.dashboard import DashboardConfig, TerminalDashboard
 
 __all__ = [
     "ORDER_SIZE",
@@ -27,4 +28,6 @@ __all__ = [
     "unpack_order_raw",
     "MmapRingBuffer",
     "RingBufferFullError",
+    "DashboardConfig",
+    "TerminalDashboard",
 ]
