@@ -38,7 +38,7 @@ def main() -> None:
     dashboard = TerminalDashboard(config=config)
 
     if args.non_interactive:
-        for line in dashboard.get_display_lines(rows=24, cols=80):
+        for line in dashboard.get_display_lines(rows=40, cols=100):
             print(line)
         return
 
