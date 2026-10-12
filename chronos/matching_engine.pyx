@@ -1,14 +1,20 @@
 # cython: language_level=3
-"""ChronosMatch Cython Matching Engine Foundation.
+"""ChronosMatch Cython Matching Engine Foundation & Limit Order Book.
 
-Provides a C-level order representation and a minimal matching-engine
-skeleton.  This is the Week 2, Day 1 foundation — no order-book sorting,
-price-time priority, trade execution, or partial-fill logic is included yet.
+Provides a C-level order representation and Limit Order Book data structures
+storing BUY (bid) and SELL (ask) orders separately.
+
+Week 2, Day 2:
+- BUY and SELL order storage (bids and asks).
+- Deterministic arrival sequence preservation.
+- Full inspection and count APIs for bids and asks.
+- Safe order validation preventing corrupt book states.
+- Clean order-book initialization and reset.
 
 Price Representation
 --------------------
 The Week 1 binary protocol stores prices as ``double`` (64-bit IEEE 754
-float).  Floating-point equality/comparison is unsafe for matching, so this
+float). Floating-point equality/comparison is unsafe for matching, so this
 module converts prices to **integer cent ticks**::
 
     price_cents = <long long>round(price_float * 100.0)
@@ -23,16 +29,28 @@ Reuses the Week 1 ``Side`` convention:
 * ``2`` → SELL
 """
 
+# ---------------------------------------------------------------------------
+# C-level and Python-level constants
+# ---------------------------------------------------------------------------
+DEF _SIDE_BUY  = 1
+DEF _SIDE_SELL = 2
+
+SIDE_BUY = 1
+SIDE_SELL = 2
+
 
 # ---------------------------------------------------------------------------
-# C-level constants
+# Helper: callable list wrapper for dual property/method access
 # ---------------------------------------------------------------------------
-DEF SIDE_BUY  = 1
-DEF SIDE_SELL = 2
+class _OrderListView(list):
+    """List view wrapper supporting both list operations and callable syntax."""
+
+    def __call__(self):
+        return self
 
 
 # ---------------------------------------------------------------------------
-# C-level order struct (kept as a Cython extension type for convenience)
+# C-level order struct (Cython extension type)
 # ---------------------------------------------------------------------------
 cdef class COrder:
     """Statically typed order representation for the matching engine.
@@ -54,6 +72,8 @@ cdef class COrder:
         Number of shares/contracts (must be > 0).
     timestamp_ns : unsigned long long
         Arrival timestamp in nanoseconds (or sequence number).
+    sequence_num : unsigned long long
+        Deterministic arrival sequence assigned by the matching engine.
     """
 
     cdef public unsigned long long order_id
@@ -61,6 +81,7 @@ cdef class COrder:
     cdef public long long price_cents
     cdef public unsigned int quantity
     cdef public unsigned long long timestamp_ns
+    cdef public unsigned long long sequence_num
 
     def __init__(
         self,
@@ -69,15 +90,22 @@ cdef class COrder:
         long long price_cents,
         unsigned int quantity,
         unsigned long long timestamp_ns,
+        unsigned long long sequence_num=0,
     ):
         self.order_id = order_id
         self.side = side
         self.price_cents = price_cents
         self.quantity = quantity
         self.timestamp_ns = timestamp_ns
+        self.sequence_num = sequence_num
+
+    @property
+    def price(self):
+        """Return the dollar price as a float."""
+        return self.price_cents / 100.0
 
     def __repr__(self):
-        side_str = "BUY" if self.side == SIDE_BUY else "SELL"
+        side_str = "BUY" if self.side == _SIDE_BUY else "SELL"
         return (
             f"COrder(id={self.order_id}, side={side_str}, "
             f"price_cents={self.price_cents}, qty={self.quantity}, "
@@ -120,34 +148,42 @@ cpdef long long price_to_cents(double price):
 
 
 # ---------------------------------------------------------------------------
-# Matching-engine skeleton
+# Limit Order Book & Matching Engine
 # ---------------------------------------------------------------------------
 cdef class MatchingEngine:
-    """Minimal matching-engine skeleton (Week 2, Day 1).
+    """Cython Matching Engine and Limit Order Book (Week 2, Day 2).
 
     Capabilities
     ------------
-    * Initialise an empty engine.
-    * Report readiness/status.
-    * Accept **one validated order** at a time and return an acknowledgement.
+    * Initialise an empty engine and order book.
+    * Separate storage for BUY orders (bids) and SELL orders (asks).
+    * Deterministic arrival sequence preservation.
+    * Accept and validate orders.
+    * Full inspection and order-counting for bids and asks.
+    * Clear and re-initialize order book state.
 
-    Not yet implemented
-    -------------------
-    * Order-book data structures (sorted buy/sell sides).
-    * Price-time priority matching.
+    Not yet implemented (scheduled for later working days)
+    ------------------------------------------------------
+    * Price-time priority sorting.
     * Trade execution / partial fills.
-    * Ring-buffer integration.
+    * Ring-buffer zero-copy IPC integration.
     """
 
     cdef public unsigned long long _order_count
     cdef public bint _ready
+    cdef list _bids
+    cdef list _asks
+    cdef public unsigned long long _sequence_counter
 
     def __init__(self):
-        """Initialise an empty matching engine."""
+        """Initialise an empty matching engine with an empty order book."""
         self._order_count = 0
         self._ready = True
+        self._bids = []
+        self._asks = []
+        self._sequence_counter = 0
 
-    # ---- status -----------------------------------------------------------
+    # ---- status & readiness -----------------------------------------------
 
     cpdef bint is_ready(self):
         """Return ``True`` if the engine is initialised and ready."""
@@ -164,7 +200,69 @@ cdef class MatchingEngine:
             "order_count": self._order_count,
         }
 
-    # ---- order submission -------------------------------------------------
+    # ---- order book initialization / reset --------------------------------
+
+    cpdef void clear(self):
+        """Reset the order book to an empty state."""
+        self._bids = []
+        self._asks = []
+        self._order_count = 0
+        self._sequence_counter = 0
+        self._ready = True
+
+    cpdef void reset(self):
+        """Alias for ``clear()``."""
+        self.clear()
+
+    cpdef void init_order_book(self):
+        """Initialise an empty order book."""
+        self.clear()
+
+    # ---- order counts -----------------------------------------------------
+
+    cpdef unsigned long long bid_count(self):
+        """Return the number of stored BUY orders (bids)."""
+        return len(self._bids)
+
+    cpdef unsigned long long ask_count(self):
+        """Return the number of stored SELL orders (asks)."""
+        return len(self._asks)
+
+    cpdef unsigned long long get_bid_count(self):
+        """Return the number of stored BUY orders (bids)."""
+        return len(self._bids)
+
+    cpdef unsigned long long get_ask_count(self):
+        """Return the number of stored SELL orders (asks)."""
+        return len(self._asks)
+
+    # ---- order retrieval / inspection -------------------------------------
+
+    cpdef list get_bids(self):
+        """Return a list copy of currently stored BUY orders in arrival order."""
+        return list(self._bids)
+
+    cpdef list get_asks(self):
+        """Return a list copy of currently stored SELL orders in arrival order."""
+        return list(self._asks)
+
+    cpdef list get_buy_orders(self):
+        """Alias for ``get_bids()``."""
+        return list(self._bids)
+
+    cpdef list get_sell_orders(self):
+        """Alias for ``get_asks()``."""
+        return list(self._asks)
+
+    property bids:
+        def __get__(self):
+            return _OrderListView(self._bids)
+
+    property asks:
+        def __get__(self):
+            return _OrderListView(self._asks)
+
+    # ---- order submission & storage ---------------------------------------
 
     cpdef COrder submit_order(
         self,
@@ -174,7 +272,7 @@ cdef class MatchingEngine:
         unsigned int quantity,
         unsigned long long timestamp_ns,
     ):
-        """Validate and accept a single order.
+        """Validate and accept a single order into the order book.
 
         Parameters
         ----------
@@ -192,7 +290,7 @@ cdef class MatchingEngine:
         Returns
         -------
         COrder
-            The accepted order (with ``price_cents`` set).
+            The accepted order stored in the order book.
 
         Raises
         ------
@@ -200,9 +298,9 @@ cdef class MatchingEngine:
             If any field fails validation.
         """
         # --- validation ---
-        if side != SIDE_BUY and side != SIDE_SELL:
+        if side != _SIDE_BUY and side != _SIDE_SELL:
             raise ValueError(
-                f"Invalid side {side}: must be {SIDE_BUY} (BUY) or {SIDE_SELL} (SELL)"
+                f"Invalid side {side}: must be {_SIDE_BUY} (BUY) or {_SIDE_SELL} (SELL)"
             )
 
         if price <= 0.0:
@@ -216,6 +314,7 @@ cdef class MatchingEngine:
             )
 
         cdef long long cents = price_to_cents(price)
+        self._sequence_counter += 1
 
         cdef COrder order = COrder(
             order_id=order_id,
@@ -223,7 +322,138 @@ cdef class MatchingEngine:
             price_cents=cents,
             quantity=quantity,
             timestamp_ns=timestamp_ns,
+            sequence_num=self._sequence_counter,
         )
+
+        if side == _SIDE_BUY:
+            self._bids.append(order)
+        elif side == _SIDE_SELL:
+            self._asks.append(order)
 
         self._order_count += 1
         return order
+
+    def add_buy_order(self, *args, **kwargs):
+        """Validate and add a BUY order to bid storage.
+
+        Can be called with ``(order_id, price, quantity[, timestamp_ns])``
+        or with an existing ``COrder`` instance.
+        """
+        cdef COrder ord_obj
+        cdef unsigned long long order_id
+        cdef double price
+        cdef unsigned int quantity
+        cdef unsigned long long timestamp_ns = 0
+
+        if len(args) == 1 and isinstance(args[0], COrder) and not kwargs:
+            ord_obj = <COrder>args[0]
+            if ord_obj.side != _SIDE_BUY:
+                raise ValueError(f"Invalid side {ord_obj.side}: expected BUY ({_SIDE_BUY})")
+            if ord_obj.price_cents <= 0:
+                raise ValueError(f"Invalid price_cents {ord_obj.price_cents}: must be positive")
+            if ord_obj.quantity == 0:
+                raise ValueError("Invalid quantity 0: must be positive")
+            self._sequence_counter += 1
+            ord_obj.sequence_num = self._sequence_counter
+            self._bids.append(ord_obj)
+            self._order_count += 1
+            return ord_obj
+
+        if "order_id" in kwargs:
+            if "side" in kwargs and kwargs["side"] != _SIDE_BUY:
+                raise ValueError(f"Invalid side {kwargs['side']}: expected BUY ({_SIDE_BUY})")
+            order_id = kwargs["order_id"]
+            price = kwargs["price"]
+            quantity = kwargs["quantity"]
+            timestamp_ns = kwargs.get("timestamp_ns", 0)
+        elif len(args) >= 3:
+            # Handle possible positional (order_id, side, price, quantity[, ts])
+            if len(args) >= 4 and args[1] == _SIDE_BUY:
+                order_id = args[0]
+                price = args[2]
+                quantity = args[3]
+                if len(args) >= 5:
+                    timestamp_ns = args[4]
+            else:
+                order_id = args[0]
+                price = args[1]
+                quantity = args[2]
+                if len(args) >= 4:
+                    timestamp_ns = args[3]
+        else:
+            raise ValueError(
+                "add_buy_order requires (order_id, price, quantity[, timestamp_ns]) or a COrder"
+            )
+
+        return self.submit_order(order_id, _SIDE_BUY, price, quantity, timestamp_ns)
+
+    def add_sell_order(self, *args, **kwargs):
+        """Validate and add a SELL order to ask storage.
+
+        Can be called with ``(order_id, price, quantity[, timestamp_ns])``
+        or with an existing ``COrder`` instance.
+        """
+        cdef COrder ord_obj
+        cdef unsigned long long order_id
+        cdef double price
+        cdef unsigned int quantity
+        cdef unsigned long long timestamp_ns = 0
+
+        if len(args) == 1 and isinstance(args[0], COrder) and not kwargs:
+            ord_obj = <COrder>args[0]
+            if ord_obj.side != _SIDE_SELL:
+                raise ValueError(f"Invalid side {ord_obj.side}: expected SELL ({_SIDE_SELL})")
+            if ord_obj.price_cents <= 0:
+                raise ValueError(f"Invalid price_cents {ord_obj.price_cents}: must be positive")
+            if ord_obj.quantity == 0:
+                raise ValueError("Invalid quantity 0: must be positive")
+            self._sequence_counter += 1
+            ord_obj.sequence_num = self._sequence_counter
+            self._asks.append(ord_obj)
+            self._order_count += 1
+            return ord_obj
+
+        if "order_id" in kwargs:
+            if "side" in kwargs and kwargs["side"] != _SIDE_SELL:
+                raise ValueError(f"Invalid side {kwargs['side']}: expected SELL ({_SIDE_SELL})")
+            order_id = kwargs["order_id"]
+            price = kwargs["price"]
+            quantity = kwargs["quantity"]
+            timestamp_ns = kwargs.get("timestamp_ns", 0)
+        elif len(args) >= 3:
+            # Handle possible positional (order_id, side, price, quantity[, ts])
+            if len(args) >= 4 and args[1] == _SIDE_SELL:
+                order_id = args[0]
+                price = args[2]
+                quantity = args[3]
+                if len(args) >= 5:
+                    timestamp_ns = args[4]
+            else:
+                order_id = args[0]
+                price = args[1]
+                quantity = args[2]
+                if len(args) >= 4:
+                    timestamp_ns = args[3]
+        else:
+            raise ValueError(
+                "add_sell_order requires (order_id, price, quantity[, timestamp_ns]) or a COrder"
+            )
+
+        return self.submit_order(order_id, _SIDE_SELL, price, quantity, timestamp_ns)
+
+    def add_order(self, *args, **kwargs):
+        """Add an order (COrder or parameters) to the appropriate storage side."""
+        cdef COrder ord_obj
+        if len(args) == 1 and isinstance(args[0], COrder) and not kwargs:
+            ord_obj = <COrder>args[0]
+            if ord_obj.side == _SIDE_BUY:
+                return self.add_buy_order(ord_obj)
+            elif ord_obj.side == _SIDE_SELL:
+                return self.add_sell_order(ord_obj)
+            else:
+                raise ValueError(f"Invalid side {ord_obj.side}")
+        return self.submit_order(*args, **kwargs)
+
+
+# Module-level alias for convenience and alternative naming conventions
+OrderBook = MatchingEngine
