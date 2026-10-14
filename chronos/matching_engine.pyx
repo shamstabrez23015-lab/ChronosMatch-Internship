@@ -1,8 +1,8 @@
 # cython: language_level=3
 """ChronosMatch Cython Matching Engine Foundation & Limit Order Book.
 
-Provides a C-level order representation and Limit Order Book data structures
-storing BUY (bid) and SELL (ask) orders separately.
+Provides a C-level order representation, Limit Order Book data structures,
+and Price Priority inspection.
 
 Week 2, Day 2:
 - BUY and SELL order storage (bids and asks).
@@ -10,6 +10,14 @@ Week 2, Day 2:
 - Full inspection and count APIs for bids and asks.
 - Safe order validation preventing corrupt book states.
 - Clean order-book initialization and reset.
+
+Week 2, Day 3:
+- Price Priority: Highest BUY price has highest priority.
+- Price Priority: Lowest SELL price has highest priority.
+- Price Priority inspection methods for best BUY/SELL orders and prices.
+- Deterministic arrival preservation for equal prices.
+- Safe crossing-price detection using integer cent comparisons (best BUY >= best SELL).
+- Full preservation of order data, arrival order, and book state.
 
 Price Representation
 --------------------
@@ -151,7 +159,7 @@ cpdef long long price_to_cents(double price):
 # Limit Order Book & Matching Engine
 # ---------------------------------------------------------------------------
 cdef class MatchingEngine:
-    """Cython Matching Engine and Limit Order Book (Week 2, Day 2).
+    """Cython Matching Engine and Limit Order Book (Week 2, Day 3).
 
     Capabilities
     ------------
@@ -160,12 +168,15 @@ cdef class MatchingEngine:
     * Deterministic arrival sequence preservation.
     * Accept and validate orders.
     * Full inspection and order-counting for bids and asks.
+    * Price priority: Identify highest BUY and lowest SELL orders and prices.
+    * Deterministic arrival preservation for equal prices.
+    * Crossing-price detection (best BUY price >= best SELL price).
     * Clear and re-initialize order book state.
 
     Not yet implemented (scheduled for later working days)
     ------------------------------------------------------
-    * Price-time priority sorting.
     * Trade execution / partial fills.
+    * Complete FIFO order matching.
     * Ring-buffer zero-copy IPC integration.
     """
 
@@ -261,6 +272,169 @@ cdef class MatchingEngine:
     property asks:
         def __get__(self):
             return _OrderListView(self._asks)
+
+    # ---- price priority & best order retrieval (Week 2, Day 3) ------------
+
+    cpdef COrder get_best_buy_order(self):
+        """Return the BUY order with the highest price (highest bid).
+
+        If multiple orders share the highest price, the one that arrived
+        earliest (deterministic FIFO arrival preservation) is returned.
+        Returns ``None`` if the BUY book is empty.
+        """
+        if not self._bids:
+            return None
+        cdef COrder best = <COrder>self._bids[0]
+        cdef COrder current
+        cdef Py_ssize_t i, n = len(self._bids)
+        for i in range(1, n):
+            current = <COrder>self._bids[i]
+            if current.price_cents > best.price_cents:
+                best = current
+        return best
+
+    cpdef COrder get_best_sell_order(self):
+        """Return the SELL order with the lowest price (lowest ask).
+
+        If multiple orders share the lowest price, the one that arrived
+        earliest (deterministic FIFO arrival preservation) is returned.
+        Returns ``None`` if the SELL book is empty.
+        """
+        if not self._asks:
+            return None
+        cdef COrder best = <COrder>self._asks[0]
+        cdef COrder current
+        cdef Py_ssize_t i, n = len(self._asks)
+        for i in range(1, n):
+            current = <COrder>self._asks[i]
+            if current.price_cents < best.price_cents:
+                best = current
+        return best
+
+    # Aliases for best order retrieval
+    cpdef COrder get_best_bid(self):
+        """Alias for ``get_best_buy_order()``."""
+        return self.get_best_buy_order()
+
+    cpdef COrder get_best_bid_order(self):
+        """Alias for ``get_best_buy_order()``."""
+        return self.get_best_buy_order()
+
+    cpdef COrder best_buy_order(self):
+        """Alias for ``get_best_buy_order()``."""
+        return self.get_best_buy_order()
+
+    cpdef COrder best_bid(self):
+        """Alias for ``get_best_buy_order()``."""
+        return self.get_best_buy_order()
+
+    cpdef COrder get_best_ask(self):
+        """Alias for ``get_best_sell_order()``."""
+        return self.get_best_sell_order()
+
+    cpdef COrder get_best_ask_order(self):
+        """Alias for ``get_best_sell_order()``."""
+        return self.get_best_sell_order()
+
+    cpdef COrder best_sell_order(self):
+        """Alias for ``get_best_sell_order()``."""
+        return self.get_best_sell_order()
+
+    cpdef COrder best_ask(self):
+        """Alias for ``get_best_sell_order()``."""
+        return self.get_best_sell_order()
+
+    # Best price inspection (dollar float)
+    cpdef object get_best_buy_price(self):
+        """Return the highest BUY price as a float, or ``None`` if empty."""
+        cdef COrder best = self.get_best_buy_order()
+        if best is None:
+            return None
+        return best.price
+
+    cpdef object get_best_bid_price(self):
+        """Alias for ``get_best_buy_price()``."""
+        return self.get_best_buy_price()
+
+    cpdef object best_buy_price(self):
+        """Alias for ``get_best_buy_price()``."""
+        return self.get_best_buy_price()
+
+    cpdef object best_bid_price(self):
+        """Alias for ``get_best_buy_price()``."""
+        return self.get_best_buy_price()
+
+    cpdef object get_best_sell_price(self):
+        """Return the lowest SELL price as a float, or ``None`` if empty."""
+        cdef COrder best = self.get_best_sell_order()
+        if best is None:
+            return None
+        return best.price
+
+    cpdef object get_best_ask_price(self):
+        """Alias for ``get_best_sell_price()``."""
+        return self.get_best_sell_price()
+
+    cpdef object best_sell_price(self):
+        """Alias for ``get_best_sell_price()``."""
+        return self.get_best_sell_price()
+
+    cpdef object best_ask_price(self):
+        """Alias for ``get_best_sell_price()``."""
+        return self.get_best_sell_price()
+
+    # Best price inspection (integer cents)
+    cpdef object get_best_buy_price_cents(self):
+        """Return the highest BUY price in integer cents, or ``None`` if empty."""
+        cdef COrder best = self.get_best_buy_order()
+        if best is None:
+            return None
+        return best.price_cents
+
+    cpdef object get_best_bid_price_cents(self):
+        """Alias for ``get_best_buy_price_cents()``."""
+        return self.get_best_buy_price_cents()
+
+    cpdef object get_best_sell_price_cents(self):
+        """Return the lowest SELL price in integer cents, or ``None`` if empty."""
+        cdef COrder best = self.get_best_sell_order()
+        if best is None:
+            return None
+        return best.price_cents
+
+    cpdef object get_best_ask_price_cents(self):
+        """Alias for ``get_best_sell_price_cents()``."""
+        return self.get_best_sell_price_cents()
+
+    # Crossing price detection
+    cpdef bint has_crossing_prices(self):
+        """Return True if highest BUY price >= lowest SELL price.
+
+        Returns False if either book side is empty, or if best BUY < best SELL.
+        """
+        if not self._bids or not self._asks:
+            return False
+        cdef COrder best_buy = self.get_best_buy_order()
+        cdef COrder best_sell = self.get_best_sell_order()
+        if best_buy is None or best_sell is None:
+            return False
+        return best_buy.price_cents >= best_sell.price_cents
+
+    cpdef bint has_crossing_price(self):
+        """Alias for ``has_crossing_prices()``."""
+        return self.has_crossing_prices()
+
+    cpdef bint crossing_prices(self):
+        """Alias for ``has_crossing_prices()``."""
+        return self.has_crossing_prices()
+
+    cpdef bint is_crossed(self):
+        """Alias for ``has_crossing_prices()``."""
+        return self.has_crossing_prices()
+
+    cpdef bint can_match(self):
+        """Alias for ``has_crossing_prices()``."""
+        return self.has_crossing_prices()
 
     # ---- order submission & storage ---------------------------------------
 

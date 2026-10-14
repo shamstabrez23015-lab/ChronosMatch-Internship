@@ -589,3 +589,406 @@ class TestSeparateBuySellStorage:
         assert book.bid_count() == 1
         assert book.ask_count() == 1
 
+
+# ===========================================================================
+# Day 3: Price Priority Tests
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# 13. Highest BUY price selection
+# ---------------------------------------------------------------------------
+class TestHighestBuyPriceSelection:
+    """Verify that the highest BUY price has the highest priority."""
+
+    def test_highest_buy_price_spec_example(self):
+        """Spec example:
+        BUY order 101: price 500, quantity 100
+        BUY order 102: price 510, quantity 50
+        BUY order 103: price 505, quantity 80
+        Expected best BUY order: Order 102, price 510.
+        """
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        engine.submit_order(order_id=101, side=SIDE_BUY, price=500.0, quantity=100, timestamp_ns=1000)
+        engine.submit_order(order_id=102, side=SIDE_BUY, price=510.0, quantity=50, timestamp_ns=2000)
+        engine.submit_order(order_id=103, side=SIDE_BUY, price=505.0, quantity=80, timestamp_ns=3000)
+
+        best_buy = engine.get_best_buy_order()
+        assert best_buy is not None
+        assert best_buy.order_id == 102
+        assert best_buy.price == 510.0
+        assert best_buy.price_cents == 51000
+        assert best_buy.quantity == 50
+
+        assert engine.get_best_buy_price() == 510.0
+        assert engine.get_best_buy_price_cents() == 51000
+
+    def test_single_buy_order_is_best(self):
+        """A single submitted BUY order must be the best BUY order."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        order = engine.submit_order(1, SIDE_BUY, 250.25, 10, 1000)
+        assert engine.get_best_buy_order() is order
+        assert engine.get_best_buy_price() == 250.25
+        assert engine.get_best_buy_price_cents() == 25025
+
+    def test_buy_price_priority_aliases(self):
+        """Verify all best-bid / best-buy alias methods return consistent results."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 100.0, 10, 100)
+        engine.submit_order(2, SIDE_BUY, 120.0, 10, 200)
+
+        best = engine.get_best_buy_order()
+        assert engine.get_best_bid() is best
+        assert engine.get_best_bid_order() is best
+        assert engine.best_buy_order() is best
+        assert engine.best_bid() is best
+
+        assert engine.get_best_buy_price() == 120.0
+        assert engine.get_best_bid_price() == 120.0
+        assert engine.best_buy_price() == 120.0
+        assert engine.best_bid_price() == 120.0
+        assert engine.get_best_buy_price_cents() == 12000
+        assert engine.get_best_bid_price_cents() == 12000
+
+    def test_equal_highest_buy_prices_preserve_arrival_order(self):
+        """When multiple BUY orders share the highest price, the earlier arrival has priority."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        # Order 1 arrives first at 500.0
+        engine.submit_order(order_id=1, side=SIDE_BUY, price=500.0, quantity=100, timestamp_ns=1000)
+        # Order 2 arrives later with the same price 500.0
+        engine.submit_order(order_id=2, side=SIDE_BUY, price=500.0, quantity=50, timestamp_ns=2000)
+        # Order 3 arrives with lower price 490.0
+        engine.submit_order(order_id=3, side=SIDE_BUY, price=490.0, quantity=75, timestamp_ns=3000)
+
+        best = engine.get_best_buy_order()
+        assert best is not None
+        assert best.order_id == 1
+        assert best.sequence_num == 1
+        assert best.quantity == 100
+
+
+# ---------------------------------------------------------------------------
+# 14. Lowest SELL price selection
+# ---------------------------------------------------------------------------
+class TestLowestSellPriceSelection:
+    """Verify that the lowest SELL price has the highest priority."""
+
+    def test_lowest_sell_price_spec_example(self):
+        """Spec example:
+        SELL order 201: price 515, quantity 100
+        SELL order 202: price 508, quantity 40
+        SELL order 203: price 520, quantity 80
+        Expected best SELL order: Order 202, price 508.
+        """
+        from chronos.matching_engine import MatchingEngine, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(order_id=201, side=SIDE_SELL, price=515.0, quantity=100, timestamp_ns=1000)
+        engine.submit_order(order_id=202, side=SIDE_SELL, price=508.0, quantity=40, timestamp_ns=2000)
+        engine.submit_order(order_id=203, side=SIDE_SELL, price=520.0, quantity=80, timestamp_ns=3000)
+
+        best_sell = engine.get_best_sell_order()
+        assert best_sell is not None
+        assert best_sell.order_id == 202
+        assert best_sell.price == 508.0
+        assert best_sell.price_cents == 50800
+        assert best_sell.quantity == 40
+
+        assert engine.get_best_sell_price() == 508.0
+        assert engine.get_best_sell_price_cents() == 50800
+
+    def test_single_sell_order_is_best(self):
+        """A single submitted SELL order must be the best SELL order."""
+        from chronos.matching_engine import MatchingEngine, SIDE_SELL
+        engine = MatchingEngine()
+        order = engine.submit_order(1, SIDE_SELL, 305.50, 15, 1000)
+        assert engine.get_best_sell_order() is order
+        assert engine.get_best_sell_price() == 305.50
+        assert engine.get_best_sell_price_cents() == 30550
+
+    def test_sell_price_priority_aliases(self):
+        """Verify all best-ask / best-sell alias methods return consistent results."""
+        from chronos.matching_engine import MatchingEngine, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_SELL, 200.0, 10, 100)
+        engine.submit_order(2, SIDE_SELL, 180.0, 10, 200)
+
+        best = engine.get_best_sell_order()
+        assert engine.get_best_ask() is best
+        assert engine.get_best_ask_order() is best
+        assert engine.best_sell_order() is best
+        assert engine.best_ask() is best
+
+        assert engine.get_best_sell_price() == 180.0
+        assert engine.get_best_ask_price() == 180.0
+        assert engine.best_sell_price() == 180.0
+        assert engine.best_ask_price() == 180.0
+        assert engine.get_best_sell_price_cents() == 18000
+        assert engine.get_best_ask_price_cents() == 18000
+
+    def test_equal_lowest_sell_prices_preserve_arrival_order(self):
+        """When multiple SELL orders share the lowest price, the earlier arrival has priority."""
+        from chronos.matching_engine import MatchingEngine, SIDE_SELL
+        engine = MatchingEngine()
+        # Order 1 arrives first at 508.0
+        engine.submit_order(order_id=10, side=SIDE_SELL, price=508.0, quantity=40, timestamp_ns=1000)
+        # Order 2 arrives later with the same price 508.0
+        engine.submit_order(order_id=20, side=SIDE_SELL, price=508.0, quantity=90, timestamp_ns=2000)
+        # Order 3 arrives with higher price 520.0
+        engine.submit_order(order_id=30, side=SIDE_SELL, price=520.0, quantity=60, timestamp_ns=3000)
+
+        best = engine.get_best_sell_order()
+        assert best is not None
+        assert best.order_id == 10
+        assert best.sequence_num == 1
+        assert best.quantity == 40
+
+
+# ---------------------------------------------------------------------------
+# 15. Random order insertion
+# ---------------------------------------------------------------------------
+class TestRandomOrderInsertion:
+    """Verify that price priority does not depend on insertion order."""
+
+    def test_buy_prices_inserted_in_random_order(self):
+        """Highest BUY order is correctly selected regardless of insertion order."""
+        import random
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        rng = random.Random(42)
+        prices = [round(rng.uniform(10.0, 500.0), 2) for _ in range(50)]
+        max_price = max(prices)
+
+        engine = MatchingEngine()
+        for i, price in enumerate(prices, start=1):
+            engine.submit_order(order_id=i, side=SIDE_BUY, price=price, quantity=10, timestamp_ns=i * 1000)
+
+        best_buy = engine.get_best_buy_order()
+        assert best_buy is not None
+        assert best_buy.price == max_price
+        assert engine.get_best_buy_price() == max_price
+
+    def test_sell_prices_inserted_in_random_order(self):
+        """Lowest SELL order is correctly selected regardless of insertion order."""
+        import random
+        from chronos.matching_engine import MatchingEngine, SIDE_SELL
+        rng = random.Random(42)
+        prices = [round(rng.uniform(10.0, 500.0), 2) for _ in range(50)]
+        min_price = min(prices)
+
+        engine = MatchingEngine()
+        for i, price in enumerate(prices, start=1):
+            engine.submit_order(order_id=i, side=SIDE_SELL, price=price, quantity=10, timestamp_ns=i * 1000)
+
+        best_sell = engine.get_best_sell_order()
+        assert best_sell is not None
+        assert best_sell.price == min_price
+        assert engine.get_best_sell_price() == min_price
+
+
+# ---------------------------------------------------------------------------
+# 16. Empty order book priority inspection
+# ---------------------------------------------------------------------------
+class TestEmptyOrderBookPriority:
+    """Verify empty-book behavior for price priority inspection methods."""
+
+    def test_empty_buy_order_book(self):
+        """Empty BUY book yields None for best BUY order and prices."""
+        from chronos.matching_engine import MatchingEngine
+        engine = MatchingEngine()
+        assert engine.get_best_buy_order() is None
+        assert engine.get_best_bid() is None
+        assert engine.get_best_buy_price() is None
+        assert engine.get_best_bid_price() is None
+        assert engine.get_best_buy_price_cents() is None
+        assert engine.get_best_bid_price_cents() is None
+
+    def test_empty_sell_order_book(self):
+        """Empty SELL book yields None for best SELL order and prices."""
+        from chronos.matching_engine import MatchingEngine
+        engine = MatchingEngine()
+        assert engine.get_best_sell_order() is None
+        assert engine.get_best_ask() is None
+        assert engine.get_best_sell_price() is None
+        assert engine.get_best_ask_price() is None
+        assert engine.get_best_sell_price_cents() is None
+        assert engine.get_best_ask_price_cents() is None
+
+    def test_empty_book_crossing_detection(self):
+        """Crossing detection returns False when either or both books are empty."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        # Both empty
+        assert engine.has_crossing_prices() is False
+        assert engine.crossing_prices() is False
+
+        # Only BUY orders present
+        engine.submit_order(1, SIDE_BUY, 100.0, 10, 1000)
+        assert engine.has_crossing_prices() is False
+        assert engine.crossing_prices() is False
+
+        # Clear and only SELL orders present
+        engine.clear()
+        engine.submit_order(2, SIDE_SELL, 90.0, 10, 2000)
+        assert engine.has_crossing_prices() is False
+        assert engine.crossing_prices() is False
+
+    def test_cleared_engine_resets_best_orders(self):
+        """After clear(), best order inspection returns None again."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 150.0, 10, 1000)
+        engine.submit_order(2, SIDE_SELL, 140.0, 10, 2000)
+        assert engine.get_best_buy_order() is not None
+        assert engine.get_best_sell_order() is not None
+        assert engine.has_crossing_prices() is True
+
+        engine.clear()
+        assert engine.get_best_buy_order() is None
+        assert engine.get_best_sell_order() is None
+        assert engine.get_best_buy_price() is None
+        assert engine.get_best_sell_price() is None
+        assert engine.has_crossing_prices() is False
+
+
+# ---------------------------------------------------------------------------
+# 17. Crossing-price detection
+# ---------------------------------------------------------------------------
+class TestCrossingPriceDetection:
+    """Verify crossing-price detection logic (BUY price >= SELL price)."""
+
+    def test_crossing_prices_higher_buy(self):
+        """BUY 510, SELL 508: Crossing prices = True."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 510.0, 50, 1000)
+        engine.submit_order(2, SIDE_SELL, 508.0, 40, 2000)
+
+        assert engine.has_crossing_prices() is True
+        assert engine.crossing_prices() is True
+        assert engine.has_crossing_price() is True
+        assert engine.is_crossed() is True
+        assert engine.can_match() is True
+
+    def test_non_crossing_prices(self):
+        """BUY 500, SELL 505: Crossing prices = False."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 500.0, 50, 1000)
+        engine.submit_order(2, SIDE_SELL, 505.0, 40, 2000)
+
+        assert engine.has_crossing_prices() is False
+        assert engine.crossing_prices() is False
+        assert engine.has_crossing_price() is False
+        assert engine.is_crossed() is False
+        assert engine.can_match() is False
+
+    def test_equal_buy_and_sell_prices(self):
+        """BUY 500, SELL 500: Crossing prices = True."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 500.0, 50, 1000)
+        engine.submit_order(2, SIDE_SELL, 500.0, 40, 2000)
+
+        assert engine.has_crossing_prices() is True
+        assert engine.crossing_prices() is True
+
+    def test_crossing_with_multiple_orders_on_both_sides(self):
+        """Engine correctly tests the best prices when multiple orders exist."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        # Bids: 480, 490, 502 -> Best BUY = 502
+        engine.submit_order(1, SIDE_BUY, 480.0, 10, 100)
+        engine.submit_order(2, SIDE_BUY, 490.0, 20, 200)
+        engine.submit_order(3, SIDE_BUY, 502.0, 30, 300)
+
+        # Asks: 510, 505, 501 -> Best SELL = 501
+        engine.submit_order(4, SIDE_SELL, 510.0, 15, 400)
+        engine.submit_order(5, SIDE_SELL, 505.0, 25, 500)
+        engine.submit_order(6, SIDE_SELL, 501.0, 35, 600)
+
+        # 502 >= 501 -> True
+        assert engine.has_crossing_prices() is True
+
+        # Now add a new ask at 503 -> Best ask is still 501 -> Still True
+        engine.submit_order(7, SIDE_SELL, 503.0, 10, 700)
+        assert engine.get_best_sell_price() == 501.0
+        assert engine.has_crossing_prices() is True
+
+
+# ---------------------------------------------------------------------------
+# 18. Order data preservation during inspection
+# ---------------------------------------------------------------------------
+class TestPreserveOrderDataOnPriorityInspection:
+    """Verify that price-priority inspection does not modify stored orders."""
+
+    def test_inspection_does_not_modify_order_book(self):
+        """Calling price priority inspection methods must preserve order state."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        engine.submit_order(101, SIDE_BUY, 500.0, 100, 1000)
+        engine.submit_order(102, SIDE_BUY, 510.0, 50, 2000)
+        engine.submit_order(103, SIDE_BUY, 505.0, 80, 3000)
+
+        engine.submit_order(201, SIDE_SELL, 515.0, 100, 4000)
+        engine.submit_order(202, SIDE_SELL, 508.0, 40, 5000)
+        engine.submit_order(203, SIDE_SELL, 520.0, 80, 6000)
+
+        # Snapshot before inspection
+        before_bids_data = [
+            (b.order_id, b.side, b.price_cents, b.quantity, b.timestamp_ns, b.sequence_num)
+            for b in engine.get_bids()
+        ]
+        before_asks_data = [
+            (a.order_id, a.side, a.price_cents, a.quantity, a.timestamp_ns, a.sequence_num)
+            for a in engine.get_asks()
+        ]
+        before_order_count = engine.order_count()
+        before_bid_count = engine.bid_count()
+        before_ask_count = engine.ask_count()
+
+        # Perform multiple inspections
+        for _ in range(5):
+            _ = engine.get_best_buy_order()
+            _ = engine.get_best_sell_order()
+            _ = engine.get_best_buy_price()
+            _ = engine.get_best_sell_price()
+            _ = engine.get_best_buy_price_cents()
+            _ = engine.get_best_sell_price_cents()
+            _ = engine.has_crossing_prices()
+            _ = engine.crossing_prices()
+
+        # Snapshot after inspection
+        after_bids_data = [
+            (b.order_id, b.side, b.price_cents, b.quantity, b.timestamp_ns, b.sequence_num)
+            for b in engine.get_bids()
+        ]
+        after_asks_data = [
+            (a.order_id, a.side, a.price_cents, a.quantity, a.timestamp_ns, a.sequence_num)
+            for a in engine.get_asks()
+        ]
+
+        assert engine.order_count() == before_order_count
+        assert engine.bid_count() == before_bid_count
+        assert engine.ask_count() == before_ask_count
+        assert after_bids_data == before_bids_data
+        assert after_asks_data == before_asks_data
+
+    def test_inspection_is_idempotent(self):
+        """Repeated inspection queries return the exact same objects and values."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        b = engine.submit_order(1, SIDE_BUY, 100.0, 10, 100)
+        a = engine.submit_order(2, SIDE_SELL, 90.0, 10, 200)
+
+        for _ in range(3):
+            assert engine.get_best_buy_order() is b
+            assert engine.get_best_sell_order() is a
+            assert engine.get_best_buy_price() == 100.0
+            assert engine.get_best_sell_price() == 90.0
+            assert engine.has_crossing_prices() is True
+
+
