@@ -24,18 +24,25 @@ from chronos.dashboard import (
     SECTION_SELL_ORDERS,
     SECTION_PERFORMANCE,
     LABEL_BEST_BID,
+    LABEL_BID_QTY,
     LABEL_BEST_ASK,
     LABEL_SPREAD,
     LABEL_TOTAL_ORDERS,
     LABEL_THROUGHPUT,
     LABEL_LATENCY,
+    BestBid,
     DashboardConfig,
+    SAMPLE_BUY_ORDERS,
     TerminalDashboard,
     build_header_lines,
     build_market_summary_lines,
     build_order_book_lines,
     build_performance_lines,
     build_footer_lines,
+    calculate_best_bid,
+    format_best_bid_price,
+    format_best_bid_qty,
+    get_sample_buy_orders,
 )
 
 
@@ -426,3 +433,219 @@ def test_layout_helper_width_consistency():
     assert market[1] == "-" * width
     assert performance[1] == "-" * width
     assert footer[-1] == "=" * width
+
+
+# ===========================================================================
+# Day 3 - Best Bid calculation, formatting, and dashboard rendering tests
+# ===========================================================================
+
+
+def test_calculate_best_bid_single_order():
+    """Verify Best Bid calculation with a single BUY order."""
+    orders = [{"order_id": 101, "price": 500.0, "quantity": 100}]
+    result = calculate_best_bid(orders)
+
+    assert isinstance(result, BestBid)
+    assert result.price == 500.0
+    assert result.quantity == 100
+    assert result == (500.0, 100)
+
+
+def test_calculate_best_bid_multiple_different_prices():
+    """Verify Best Bid calculation selects the highest price among multiple distinct BUY orders."""
+    orders = [
+        {"order_id": 101, "price": 500.0, "quantity": 100},
+        {"order_id": 102, "price": 505.0, "quantity": 50},
+        {"order_id": 103, "price": 510.0, "quantity": 200},
+    ]
+    result = calculate_best_bid(orders)
+
+    assert result.price == 510.0
+    assert result.quantity == 200
+
+
+def test_calculate_best_bid_unsorted_order():
+    """Verify Best Bid calculation is invariant to the arrival order of orders."""
+    orders = [
+        {"order_id": 102, "price": 505.0, "quantity": 50},
+        {"order_id": 103, "price": 510.0, "quantity": 200},
+        {"order_id": 101, "price": 500.0, "quantity": 100},
+    ]
+    result = calculate_best_bid(orders)
+
+    assert result.price == 510.0
+    assert result.quantity == 200
+
+
+def test_calculate_best_bid_aggregated_highest_price():
+    """Verify quantities are aggregated across multiple BUY orders sharing the highest price."""
+    orders = [
+        {"order_id": 1, "price": 510.0, "quantity": 100},
+        {"order_id": 2, "price": 510.0, "quantity": 50},
+        {"order_id": 3, "price": 505.0, "quantity": 80},
+    ]
+    result = calculate_best_bid(orders)
+
+    assert result.price == 510.0
+    assert result.quantity == 150  # 100 + 50 aggregated
+
+
+def test_calculate_best_bid_empty_order_book():
+    """Verify calculation returns (None, 0) and formatting produces 'N/A' and '0' for empty book."""
+    # Empty list
+    res_empty = calculate_best_bid([])
+    assert res_empty.price is None
+    assert res_empty.quantity == 0
+
+    # None input
+    res_none = calculate_best_bid(None)
+    assert res_none.price is None
+    assert res_none.quantity == 0
+
+    # Formatted output for empty book
+    assert format_best_bid_price(res_empty.price) == "N/A"
+    assert format_best_bid_qty(res_empty.quantity) == "0"
+
+
+def test_best_bid_price_and_quantity_formatting():
+    """Verify consistent two-decimal price formatting and quantity string conversion."""
+    assert format_best_bid_price(510.0) == "510.00"
+    assert format_best_bid_price(510) == "510.00"
+    assert format_best_bid_price(505.5) == "505.50"
+    assert format_best_bid_price(500.125) == "500.12" or format_best_bid_price(500.125) == "500.13"
+    assert format_best_bid_price(None) == "N/A"
+
+    assert format_best_bid_qty(150) == "150"
+    assert format_best_bid_qty(0) == "0"
+    assert format_best_bid_qty(10000) == "10000"
+
+
+def test_dashboard_renders_best_bid_with_sample_data():
+    """Verify dashboard displays Best Bid 510.00 and Bid Qty 150 with demonstration sample data."""
+    dashboard = TerminalDashboard()
+    lines = dashboard.get_display_lines(rows=40, cols=100)
+    text = "\n".join(lines)
+
+    assert "510.00" in text
+    assert "150" in text
+    assert LABEL_BEST_BID in text
+    assert LABEL_BID_QTY in text
+    assert "Sample Data" in text
+
+    # Verify mock curses render window output
+    win = MockCursesWindow(rows=40, cols=100)
+    dashboard.render(win)
+    rendered_text = " ".join([call[2] for call in win.addstr_calls])
+
+    assert "510.00" in rendered_text
+    assert "150" in rendered_text
+    assert LABEL_BEST_BID in rendered_text
+    assert LABEL_BID_QTY in rendered_text
+
+
+def test_dashboard_renders_best_bid_empty_order_book():
+    """Verify dashboard displays 'N/A' and '0' when BUY order book is empty."""
+    dashboard = TerminalDashboard(buy_orders=[])
+    lines = dashboard.get_display_lines(rows=40, cols=100)
+    text = "\n".join(lines)
+
+    assert "N/A" in text
+    assert "0" in text
+    assert LABEL_BEST_BID in text
+    assert LABEL_BID_QTY in text
+
+    # Verify mock curses render window output
+    win = MockCursesWindow(rows=40, cols=100)
+    dashboard.render(win)
+    rendered_text = " ".join([call[2] for call in win.addstr_calls])
+
+    assert "N/A" in rendered_text
+    assert "0" in rendered_text
+
+
+def test_dashboard_renders_custom_buy_orders():
+    """Verify dashboard dynamically computes Best Bid for custom BUY orders."""
+    custom_orders = [
+        {"price": 420.75, "quantity": 300},
+        {"price": 420.75, "quantity": 150},
+        {"price": 415.00, "quantity": 500},
+    ]
+    dashboard = TerminalDashboard(buy_orders=custom_orders)
+    lines = dashboard.get_display_lines(rows=40, cols=100)
+    text = "\n".join(lines)
+
+    assert "420.75" in text
+    assert "450" in text
+
+
+def test_dashboard_preserves_other_sections_with_best_bid():
+    """Verify all dashboard sections remain intact and placeholders are preserved."""
+    dashboard = TerminalDashboard()
+    lines = dashboard.get_display_lines(rows=40, cols=100)
+    full_output = "\n".join(lines)
+
+    # Header
+    assert APP_TITLE in full_output
+    assert APP_SUBTITLE in full_output
+    assert STATUS_MESSAGE in full_output
+
+    # Market Summary
+    assert SECTION_MARKET_SUMMARY in full_output
+    assert LABEL_BEST_BID in full_output
+    assert LABEL_BID_QTY in full_output
+    assert LABEL_BEST_ASK in full_output
+    assert LABEL_SPREAD in full_output
+
+    # Order Book
+    assert SECTION_ORDER_BOOK in full_output
+    assert SECTION_BUY_ORDERS in full_output
+    assert SECTION_SELL_ORDERS in full_output
+    assert "Price" in full_output
+    assert "Qty" in full_output
+
+    # Performance
+    assert SECTION_PERFORMANCE in full_output
+    assert LABEL_TOTAL_ORDERS in full_output
+    assert LABEL_THROUGHPUT in full_output
+    assert LABEL_LATENCY in full_output
+
+    # Placeholders for unintegrated sections
+    assert PLACEHOLDER in full_output
+
+    # Footer
+    assert QUIT_MESSAGE in full_output
+
+
+def test_calculate_best_bid_with_protocol_orders():
+    """Verify calculate_best_bid works with Order objects from chronos.protocol."""
+    from chronos.protocol import Order, OrderType, Side
+
+    orders = [
+        Order(1, 1000, 500.0, 100, 1001, Side.BUY, OrderType.LIMIT),
+        Order(2, 2000, 510.0, 120, 1001, Side.BUY, OrderType.LIMIT),
+        Order(3, 3000, 510.0, 80, 1001, Side.BUY, OrderType.LIMIT),
+    ]
+    result = calculate_best_bid(orders)
+    assert result.price == 510.0
+    assert result.quantity == 200
+
+
+def test_calculate_best_bid_filters_sell_orders():
+    """Verify calculate_best_bid ignores SELL orders if mixed orders are passed."""
+    orders = [
+        {"order_id": 1, "side": 2, "price": 550.0, "quantity": 1000},  # SELL
+        {"order_id": 2, "side": 1, "price": 500.0, "quantity": 100},   # BUY
+        {"order_id": 3, "side": 1, "price": 510.0, "quantity": 250},   # BUY
+    ]
+    result = calculate_best_bid(orders)
+    assert result.price == 510.0
+    assert result.quantity == 250
+
+
+def test_calculate_best_bid_with_tuples():
+    """Verify calculate_best_bid handles (price, quantity) tuples."""
+    orders = [(510.0, 100), (510.0, 50), (505.0, 80)]
+    result = calculate_best_bid(orders)
+    assert result.price == 510.0
+    assert result.quantity == 150
+
