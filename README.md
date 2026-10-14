@@ -308,6 +308,8 @@ The system achieves the Week 1 milestone:
 
 ## Week 2 Integration Plan
 
+> For the comprehensive system integration specification, data flow diagrams, and interface definitions, see [Week 2 Integration Architecture](docs/week2-integration.md).
+
 ### Week 1 Completion Status
 Week 1 is already completed and tested at approximately 100,000 mock orders per second (benchmarked at ~100,149 orders/sec producer rate and ~98,234 orders/sec consumer drain with zero dropped orders across 300,000 orders).
 
