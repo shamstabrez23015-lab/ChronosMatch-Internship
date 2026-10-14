@@ -13,7 +13,7 @@ Layout helpers are pure functions and fully testable without a live terminal.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple, Union
 
 try:
     import curses
@@ -39,6 +39,8 @@ SECTION_PERFORMANCE = "PERFORMANCE METRICS"
 
 # Market summary field labels
 LABEL_BEST_BID = "Best Bid"
+LABEL_BID_QTY = "Bid Qty"
+LABEL_BID_QUANTITY = LABEL_BID_QTY
 LABEL_BEST_ASK = "Best Ask"
 LABEL_SPREAD = "Bid-Ask Spread"
 
@@ -54,6 +56,175 @@ PLACEHOLDER = "--"
 DEFAULT_REFRESH_INTERVAL_MS = 100
 MIN_TERMINAL_ROWS = 30
 MIN_TERMINAL_COLS = 72
+
+
+# ---------------------------------------------------------------------------
+# Best Bid structures and calculation (pure functions, independent of Cython)
+# ---------------------------------------------------------------------------
+
+
+class BestBid(NamedTuple):
+    """Container representing the best bid price and aggregated quantity."""
+
+    price: Optional[float]
+    quantity: int
+
+
+# Clearly labeled demonstration BUY orders (fixed sample data for testing & demo mode)
+SAMPLE_BUY_ORDERS: List[Dict[str, Any]] = [
+    {"order_id": 101, "side": 1, "price": 500.0, "quantity": 100, "source": "DEMO_SAMPLE_DATA"},
+    {"order_id": 102, "side": 1, "price": 505.0, "quantity": 80, "source": "DEMO_SAMPLE_DATA"},
+    {"order_id": 103, "side": 1, "price": 510.0, "quantity": 100, "source": "DEMO_SAMPLE_DATA"},
+    {"order_id": 104, "side": 1, "price": 510.0, "quantity": 50, "source": "DEMO_SAMPLE_DATA"},
+]
+
+
+def get_sample_buy_orders() -> List[Dict[str, Any]]:
+    """Return a fresh copy of the demonstration BUY orders collection."""
+    return [dict(order) for order in SAMPLE_BUY_ORDERS]
+
+
+def _extract_order_price_qty(order: Any) -> Optional[Tuple[float, int]]:
+    """Extract (price, quantity) from various BUY order representations.
+
+    Supports:
+      - dict: keys 'price' (or 'price_cents'), 'quantity' (or 'qty'), optional 'side'
+      - tuple / list: (price, quantity) or (order_id, price, quantity)
+      - objects: attributes .price (or .price_cents), .quantity (or .qty), optional .side
+
+    Returns:
+      (price, quantity) tuple or None if invalid or non-BUY order.
+    """
+    if order is None:
+        return None
+
+    # Handle dictionary
+    if isinstance(order, dict):
+        if "side" in order:
+            side = order["side"]
+            if side not in (1, "BUY", "buy", "B", "b"):
+                return None
+
+        qty_val = order.get("quantity", order.get("qty", 0))
+        try:
+            qty = int(qty_val)
+        except (ValueError, TypeError):
+            return None
+
+        if "price" in order:
+            try:
+                price = float(order["price"])
+            except (ValueError, TypeError):
+                return None
+        elif "price_cents" in order:
+            try:
+                price = float(order["price_cents"]) / 100.0
+            except (ValueError, TypeError):
+                return None
+        else:
+            return None
+
+        return (price, qty)
+
+    # Handle tuple / list
+    if isinstance(order, (tuple, list)):
+        if len(order) == 2:
+            try:
+                return (float(order[0]), int(order[1]))
+            except (ValueError, TypeError):
+                return None
+        if len(order) == 3:
+            try:
+                return (float(order[1]), int(order[2]))
+            except (ValueError, TypeError):
+                return None
+
+    # Handle objects (dataclasses, NamedTuples, Cython COrder, protocol Order)
+    if hasattr(order, "side"):
+        side = getattr(order, "side")
+        if side not in (1, "BUY", "buy", "B", "b"):
+            return None
+
+    qty = None
+    if hasattr(order, "quantity"):
+        try:
+            qty = int(getattr(order, "quantity"))
+        except (ValueError, TypeError):
+            return None
+    elif hasattr(order, "qty"):
+        try:
+            qty = int(getattr(order, "qty"))
+        except (ValueError, TypeError):
+            return None
+    else:
+        return None
+
+    price = None
+    if hasattr(order, "price"):
+        try:
+            price = float(getattr(order, "price"))
+        except (ValueError, TypeError):
+            return None
+    elif hasattr(order, "price_cents"):
+        try:
+            price = float(getattr(order, "price_cents")) / 100.0
+        except (ValueError, TypeError):
+            return None
+    else:
+        return None
+
+    return (price, qty)
+
+
+def calculate_best_bid(orders: Optional[Iterable[Any]]) -> BestBid:
+    """Calculate the Best Bid (highest BUY price and aggregated quantity).
+
+    Finds the highest BUY price available in the collection of BUY orders and sums
+    the quantities of all orders posted at that exact highest price level.
+
+    Args:
+        orders: An iterable collection of BUY orders in dict, tuple, or object form.
+
+    Returns:
+        BestBid(price=None, quantity=0) if collection is empty or contains no valid bids.
+        BestBid(price=highest_price, quantity=aggregated_quantity) otherwise.
+    """
+    if orders is None:
+        return BestBid(price=None, quantity=0)
+
+    extracted: List[Tuple[float, int]] = []
+    for order in orders:
+        parsed = _extract_order_price_qty(order)
+        if parsed is not None:
+            p, q = parsed
+            if p > 0 and q > 0:
+                extracted.append((p, q))
+
+    if not extracted:
+        return BestBid(price=None, quantity=0)
+
+    # Find highest buy price
+    max_price = max(p for p, _ in extracted)
+
+    # Aggregate quantities for all orders matching highest price (within float precision)
+    aggregated_qty = sum(
+        q for p, q in extracted
+        if abs(p - max_price) < 1e-6
+    )
+
+    return BestBid(price=max_price, quantity=aggregated_qty)
+
+
+def format_best_bid_price(price: Optional[Union[float, int]]) -> str:
+    """Format Best Bid price to two decimal places, or 'N/A' if empty."""
+    if price is None:
+        return "N/A"
+    return f"{float(price):.2f}"
+
+
+def format_best_bid_qty(quantity: int) -> str:
+    """Format Best Bid aggregated quantity as a string."""
+    return str(int(quantity))
 
 
 # ---------------------------------------------------------------------------
@@ -75,14 +246,14 @@ class DashboardConfig:
 # ---------------------------------------------------------------------------
 
 
-def build_header_lines(width: int) -> List[str]:
+def build_header_lines(width: int, status: str = STATUS_MESSAGE) -> List[str]:
     """Return header text lines for the given content width."""
     border = "=" * width
     return [
         border,
         f"  {APP_TITLE}",
         f"  {APP_SUBTITLE}",
-        f"  [{STATUS_MESSAGE}]",
+        f"  [{status}]",
         border,
     ]
 
@@ -92,6 +263,7 @@ def build_market_summary_lines(
     best_bid: str = PLACEHOLDER,
     best_ask: str = PLACEHOLDER,
     spread: str = PLACEHOLDER,
+    bid_qty: str = PLACEHOLDER,
 ) -> List[str]:
     """Return Market Summary section lines."""
     divider = "-" * width
@@ -100,6 +272,7 @@ def build_market_summary_lines(
         f"  {SECTION_MARKET_SUMMARY}",
         divider,
         f"  {LABEL_BEST_BID:<{col_w - 10}} {best_bid:>8}",
+        f"  {LABEL_BID_QTY:<{col_w - 10}} {bid_qty:>8}",
         f"  {LABEL_BEST_ASK:<{col_w - 10}} {best_ask:>8}",
         f"  {LABEL_SPREAD:<{col_w - 10}} {spread:>8}",
         divider,
@@ -191,11 +364,43 @@ def build_footer_lines(width: int) -> List[str]:
 class TerminalDashboard:
     """Curses-based terminal dashboard for ChronosMatch."""
 
-    def __init__(self, config: Optional[DashboardConfig] = None) -> None:
-        """Initialize the dashboard with optional configuration."""
+    def __init__(
+        self,
+        config: Optional[DashboardConfig] = None,
+        buy_orders: Optional[List[Any]] = None,
+        use_sample_data: bool = True,
+    ) -> None:
+        """Initialize the dashboard with optional configuration and order data."""
         self.config = config or DashboardConfig()
         self.is_running = False
         self.frame_count = 0
+        self.use_sample_data = use_sample_data
+
+        if buy_orders is not None:
+            self.buy_orders: List[Any] = list(buy_orders)
+            self.is_sample_data = False
+        elif use_sample_data:
+            self.buy_orders = list(SAMPLE_BUY_ORDERS)
+            self.is_sample_data = True
+        else:
+            self.buy_orders = []
+            self.is_sample_data = False
+
+    @property
+    def status_message(self) -> str:
+        """Return the status message, clearly labeling demo sample data when active."""
+        if self.is_sample_data:
+            return f"{STATUS_MESSAGE} (Demo: Sample Data)"
+        return STATUS_MESSAGE
+
+    def set_buy_orders(self, orders: List[Any], is_sample: bool = False) -> None:
+        """Update the buy orders collection and data source flag."""
+        self.buy_orders = list(orders)
+        self.is_sample_data = is_sample
+
+    def update_buy_orders(self, orders: List[Any], is_sample: bool = False) -> None:
+        """Alias for set_buy_orders, ready for live engine snapshot integration."""
+        self.set_buy_orders(orders, is_sample=is_sample)
 
     # ------------------------------------------------------------------
     # Size checking
@@ -227,7 +432,12 @@ class TerminalDashboard:
     # Noninteractive text generation (used by launcher --non-interactive)
     # ------------------------------------------------------------------
 
-    def get_display_lines(self, rows: int, cols: int) -> List[str]:
+    def get_display_lines(
+        self,
+        rows: int,
+        cols: int,
+        buy_orders: Optional[List[Any]] = None,
+    ) -> List[str]:
         """Generate all display lines for the current state.
 
         Useful for noninteractive testing and headless validation.
@@ -240,11 +450,20 @@ class TerminalDashboard:
                 QUIT_MESSAGE,
             ]
 
+        orders = self.buy_orders if buy_orders is None else buy_orders
+        best_bid_obj = calculate_best_bid(orders)
+        best_bid_str = format_best_bid_price(best_bid_obj.price)
+        bid_qty_str = format_best_bid_qty(best_bid_obj.quantity)
+
         width = min(cols - 4, 72)
         lines: List[str] = []
-        lines += build_header_lines(width)
+        lines += build_header_lines(width, status=self.status_message)
         lines.append("")
-        lines += build_market_summary_lines(width)
+        lines += build_market_summary_lines(
+            width,
+            best_bid=best_bid_str,
+            bid_qty=bid_qty_str,
+        )
         lines.append("")
         lines += build_order_book_lines(width)
         lines.append("")
@@ -356,7 +575,7 @@ class TerminalDashboard:
                 pass
         return attrs
 
-    def render(self, stdscr: Any) -> None:
+    def render(self, stdscr: Any, buy_orders: Optional[List[Any]] = None) -> None:
         """Render a single frame of the dashboard onto the curses window."""
         try:
             stdscr.erase()
@@ -370,7 +589,7 @@ class TerminalDashboard:
 
         # Small-terminal fallback
         if not self.is_terminal_size_sufficient(max_y, max_x):
-            lines = self.get_display_lines(max_y, max_x)
+            lines = self.get_display_lines(max_y, max_x, buy_orders=buy_orders)
             for idx, line in enumerate(lines):
                 self._safe_addstr(stdscr, idx, 0, line)
             try:
@@ -378,6 +597,11 @@ class TerminalDashboard:
             except Exception:
                 pass
             return
+
+        orders = self.buy_orders if buy_orders is None else buy_orders
+        best_bid_obj = calculate_best_bid(orders)
+        best_bid_str = format_best_bid_price(best_bid_obj.price)
+        bid_qty_str = format_best_bid_qty(best_bid_obj.quantity)
 
         attrs = self._build_attrs()
         width = min(max_x - 4, 72)
@@ -402,14 +626,15 @@ class TerminalDashboard:
         put(border, attrs["border"])
         put(f"  {APP_TITLE}", attrs["title"])
         put(f"  {APP_SUBTITLE}", attrs["subtitle"])
-        put(f"  [{STATUS_MESSAGE}]", attrs["value"])
+        put(f"  [{self.status_message}]", attrs["value"])
         put(border, attrs["border"])
         blank()
 
         # ---- Market Summary ----
         put(f"  {SECTION_MARKET_SUMMARY}", attrs["section"])
         put(divider, attrs["border"])
-        put(f"  {LABEL_BEST_BID:<{col_w - 10}} {PLACEHOLDER:>8}", attrs["label"])
+        put(f"  {LABEL_BEST_BID:<{col_w - 10}} {best_bid_str:>8}", attrs["label"])
+        put(f"  {LABEL_BID_QTY:<{col_w - 10}} {bid_qty_str:>8}", attrs["label"])
         put(f"  {LABEL_BEST_ASK:<{col_w - 10}} {PLACEHOLDER:>8}", attrs["label"])
         put(f"  {LABEL_SPREAD:<{col_w - 10}} {PLACEHOLDER:>8}", attrs["label"])
         put(divider, attrs["border"])
