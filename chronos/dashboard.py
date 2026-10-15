@@ -42,7 +42,10 @@ LABEL_BEST_BID = "Best Bid"
 LABEL_BID_QTY = "Bid Qty"
 LABEL_BID_QUANTITY = LABEL_BID_QTY
 LABEL_BEST_ASK = "Best Ask"
+LABEL_ASK_QTY = "Ask Qty"
+LABEL_ASK_QUANTITY = LABEL_ASK_QTY
 LABEL_SPREAD = "Bid-Ask Spread"
+LABEL_BID_ASK_SPREAD = LABEL_SPREAD
 
 # Performance field labels
 LABEL_TOTAL_ORDERS = "Total Orders Processed"
@@ -59,12 +62,20 @@ MIN_TERMINAL_COLS = 72
 
 
 # ---------------------------------------------------------------------------
-# Best Bid structures and calculation (pure functions, independent of Cython)
+# Best Bid, Best Ask, and Spread structures and calculations
+# (pure functions, independent of Cython)
 # ---------------------------------------------------------------------------
 
 
 class BestBid(NamedTuple):
     """Container representing the best bid price and aggregated quantity."""
+
+    price: Optional[float]
+    quantity: int
+
+
+class BestAsk(NamedTuple):
+    """Container representing the best ask price and aggregated quantity."""
 
     price: Optional[float]
     quantity: int
@@ -78,31 +89,54 @@ SAMPLE_BUY_ORDERS: List[Dict[str, Any]] = [
     {"order_id": 104, "side": 1, "price": 510.0, "quantity": 50, "source": "DEMO_SAMPLE_DATA"},
 ]
 
+# Clearly labeled demonstration SELL orders (fixed sample data for testing & demo mode)
+SAMPLE_SELL_ORDERS: List[Dict[str, Any]] = [
+    {"order_id": 201, "side": 2, "price": 515.0, "quantity": 100, "source": "DEMO_SAMPLE_DATA"},
+    {"order_id": 202, "side": 2, "price": 505.0, "quantity": 40, "source": "DEMO_SAMPLE_DATA"},
+    {"order_id": 203, "side": 2, "price": 510.0, "quantity": 80, "source": "DEMO_SAMPLE_DATA"},
+]
+
 
 def get_sample_buy_orders() -> List[Dict[str, Any]]:
     """Return a fresh copy of the demonstration BUY orders collection."""
     return [dict(order) for order in SAMPLE_BUY_ORDERS]
 
 
-def _extract_order_price_qty(order: Any) -> Optional[Tuple[float, int]]:
-    """Extract (price, quantity) from various BUY order representations.
+def get_sample_sell_orders() -> List[Dict[str, Any]]:
+    """Return a fresh copy of the demonstration SELL orders collection."""
+    return [dict(order) for order in SAMPLE_SELL_ORDERS]
+
+
+def _extract_order_price_qty(
+    order: Any, expected_side: Optional[Union[int, str]] = 1
+) -> Optional[Tuple[float, int]]:
+    """Extract (price, quantity) from various order representations.
 
     Supports:
       - dict: keys 'price' (or 'price_cents'), 'quantity' (or 'qty'), optional 'side'
-      - tuple / list: (price, quantity) or (order_id, price, quantity)
+      - tuple / list: (price, quantity), (order_id, price, quantity), or (order_id, side, price, quantity)
       - objects: attributes .price (or .price_cents), .quantity (or .qty), optional .side
 
+    Args:
+        order: The order object, dict, or tuple.
+        expected_side: 1 for BUY, 2 for SELL, or None to accept any side.
+
     Returns:
-      (price, quantity) tuple or None if invalid or non-BUY order.
+      (price, quantity) tuple or None if invalid or side does not match.
     """
     if order is None:
         return None
+
+    buy_sides = (1, "BUY", "buy", "B", "b")
+    sell_sides = (2, "SELL", "sell", "S", "s", "ASK", "ask", "A", "a")
 
     # Handle dictionary
     if isinstance(order, dict):
         if "side" in order:
             side = order["side"]
-            if side not in (1, "BUY", "buy", "B", "b"):
+            if expected_side in buy_sides and side not in buy_sides:
+                return None
+            if expected_side in sell_sides and side not in sell_sides:
                 return None
 
         qty_val = order.get("quantity", order.get("qty", 0))
@@ -138,11 +172,23 @@ def _extract_order_price_qty(order: Any) -> Optional[Tuple[float, int]]:
                 return (float(order[1]), int(order[2]))
             except (ValueError, TypeError):
                 return None
+        if len(order) == 4:
+            side = order[1]
+            if expected_side in buy_sides and side not in buy_sides:
+                return None
+            if expected_side in sell_sides and side not in sell_sides:
+                return None
+            try:
+                return (float(order[2]), int(order[3]))
+            except (ValueError, TypeError):
+                return None
 
     # Handle objects (dataclasses, NamedTuples, Cython COrder, protocol Order)
     if hasattr(order, "side"):
         side = getattr(order, "side")
-        if side not in (1, "BUY", "buy", "B", "b"):
+        if expected_side in buy_sides and side not in buy_sides:
+            return None
+        if expected_side in sell_sides and side not in sell_sides:
             return None
 
     qty = None
@@ -194,7 +240,7 @@ def calculate_best_bid(orders: Optional[Iterable[Any]]) -> BestBid:
 
     extracted: List[Tuple[float, int]] = []
     for order in orders:
-        parsed = _extract_order_price_qty(order)
+        parsed = _extract_order_price_qty(order, expected_side=1)
         if parsed is not None:
             p, q = parsed
             if p > 0 and q > 0:
@@ -215,16 +261,104 @@ def calculate_best_bid(orders: Optional[Iterable[Any]]) -> BestBid:
     return BestBid(price=max_price, quantity=aggregated_qty)
 
 
-def format_best_bid_price(price: Optional[Union[float, int]]) -> str:
-    """Format Best Bid price to two decimal places, or 'N/A' if empty."""
+def calculate_best_ask(orders: Optional[Iterable[Any]]) -> BestAsk:
+    """Calculate the Best Ask (lowest SELL price and aggregated quantity).
+
+    Finds the lowest SELL price available in the collection of SELL orders and sums
+    the quantities of all orders posted at that exact lowest price level.
+
+    Args:
+        orders: An iterable collection of SELL orders in dict, tuple, or object form.
+
+    Returns:
+        BestAsk(price=None, quantity=0) if collection is empty or contains no valid asks.
+        BestAsk(price=lowest_price, quantity=aggregated_quantity) otherwise.
+    """
+    if orders is None:
+        return BestAsk(price=None, quantity=0)
+
+    extracted: List[Tuple[float, int]] = []
+    for order in orders:
+        parsed = _extract_order_price_qty(order, expected_side=2)
+        if parsed is not None:
+            p, q = parsed
+            if p > 0 and q > 0:
+                extracted.append((p, q))
+
+    if not extracted:
+        return BestAsk(price=None, quantity=0)
+
+    # Find lowest sell price
+    min_price = min(p for p, _ in extracted)
+
+    # Aggregate quantities for all orders matching lowest price (within float precision)
+    aggregated_qty = sum(
+        q for p, q in extracted
+        if abs(p - min_price) < 1e-6
+    )
+
+    return BestAsk(price=min_price, quantity=aggregated_qty)
+
+
+def calculate_spread(
+    best_ask: Optional[Union[float, int, BestAsk]],
+    best_bid: Optional[Union[float, int, BestBid]],
+) -> Optional[float]:
+    """Calculate the Bid-Ask Spread (Best Ask - Best Bid).
+
+    Args:
+        best_ask: Best Ask price or BestAsk namedtuple.
+        best_bid: Best Bid price or BestBid namedtuple.
+
+    Returns:
+        Spread (Best Ask - Best Bid) rounded to 6 decimal places,
+        or None if either side is missing or invalid.
+    """
+    ask_price = best_ask.price if isinstance(best_ask, BestAsk) else best_ask
+    bid_price = best_bid.price if isinstance(best_bid, BestBid) else best_bid
+
+    if ask_price is None or bid_price is None:
+        return None
+
+    try:
+        ask_f = float(ask_price)
+        bid_f = float(bid_price)
+    except (ValueError, TypeError):
+        return None
+
+    return round(ask_f - bid_f, 6)
+
+
+def format_price(price: Optional[Union[float, int]]) -> str:
+    """Format price or spread to two decimal places, or 'N/A' if empty/None."""
     if price is None:
         return "N/A"
     return f"{float(price):.2f}"
 
 
+def format_best_bid_price(price: Optional[Union[float, int]]) -> str:
+    """Format Best Bid price to two decimal places, or 'N/A' if empty."""
+    return format_price(price)
+
+
 def format_best_bid_qty(quantity: int) -> str:
     """Format Best Bid aggregated quantity as a string."""
     return str(int(quantity))
+
+
+def format_best_ask_price(price: Optional[Union[float, int]]) -> str:
+    """Format Best Ask price to two decimal places, or 'N/A' if empty."""
+    return format_price(price)
+
+
+def format_best_ask_qty(quantity: int) -> str:
+    """Format Best Ask aggregated quantity as a string."""
+    return str(int(quantity))
+
+
+def format_spread(spread: Optional[Union[float, int]]) -> str:
+    """Format Bid-Ask Spread to two decimal places, or 'N/A' if empty."""
+    return format_price(spread)
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +398,7 @@ def build_market_summary_lines(
     best_ask: str = PLACEHOLDER,
     spread: str = PLACEHOLDER,
     bid_qty: str = PLACEHOLDER,
+    ask_qty: str = PLACEHOLDER,
 ) -> List[str]:
     """Return Market Summary section lines."""
     divider = "-" * width
@@ -274,6 +409,7 @@ def build_market_summary_lines(
         f"  {LABEL_BEST_BID:<{col_w - 10}} {best_bid:>8}",
         f"  {LABEL_BID_QTY:<{col_w - 10}} {bid_qty:>8}",
         f"  {LABEL_BEST_ASK:<{col_w - 10}} {best_ask:>8}",
+        f"  {LABEL_ASK_QTY:<{col_w - 10}} {ask_qty:>8}",
         f"  {LABEL_SPREAD:<{col_w - 10}} {spread:>8}",
         divider,
     ]
@@ -368,6 +504,7 @@ class TerminalDashboard:
         self,
         config: Optional[DashboardConfig] = None,
         buy_orders: Optional[List[Any]] = None,
+        sell_orders: Optional[List[Any]] = None,
         use_sample_data: bool = True,
     ) -> None:
         """Initialize the dashboard with optional configuration and order data."""
@@ -378,13 +515,25 @@ class TerminalDashboard:
 
         if buy_orders is not None:
             self.buy_orders: List[Any] = list(buy_orders)
-            self.is_sample_data = False
+            self.is_buy_sample_data = False
         elif use_sample_data:
             self.buy_orders = list(SAMPLE_BUY_ORDERS)
-            self.is_sample_data = True
+            self.is_buy_sample_data = True
         else:
             self.buy_orders = []
-            self.is_sample_data = False
+            self.is_buy_sample_data = False
+
+        if sell_orders is not None:
+            self.sell_orders: List[Any] = list(sell_orders)
+            self.is_sell_sample_data = False
+        elif use_sample_data:
+            self.sell_orders = list(SAMPLE_SELL_ORDERS)
+            self.is_sell_sample_data = True
+        else:
+            self.sell_orders = []
+            self.is_sell_sample_data = False
+
+        self.is_sample_data = self.is_buy_sample_data or self.is_sell_sample_data
 
     @property
     def status_message(self) -> str:
@@ -396,11 +545,22 @@ class TerminalDashboard:
     def set_buy_orders(self, orders: List[Any], is_sample: bool = False) -> None:
         """Update the buy orders collection and data source flag."""
         self.buy_orders = list(orders)
-        self.is_sample_data = is_sample
+        self.is_buy_sample_data = is_sample
+        self.is_sample_data = self.is_buy_sample_data or self.is_sell_sample_data
 
     def update_buy_orders(self, orders: List[Any], is_sample: bool = False) -> None:
         """Alias for set_buy_orders, ready for live engine snapshot integration."""
         self.set_buy_orders(orders, is_sample=is_sample)
+
+    def set_sell_orders(self, orders: List[Any], is_sample: bool = False) -> None:
+        """Update the sell orders collection and data source flag."""
+        self.sell_orders = list(orders)
+        self.is_sell_sample_data = is_sample
+        self.is_sample_data = self.is_buy_sample_data or self.is_sell_sample_data
+
+    def update_sell_orders(self, orders: List[Any], is_sample: bool = False) -> None:
+        """Alias for set_sell_orders, ready for live engine snapshot integration."""
+        self.set_sell_orders(orders, is_sample=is_sample)
 
     # ------------------------------------------------------------------
     # Size checking
@@ -437,6 +597,7 @@ class TerminalDashboard:
         rows: int,
         cols: int,
         buy_orders: Optional[List[Any]] = None,
+        sell_orders: Optional[List[Any]] = None,
     ) -> List[str]:
         """Generate all display lines for the current state.
 
@@ -450,10 +611,19 @@ class TerminalDashboard:
                 QUIT_MESSAGE,
             ]
 
-        orders = self.buy_orders if buy_orders is None else buy_orders
-        best_bid_obj = calculate_best_bid(orders)
+        b_orders = self.buy_orders if buy_orders is None else buy_orders
+        s_orders = self.sell_orders if sell_orders is None else sell_orders
+
+        best_bid_obj = calculate_best_bid(b_orders)
         best_bid_str = format_best_bid_price(best_bid_obj.price)
         bid_qty_str = format_best_bid_qty(best_bid_obj.quantity)
+
+        best_ask_obj = calculate_best_ask(s_orders)
+        best_ask_str = format_best_ask_price(best_ask_obj.price)
+        ask_qty_str = format_best_ask_qty(best_ask_obj.quantity)
+
+        spread_val = calculate_spread(best_ask_obj, best_bid_obj)
+        spread_str = format_spread(spread_val)
 
         width = min(cols - 4, 72)
         lines: List[str] = []
@@ -462,7 +632,10 @@ class TerminalDashboard:
         lines += build_market_summary_lines(
             width,
             best_bid=best_bid_str,
+            best_ask=best_ask_str,
+            spread=spread_str,
             bid_qty=bid_qty_str,
+            ask_qty=ask_qty_str,
         )
         lines.append("")
         lines += build_order_book_lines(width)
@@ -575,7 +748,12 @@ class TerminalDashboard:
                 pass
         return attrs
 
-    def render(self, stdscr: Any, buy_orders: Optional[List[Any]] = None) -> None:
+    def render(
+        self,
+        stdscr: Any,
+        buy_orders: Optional[List[Any]] = None,
+        sell_orders: Optional[List[Any]] = None,
+    ) -> None:
         """Render a single frame of the dashboard onto the curses window."""
         try:
             stdscr.erase()
@@ -589,7 +767,9 @@ class TerminalDashboard:
 
         # Small-terminal fallback
         if not self.is_terminal_size_sufficient(max_y, max_x):
-            lines = self.get_display_lines(max_y, max_x, buy_orders=buy_orders)
+            lines = self.get_display_lines(
+                max_y, max_x, buy_orders=buy_orders, sell_orders=sell_orders
+            )
             for idx, line in enumerate(lines):
                 self._safe_addstr(stdscr, idx, 0, line)
             try:
@@ -598,10 +778,19 @@ class TerminalDashboard:
                 pass
             return
 
-        orders = self.buy_orders if buy_orders is None else buy_orders
-        best_bid_obj = calculate_best_bid(orders)
+        b_orders = self.buy_orders if buy_orders is None else buy_orders
+        s_orders = self.sell_orders if sell_orders is None else sell_orders
+
+        best_bid_obj = calculate_best_bid(b_orders)
         best_bid_str = format_best_bid_price(best_bid_obj.price)
         bid_qty_str = format_best_bid_qty(best_bid_obj.quantity)
+
+        best_ask_obj = calculate_best_ask(s_orders)
+        best_ask_str = format_best_ask_price(best_ask_obj.price)
+        ask_qty_str = format_best_ask_qty(best_ask_obj.quantity)
+
+        spread_val = calculate_spread(best_ask_obj, best_bid_obj)
+        spread_str = format_spread(spread_val)
 
         attrs = self._build_attrs()
         width = min(max_x - 4, 72)
@@ -635,8 +824,9 @@ class TerminalDashboard:
         put(divider, attrs["border"])
         put(f"  {LABEL_BEST_BID:<{col_w - 10}} {best_bid_str:>8}", attrs["label"])
         put(f"  {LABEL_BID_QTY:<{col_w - 10}} {bid_qty_str:>8}", attrs["label"])
-        put(f"  {LABEL_BEST_ASK:<{col_w - 10}} {PLACEHOLDER:>8}", attrs["label"])
-        put(f"  {LABEL_SPREAD:<{col_w - 10}} {PLACEHOLDER:>8}", attrs["label"])
+        put(f"  {LABEL_BEST_ASK:<{col_w - 10}} {best_ask_str:>8}", attrs["label"])
+        put(f"  {LABEL_ASK_QTY:<{col_w - 10}} {ask_qty_str:>8}", attrs["label"])
+        put(f"  {LABEL_SPREAD:<{col_w - 10}} {spread_str:>8}", attrs["label"])
         put(divider, attrs["border"])
         blank()
 

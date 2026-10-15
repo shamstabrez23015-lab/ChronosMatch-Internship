@@ -26,13 +26,16 @@ from chronos.dashboard import (
     LABEL_BEST_BID,
     LABEL_BID_QTY,
     LABEL_BEST_ASK,
+    LABEL_ASK_QTY,
     LABEL_SPREAD,
     LABEL_TOTAL_ORDERS,
     LABEL_THROUGHPUT,
     LABEL_LATENCY,
     BestBid,
+    BestAsk,
     DashboardConfig,
     SAMPLE_BUY_ORDERS,
+    SAMPLE_SELL_ORDERS,
     TerminalDashboard,
     build_header_lines,
     build_market_summary_lines,
@@ -40,9 +43,16 @@ from chronos.dashboard import (
     build_performance_lines,
     build_footer_lines,
     calculate_best_bid,
+    calculate_best_ask,
+    calculate_spread,
     format_best_bid_price,
     format_best_bid_qty,
+    format_best_ask_price,
+    format_best_ask_qty,
+    format_price,
+    format_spread,
     get_sample_buy_orders,
+    get_sample_sell_orders,
 )
 
 
@@ -648,4 +658,296 @@ def test_calculate_best_bid_with_tuples():
     result = calculate_best_bid(orders)
     assert result.price == 510.0
     assert result.quantity == 150
+
+
+# ===========================================================================
+# Day 4 - Best Ask and Bid-Ask Spread calculation, formatting, and rendering
+# ===========================================================================
+
+
+def test_calculate_best_ask_single_order():
+    """1. Verify Best Ask calculation with a single SELL order."""
+    orders = [{"order_id": 201, "side": 2, "price": 505.0, "quantity": 40}]
+    result = calculate_best_ask(orders)
+
+    assert isinstance(result, BestAsk)
+    assert result.price == 505.0
+    assert result.quantity == 40
+    assert result == (505.0, 40)
+
+
+def test_calculate_best_ask_multiple_different_prices():
+    """2. Verify Best Ask selects the LOWEST price among multiple SELL orders."""
+    # Spec example: 515 (100), 505 (40), 510 (80) -> Best Ask = 505, Qty = 40
+    orders = [
+        {"order_id": 201, "price": 515.0, "quantity": 100},
+        {"order_id": 202, "price": 505.0, "quantity": 40},
+        {"order_id": 203, "price": 510.0, "quantity": 80},
+    ]
+    result = calculate_best_ask(orders)
+
+    assert result.price == 505.0
+    assert result.quantity == 40
+
+
+def test_calculate_best_ask_unsorted_orders():
+    """3. Verify Best Ask calculation is invariant to the arrival order of SELL orders."""
+    orders = [
+        {"order_id": 201, "price": 520.0, "quantity": 70},
+        {"order_id": 202, "price": 515.0, "quantity": 100},
+        {"order_id": 203, "price": 505.0, "quantity": 40},
+        {"order_id": 204, "price": 510.0, "quantity": 80},
+    ]
+    result = calculate_best_ask(orders)
+
+    assert result.price == 505.0
+    assert result.quantity == 40
+
+
+def test_calculate_best_ask_equal_lowest_prices_aggregate_quantity():
+    """4. Verify quantities are aggregated when multiple SELL orders share the lowest price."""
+    # Spec example: SELL at 505 qty 40, SELL at 505 qty 60 -> Best Ask = 505, Qty = 100
+    orders = [
+        {"order_id": 201, "price": 505.0, "quantity": 40},
+        {"order_id": 202, "price": 505.0, "quantity": 60},
+        {"order_id": 203, "price": 515.0, "quantity": 100},
+    ]
+    result = calculate_best_ask(orders)
+
+    assert result.price == 505.0
+    assert result.quantity == 100
+
+
+def test_calculate_best_ask_empty_order_book():
+    """5. Verify empty SELL collection returns (None, 0) and formats as N/A and 0."""
+    res_empty = calculate_best_ask([])
+    assert res_empty.price is None
+    assert res_empty.quantity == 0
+
+    res_none = calculate_best_ask(None)
+    assert res_none.price is None
+    assert res_none.quantity == 0
+
+    assert format_best_ask_price(res_empty.price) == "N/A"
+    assert format_best_ask_qty(res_empty.quantity) == "0"
+
+
+def test_calculate_spread_correctness():
+    """6. Verify Bid-Ask Spread calculation (Spread = Best Ask - Best Bid)."""
+    # Spec example: Best Bid = 500, Best Ask = 505, Spread = 5
+    spread = calculate_spread(best_ask=505.0, best_bid=500.0)
+    assert spread == 5.0
+    assert format_spread(spread) == "5.00"
+
+    # With BestAsk and BestBid NamedTuples
+    ask_obj = BestAsk(price=505.0, quantity=40)
+    bid_obj = BestBid(price=500.0, quantity=100)
+    assert calculate_spread(ask_obj, bid_obj) == 5.0
+
+    # Locked market (Spread = 0)
+    assert calculate_spread(505.0, 505.0) == 0.0
+    assert format_spread(0.0) == "0.00"
+
+    # Crossing / inverted market (Spread < 0)
+    crossing_spread = calculate_spread(505.0, 510.0)
+    assert crossing_spread == -5.0
+    assert format_spread(crossing_spread) == "-5.00"
+
+    # Avoid floating-point errors with small cents differences
+    cents_spread = calculate_spread(500.10, 500.00)
+    assert cents_spread == 0.10
+    assert format_spread(cents_spread) == "0.10"
+
+
+def test_spread_with_no_buy_orders():
+    """7. When BUY orders are missing, Spread is N/A and Best Bid is N/A."""
+    # Direct calculate_spread with missing bid
+    assert calculate_spread(best_ask=505.0, best_bid=None) is None
+    assert calculate_spread(BestAsk(505.0, 40), BestBid(None, 0)) is None
+    assert format_spread(calculate_spread(505.0, None)) == "N/A"
+
+    # Dashboard state with empty BUY orders
+    sell_orders = [{"price": 505.0, "quantity": 40}]
+    dashboard = TerminalDashboard(buy_orders=[], sell_orders=sell_orders)
+    lines = dashboard.get_display_lines(rows=40, cols=100)
+    text = "\n".join(lines)
+
+    assert LABEL_BEST_BID in text
+    assert LABEL_BEST_ASK in text
+    assert LABEL_SPREAD in text
+    assert "505.00" in text  # Best Ask
+    assert "40" in text      # Ask Qty
+    assert "N/A" in text     # Best Bid and Spread
+    assert "0" in text       # Bid Qty
+
+
+def test_spread_with_no_sell_orders():
+    """8. When SELL orders are missing, Spread is N/A and Best Ask is N/A."""
+    # Direct calculate_spread with missing ask
+    assert calculate_spread(best_ask=None, best_bid=500.0) is None
+    assert calculate_spread(BestAsk(None, 0), BestBid(500.0, 100)) is None
+    assert format_spread(calculate_spread(None, 500.0)) == "N/A"
+
+    # Dashboard state with empty SELL orders
+    buy_orders = [{"price": 500.0, "quantity": 100}]
+    dashboard = TerminalDashboard(buy_orders=buy_orders, sell_orders=[])
+    lines = dashboard.get_display_lines(rows=40, cols=100)
+    text = "\n".join(lines)
+
+    assert LABEL_BEST_BID in text
+    assert LABEL_BEST_ASK in text
+    assert LABEL_SPREAD in text
+    assert "500.00" in text  # Best Bid
+    assert "100" in text     # Bid Qty
+    assert "N/A" in text     # Best Ask and Spread
+    assert "0" in text       # Ask Qty
+
+
+def test_correct_price_and_spread_formatting():
+    """9. Verify price, quantity, and spread string formatting."""
+    assert format_best_ask_price(505.0) == "505.00"
+    assert format_best_ask_price(505) == "505.00"
+    assert format_best_ask_price(505.125) in ("505.12", "505.13")
+    assert format_best_ask_price(None) == "N/A"
+
+    assert format_best_ask_qty(40) == "40"
+    assert format_best_ask_qty(0) == "0"
+    assert format_best_ask_qty(12345) == "12345"
+
+    assert format_spread(5.0) == "5.00"
+    assert format_spread(0.0) == "0.00"
+    assert format_spread(-5.0) == "-5.00"
+    assert format_spread(None) == "N/A"
+
+    assert format_price(100.5) == "100.50"
+    assert format_price(None) == "N/A"
+
+
+def test_dashboard_renders_best_ask_and_spread_sample_data():
+    """10a. Verify dashboard displays Best Ask 505.00, Ask Qty 40, Spread -5.00 with sample data."""
+    dashboard = TerminalDashboard()
+    lines = dashboard.get_display_lines(rows=40, cols=100)
+    text = "\n".join(lines)
+
+    # Market summary labels
+    assert LABEL_BEST_BID in text
+    assert LABEL_BID_QTY in text
+    assert LABEL_BEST_ASK in text
+    assert LABEL_ASK_QTY in text
+    assert LABEL_SPREAD in text
+
+    # Values for sample data (BUY: 510.00 qty 150, SELL: 505.00 qty 40, Spread: -5.00)
+    assert "510.00" in text
+    assert "150" in text
+    assert "505.00" in text
+    assert "40" in text
+    assert "-5.00" in text
+
+    # Mock curses render test
+    win = MockCursesWindow(rows=40, cols=100)
+    dashboard.render(win)
+    rendered_text = " ".join([call[2] for call in win.addstr_calls])
+
+    assert LABEL_BEST_ASK in rendered_text
+    assert LABEL_ASK_QTY in rendered_text
+    assert LABEL_SPREAD in rendered_text
+    assert "505.00" in rendered_text
+    assert "40" in rendered_text
+    assert "-5.00" in rendered_text
+
+
+def test_dashboard_renders_spec_example_values():
+    """10b. Verify dashboard displays exact spec example (Best Bid 500, Ask 505, Spread 5)."""
+    custom_buys = [{"price": 500.0, "quantity": 100}]
+    custom_sells = [
+        {"order_id": 201, "price": 515.0, "quantity": 100},
+        {"order_id": 202, "price": 505.0, "quantity": 40},
+        {"order_id": 203, "price": 510.0, "quantity": 80},
+    ]
+    dashboard = TerminalDashboard(buy_orders=custom_buys, sell_orders=custom_sells)
+    lines = dashboard.get_display_lines(rows=40, cols=100)
+    text = "\n".join(lines)
+
+    assert "500.00" in text  # Best Bid
+    assert "100" in text     # Bid Qty
+    assert "505.00" in text  # Best Ask
+    assert "40" in text      # Ask Qty
+    assert "5.00" in text    # Spread
+
+
+def test_calculate_best_ask_with_protocol_orders():
+    """Verify calculate_best_ask works with Order objects from chronos.protocol."""
+    from chronos.protocol import Order, OrderType, Side
+
+    orders = [
+        Order(1, 1000, 515.0, 100, 1001, Side.SELL, OrderType.LIMIT),
+        Order(2, 2000, 505.0, 40, 1001, Side.SELL, OrderType.LIMIT),
+        Order(3, 3000, 510.0, 80, 1001, Side.SELL, OrderType.LIMIT),
+    ]
+    result = calculate_best_ask(orders)
+    assert result.price == 505.0
+    assert result.quantity == 40
+
+
+def test_calculate_best_ask_filters_buy_orders():
+    """Verify calculate_best_ask ignores BUY orders if mixed orders are passed."""
+    orders = [
+        {"order_id": 1, "side": 1, "price": 490.0, "quantity": 500},   # BUY
+        {"order_id": 2, "side": 2, "price": 520.0, "quantity": 100},   # SELL
+        {"order_id": 3, "side": 2, "price": 505.0, "quantity": 60},    # SELL
+    ]
+    result = calculate_best_ask(orders)
+    assert result.price == 505.0
+    assert result.quantity == 60
+
+
+def test_calculate_best_ask_with_tuples():
+    """Verify calculate_best_ask handles (price, quantity) tuples."""
+    orders = [(515.0, 100), (505.0, 40), (510.0, 80)]
+    result = calculate_best_ask(orders)
+    assert result.price == 505.0
+    assert result.quantity == 40
+
+
+def test_dashboard_set_and_update_sell_orders():
+    """Verify dynamic updates to sell_orders via set_sell_orders and update_sell_orders."""
+    dashboard = TerminalDashboard()
+    new_sells = [{"price": 599.00, "quantity": 25}]
+
+    dashboard.set_sell_orders(new_sells)
+    assert dashboard.sell_orders == new_sells
+    lines = dashboard.get_display_lines(rows=40, cols=100)
+    assert "599.00" in "\n".join(lines)
+    assert "25" in "\n".join(lines)
+
+    updated_sells = [{"price": 600.00, "quantity": 50}]
+    dashboard.update_sell_orders(updated_sells)
+    assert dashboard.sell_orders == updated_sells
+    lines2 = dashboard.get_display_lines(rows=40, cols=100)
+    assert "600.00" in "\n".join(lines2)
+    assert "50" in "\n".join(lines2)
+
+
+def test_build_market_summary_includes_ask_qty():
+    """Verify build_market_summary_lines formats ask_qty correctly."""
+    lines = build_market_summary_lines(
+        width=68,
+        best_bid="500.00",
+        best_ask="505.00",
+        spread="5.00",
+        bid_qty="100",
+        ask_qty="40",
+    )
+    joined = "\n".join(lines)
+    assert LABEL_BEST_BID in joined
+    assert LABEL_BID_QTY in joined
+    assert LABEL_BEST_ASK in joined
+    assert LABEL_ASK_QTY in joined
+    assert LABEL_SPREAD in joined
+    assert "500.00" in joined
+    assert "100" in joined
+    assert "505.00" in joined
+    assert "40" in joined
+    assert "5.00" in joined
+
 
