@@ -385,17 +385,54 @@ def build_performance_lines(width: int, total_orders: str = "--", throughput: st
 
 ---
 
-## 8. Team Responsibilities
+## 8. Shared Project Configuration (Week 2 — Day 4)
+
+To support seamless end-to-end integration across decoupled sub-processes, ChronosMatch introduces a centralized configuration module in `chronos/config.py`.
+
+### Purpose & Architecture
+Previously, operational parameters (buffer capacities, batch chunk sizes, order generation rates, refresh frequencies) were independently declared as defaults in individual constructors and CLI argument parsers. The shared configuration module unifies these values into a single source of truth without altering existing runtime defaults or disrupting working components.
+
+Key architectural features:
+1. **Canonical Constants**: Named project-wide constants matching existing component defaults.
+2. **`ChronosConfig` Dataclass**: A lightweight configuration container holding all shared parameters, supporting dictionary export/import (`to_dict()`, `from_dict()`), deep copying (`copy()`), and independent instantiation across processes.
+3. **Strict Validation Helpers**: Dedicated validation helpers (`validate_buffer_capacity`, `validate_batch_size`, `validate_refresh_interval_ms`, `validate_target_rate`, etc.) enforcing:
+   * Strictly positive values (`> 0`) for capacities, batch sizes, rates, and intervals.
+   * Type rejection (disallowing booleans, non-integers, strings, and `None`).
+   * Optional power-of-two enforcement for ring buffer sizing (`is_power_of_two`).
+   * Automatic execution upon dataclass initialization via `__post_init__` and on-demand via `.validate()`.
+
+### Configuration Settings & Integration Status
+
+| Setting | Type | Canonical Default | Currently In Use By | Prepared For Future Integration |
+| :--- | :--- | :--- | :--- | :--- |
+| `buffer_capacity` | `int` | `262_144` (2^18 slots) | `MmapRingBuffer`, `scripts/run_firehose.py` | Unified IPC buffer factory |
+| `slot_size` | `int` | `32` bytes | `chronos/protocol.py` (`ORDER_SIZE`) | Dynamic binary protocol assertions |
+| `buffer_path` | `str` | `"data/chronos_ring.bin"` | `scripts/run_firehose.py`, `run_consumer.py` | Centralized data directory manager |
+| `producer_batch_size` | `int` | `500` orders | `MarketFirehose`, `benchmark_ipc.py` | Coordinated burst tuning |
+| `target_rate` | `int` | `100_000` orders/sec | `MarketFirehose`, `benchmark_ipc.py` | Load generator pacing |
+| `overwrite_on_full` | `bool` | `True` | `MarketFirehose` | Ring buffer saturation policy |
+| `consumer_batch_size` | `int` | `1_000` orders | `ZeroCopyConsumer`, `benchmark_ipc.py` | Matching engine reader loop batching |
+| `benchmark_orders` | `int` | `300_000` orders | `scripts/benchmark_ipc.py` | Automated stress testing harness |
+| `refresh_interval_ms` | `int` | `100` ms | `chronos/dashboard.py` (`DashboardConfig`) | Live engine telemetry refresh rate |
+| `min_terminal_rows` | `int` | `30` rows | `chronos/dashboard.py` (`MIN_TERMINAL_ROWS`) | Dynamic layout resizing |
+| `min_terminal_cols` | `int` | `72` cols | `chronos/dashboard.py` (`MIN_TERMINAL_COLS`) | Dynamic layout resizing |
+
+> [!NOTE]
+> **Component Integration Boundary**: Running components (`firehose.py`, `consumer.py`, `dashboard.py`, `matching_engine.pyx`) currently retain their local defaults, which match the values in `chronos/config.py` identically. The new configuration module does not disrupt any existing working code and is prepared for direct injection during the upcoming Day 5 end-to-end pipeline integration.
+
+---
+
+## 9. Team Responsibilities
 
 | Team Member | Role | Key Contributions & Scope |
 | :--- | :--- | :--- |
-| **Faizan** *(Team Leader)* | System Architecture & Foundation | * Week 1 Foundation: Binary protocol (`protocol.py`), SPSC memory-mapped ring buffer (`ring_buffer.py`), mock order generator (`firehose.py`), consumer (`consumer.py`).<br>* IPC benchmark suite (`benchmark_ipc.py`).<br>* System integration architecture, CI configuration, pytest test suite maintenance, and repository documentation. |
+| **Faizan** *(Team Leader)* | System Architecture & Foundation | * Week 1 Foundation: Binary protocol (`protocol.py`), SPSC memory-mapped ring buffer (`ring_buffer.py`), mock order generator (`firehose.py`), consumer (`consumer.py`).<br>* IPC benchmark suite (`benchmark_ipc.py`).<br>* Week 2 Day 4: Centralized project configuration module (`chronos/config.py`, `tests/test_config.py`).<br>* System integration architecture, CI configuration, pytest test suite maintenance, and repository documentation. |
 | **Albert** | Matching Engine Core | * Cython matching engine foundation (`matching_engine.pyx`).<br>* `COrder` C-level data structures and integer cent price representation.<br>* BUY and SELL order-book storage (`_bids` and `_asks`).<br>* Next: Price-Time Priority matching algorithm, order fills, and cancellation handling. |
 | **Taniya** | Monitoring & Dashboard | * Curses terminal dashboard (`dashboard.py`, `run_dashboard.py`).<br>* Multi-section UI: Market Summary, Order Book, Performance Metrics.<br>* Pure layout formatting functions and dimension checks.<br>* Next: Ingestion of live engine telemetry, top-of-book depth rendering, and dynamic latency percentiles. |
 
 ---
 
-## 9. Remaining Integration Tasks
+## 10. Remaining Integration Tasks
 
 Connecting the completed Week 1 foundation with the Week 2 modules requires the following planned engineering tasks:
 
@@ -419,7 +456,7 @@ Connecting the completed Week 1 foundation with the Week 2 modules requires the 
 
 ---
 
-## 10. How to Verify Current Components
+## 11. How to Verify Current Components
 
 ### 1. Build Cython Extension
 The Cython matching engine extension must be compiled before running Cython-dependent tests or applications:
@@ -433,6 +470,12 @@ python setup.py build_ext --inplace
 ### 2. Run Unit Tests
 Execute the pytest suite across components:
 
+* **Shared Configuration Tests** (Configuration & Validation):
+  ```powershell
+  python -m pytest tests/test_config.py -v
+  ```
+  *Expected behavior*: 52 passed tests validating configuration defaults, strict types, positive boundary validations, power-of-two checks, and independent dataclass instances.
+
 * **Week 1 Foundation Tests** (Protocol, Ring Buffer, Firehose):
   ```powershell
   python -m pytest tests/test_protocol.py tests/test_ring_buffer.py tests/test_firehose.py -v
@@ -443,18 +486,19 @@ Execute the pytest suite across components:
   ```powershell
   python -m pytest tests/test_matching_engine.py -v
   ```
-  *Expected behavior*: 44 unit tests validating engine initialization, valid order submission, rejection of invalid sides/prices/quantities, integer cent conversion, sequence order preservation, and bid/ask separation.
+  *Expected behavior*: 64 unit tests validating engine initialization, valid order submission, rejection of invalid sides/prices/quantities, integer cent conversion, sequence order preservation, bid/ask separation, price priority, and crossing detection.
 
 * **Terminal Dashboard Tests** (requires `windows-curses` on Windows):
   ```powershell
   python -m pytest tests/test_dashboard.py -v
   ```
-  *Expected behavior*: 29 unit tests verifying layout builders, header/summary/book/performance formatting, terminal size checking, and input handling.
+  *Expected behavior*: 45 unit tests verifying layout builders, header/summary/book/performance formatting, terminal size checking, and input handling.
 
 * **Full Test Suite**:
   ```powershell
   python -m pytest -v
   ```
+  *Expected behavior*: 171 passed unit tests covering configuration, protocol, ring buffer, firehose, matching engine, and terminal dashboard.
 
 ### 3. Run Standalone Scripts
 
