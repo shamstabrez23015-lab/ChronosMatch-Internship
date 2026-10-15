@@ -19,6 +19,13 @@ Week 2, Day 3:
 - Safe crossing-price detection using integer cent comparisons (best BUY >= best SELL).
 - Full preservation of order data, arrival order, and book state.
 
+Week 2, Day 4:
+- Time Priority (FIFO) at equal price levels for BUY and SELL orders.
+- Combined Price-Time Priority: price is primary, arrival time is secondary tie-breaker.
+- Deterministic arrival sequence preservation using engine `sequence_num` and timestamps.
+- Priority inspection APIs for best orders and prioritized order sequences (get_prioritized_bids, get_prioritized_asks).
+- Safe, non-mutating inspection leaving book state and quantities intact.
+
 Price Representation
 --------------------
 The Week 1 binary protocol stores prices as ``double`` (64-bit IEEE 754
@@ -156,10 +163,93 @@ cpdef long long price_to_cents(double price):
 
 
 # ---------------------------------------------------------------------------
+# C-level comparison helpers for Price-Time Priority (FIFO)
+# ---------------------------------------------------------------------------
+from functools import cmp_to_key
+
+cdef inline bint _is_earlier_order(COrder a, COrder b):
+    """Return True if order `a` has earlier arrival priority than order `b`.
+
+    Deterministic arrival evaluation:
+    1. Check `timestamp_ns` if both are non-zero and distinct.
+    2. Check engine `sequence_num` if both are non-zero and distinct.
+    3. Fallback checks on `sequence_num` and `timestamp_ns`.
+    4. Deterministic final tie-breaker on `order_id`.
+    """
+    if a.timestamp_ns != 0 and b.timestamp_ns != 0 and a.timestamp_ns != b.timestamp_ns:
+        return a.timestamp_ns < b.timestamp_ns
+    if a.sequence_num != 0 and b.sequence_num != 0 and a.sequence_num != b.sequence_num:
+        return a.sequence_num < b.sequence_num
+    if a.sequence_num != b.sequence_num:
+        return a.sequence_num < b.sequence_num
+    if a.timestamp_ns != b.timestamp_ns:
+        return a.timestamp_ns < b.timestamp_ns
+    return a.order_id < b.order_id
+
+
+cdef inline int _compare_buy_orders(COrder a, COrder b):
+    """Compare two BUY orders for Price-Time Priority.
+
+    Returns:
+       1 if `a` has higher priority than `b`
+      -1 if `b` has higher priority than `a`
+       0 if identical priority
+    """
+    if a.price_cents > b.price_cents:
+        return 1
+    elif a.price_cents < b.price_cents:
+        return -1
+    else:
+        # Equal price -> Time Priority (FIFO)
+        if _is_earlier_order(a, b):
+            return 1
+        elif _is_earlier_order(b, a):
+            return -1
+        else:
+            return 0
+
+
+cdef inline int _compare_sell_orders(COrder a, COrder b):
+    """Compare two SELL orders for Price-Time Priority.
+
+    Returns:
+       1 if `a` has higher priority than `b`
+      -1 if `b` has higher priority than `a`
+       0 if identical priority
+    """
+    if a.price_cents < b.price_cents:
+        return 1
+    elif a.price_cents > b.price_cents:
+        return -1
+    else:
+        # Equal price -> Time Priority (FIFO)
+        if _is_earlier_order(a, b):
+            return 1
+        elif _is_earlier_order(b, a):
+            return -1
+        else:
+            return 0
+
+
+def _buy_cmp(a, b):
+    # For cmp_to_key: negative means a precedes b in sorted output (higher priority first)
+    return -_compare_buy_orders(<COrder>a, <COrder>b)
+
+
+def _sell_cmp(a, b):
+    # For cmp_to_key: negative means a precedes b in sorted output (higher priority first)
+    return -_compare_sell_orders(<COrder>a, <COrder>b)
+
+
+_BUY_PRIORITY_KEY = cmp_to_key(_buy_cmp)
+_SELL_PRIORITY_KEY = cmp_to_key(_sell_cmp)
+
+
+# ---------------------------------------------------------------------------
 # Limit Order Book & Matching Engine
 # ---------------------------------------------------------------------------
 cdef class MatchingEngine:
-    """Cython Matching Engine and Limit Order Book (Week 2, Day 3).
+    """Cython Matching Engine and Limit Order Book (Week 2, Day 4).
 
     Capabilities
     ------------
@@ -169,6 +259,8 @@ cdef class MatchingEngine:
     * Accept and validate orders.
     * Full inspection and order-counting for bids and asks.
     * Price priority: Identify highest BUY and lowest SELL orders and prices.
+    * Time priority: Deterministic FIFO ordering when prices are equal.
+    * Price-Time priority: Combined priority with price as primary and FIFO as secondary.
     * Deterministic arrival preservation for equal prices.
     * Crossing-price detection (best BUY price >= best SELL price).
     * Clear and re-initialize order book state.
@@ -249,21 +341,93 @@ cdef class MatchingEngine:
 
     # ---- order retrieval / inspection -------------------------------------
 
-    cpdef list get_bids(self):
-        """Return a list copy of currently stored BUY orders in arrival order."""
+    cpdef list get_bids(self, bint priority=False):
+        """Return a list copy of currently stored BUY orders.
+
+        Parameters
+        ----------
+        priority : bint, default False
+            If ``True``, orders are returned sorted by Price-Time Priority
+            (highest price first; earlier arrival first at equal prices).
+            If ``False``, orders are returned in raw arrival sequence.
+        """
+        if priority:
+            return self.get_prioritized_bids()
         return list(self._bids)
 
-    cpdef list get_asks(self):
-        """Return a list copy of currently stored SELL orders in arrival order."""
+    cpdef list get_asks(self, bint priority=False):
+        """Return a list copy of currently stored SELL orders.
+
+        Parameters
+        ----------
+        priority : bint, default False
+            If ``True``, orders are returned sorted by Price-Time Priority
+            (lowest price first; earlier arrival first at equal prices).
+            If ``False``, orders are returned in raw arrival sequence.
+        """
+        if priority:
+            return self.get_prioritized_asks()
         return list(self._asks)
 
-    cpdef list get_buy_orders(self):
-        """Alias for ``get_bids()``."""
-        return list(self._bids)
+    cpdef list get_buy_orders(self, bint priority=False):
+        """Alias for ``get_bids(priority=priority)``."""
+        return self.get_bids(priority=priority)
 
-    cpdef list get_sell_orders(self):
-        """Alias for ``get_asks()``."""
-        return list(self._asks)
+    cpdef list get_sell_orders(self, bint priority=False):
+        """Alias for ``get_asks(priority=priority)``."""
+        return self.get_asks(priority=priority)
+
+    cpdef list get_prioritized_bids(self):
+        """Return a new list copy of BUY orders sorted in Price-Time Priority order.
+
+        Primary rule: Highest price.
+        Secondary rule: Earlier arrival (FIFO).
+        Stored book state is NOT modified.
+        """
+        cdef Py_ssize_t n = len(self._bids)
+        if n == 0:
+            return []
+        if n == 1:
+            return list(self._bids)
+        return sorted(self._bids, key=_BUY_PRIORITY_KEY)
+
+    cpdef list get_prioritized_asks(self):
+        """Return a new list copy of SELL orders sorted in Price-Time Priority order.
+
+        Primary rule: Lowest price.
+        Secondary rule: Earlier arrival (FIFO).
+        Stored book state is NOT modified.
+        """
+        cdef Py_ssize_t n = len(self._asks)
+        if n == 0:
+            return []
+        if n == 1:
+            return list(self._asks)
+        return sorted(self._asks, key=_SELL_PRIORITY_KEY)
+
+    cpdef list get_bids_by_priority(self):
+        """Alias for ``get_prioritized_bids()``."""
+        return self.get_prioritized_bids()
+
+    cpdef list get_asks_by_priority(self):
+        """Alias for ``get_prioritized_asks()``."""
+        return self.get_prioritized_asks()
+
+    cpdef list get_buy_orders_by_priority(self):
+        """Alias for ``get_prioritized_bids()``."""
+        return self.get_prioritized_bids()
+
+    cpdef list get_sell_orders_by_priority(self):
+        """Alias for ``get_prioritized_asks()``."""
+        return self.get_prioritized_asks()
+
+    cpdef list prioritized_bids(self):
+        """Alias for ``get_prioritized_bids()``."""
+        return self.get_prioritized_bids()
+
+    cpdef list prioritized_asks(self):
+        """Alias for ``get_prioritized_asks()``."""
+        return self.get_prioritized_asks()
 
     property bids:
         def __get__(self):
@@ -273,13 +437,13 @@ cdef class MatchingEngine:
         def __get__(self):
             return _OrderListView(self._asks)
 
-    # ---- price priority & best order retrieval (Week 2, Day 3) ------------
+    # ---- price priority & best order retrieval (Week 2, Day 3 & Day 4) ----
 
     cpdef COrder get_best_buy_order(self):
-        """Return the BUY order with the highest price (highest bid).
+        """Return the BUY order with the highest price-time priority.
 
-        If multiple orders share the highest price, the one that arrived
-        earliest (deterministic FIFO arrival preservation) is returned.
+        Primary rule: Highest price.
+        Secondary rule: At equal prices, earlier arrival (FIFO) has priority.
         Returns ``None`` if the BUY book is empty.
         """
         if not self._bids:
@@ -289,15 +453,15 @@ cdef class MatchingEngine:
         cdef Py_ssize_t i, n = len(self._bids)
         for i in range(1, n):
             current = <COrder>self._bids[i]
-            if current.price_cents > best.price_cents:
+            if _compare_buy_orders(current, best) > 0:
                 best = current
         return best
 
     cpdef COrder get_best_sell_order(self):
-        """Return the SELL order with the lowest price (lowest ask).
+        """Return the SELL order with the lowest price-time priority.
 
-        If multiple orders share the lowest price, the one that arrived
-        earliest (deterministic FIFO arrival preservation) is returned.
+        Primary rule: Lowest price.
+        Secondary rule: At equal prices, earlier arrival (FIFO) has priority.
         Returns ``None`` if the SELL book is empty.
         """
         if not self._asks:
@@ -307,7 +471,7 @@ cdef class MatchingEngine:
         cdef Py_ssize_t i, n = len(self._asks)
         for i in range(1, n):
             current = <COrder>self._asks[i]
-            if current.price_cents < best.price_cents:
+            if _compare_sell_orders(current, best) > 0:
                 best = current
         return best
 

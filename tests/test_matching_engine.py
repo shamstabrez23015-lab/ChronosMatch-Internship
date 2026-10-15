@@ -992,3 +992,409 @@ class TestPreserveOrderDataOnPriorityInspection:
             assert engine.has_crossing_prices() is True
 
 
+# ===========================================================================
+# Day 4: Time Priority (FIFO) & Price-Time Priority Tests
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# 19. Two BUY orders at equal prices
+# ---------------------------------------------------------------------------
+class TestTwoBuyOrdersEqualPrice:
+    """Verify FIFO ordering when two BUY orders arrive with identical prices."""
+
+    def test_two_buy_orders_equal_prices_first_arrived_selected(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        o1 = engine.submit_order(101, SIDE_BUY, 500.0, 100, timestamp_ns=1000)
+        o2 = engine.submit_order(102, SIDE_BUY, 500.0, 50, timestamp_ns=2000)
+
+        best = engine.get_best_buy_order()
+        assert best is o1
+        assert best.order_id == 101
+
+        prioritized = engine.get_prioritized_bids()
+        assert len(prioritized) == 2
+        assert prioritized[0] is o1
+        assert prioritized[1] is o2
+
+        # Check get_bids(priority=True) returns prioritized
+        assert engine.get_bids(priority=True) == [o1, o2]
+        # Check raw get_bids() returns arrival sequence
+        assert engine.get_bids() == [o1, o2]
+
+    def test_two_buy_orders_equal_prices_reverse_id_first_arrived_selected(self):
+        """Arrival sequence determines priority, not order_id magnitude."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        # Order with larger ID arrives first
+        o1 = engine.submit_order(999, SIDE_BUY, 250.0, 10, timestamp_ns=1000)
+        o2 = engine.submit_order(111, SIDE_BUY, 250.0, 20, timestamp_ns=2000)
+
+        best = engine.get_best_buy_order()
+        assert best is o1
+        assert best.order_id == 999
+        assert engine.get_prioritized_bids() == [o1, o2]
+
+
+# ---------------------------------------------------------------------------
+# 20. Three BUY orders at equal prices (Spec Example)
+# ---------------------------------------------------------------------------
+class TestThreeBuyOrdersEqualPrice:
+    """Verify FIFO ordering with three BUY orders at identical price levels."""
+
+    def test_three_buy_orders_spec_example(self):
+        """Spec example:
+        Order 101: BUY, price 500, quantity 100, arrival first.
+        Order 102: BUY, price 500, quantity 50, arrival second.
+        Order 103: BUY, price 500, quantity 80, arrival third.
+        Expected order priority: 101, then 102, then 103.
+        """
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        o101 = engine.submit_order(101, SIDE_BUY, 500.0, 100, timestamp_ns=1000)
+        o102 = engine.submit_order(102, SIDE_BUY, 500.0, 50, timestamp_ns=2000)
+        o103 = engine.submit_order(103, SIDE_BUY, 500.0, 80, timestamp_ns=3000)
+
+        assert engine.get_best_buy_order() is o101
+        prioritized = engine.get_prioritized_bids()
+        assert [o.order_id for o in prioritized] == [101, 102, 103]
+        assert [o.quantity for o in prioritized] == [100, 50, 80]
+        assert engine.get_bids(priority=True) == [o101, o102, o103]
+
+
+# ---------------------------------------------------------------------------
+# 21. Two SELL orders at equal prices
+# ---------------------------------------------------------------------------
+class TestTwoSellOrdersEqualPrice:
+    """Verify FIFO ordering when SELL orders arrive with identical prices."""
+
+    def test_two_sell_orders_equal_prices_first_arrived_selected(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_SELL
+        engine = MatchingEngine()
+        o1 = engine.submit_order(201, SIDE_SELL, 300.0, 40, timestamp_ns=1000)
+        o2 = engine.submit_order(202, SIDE_SELL, 300.0, 60, timestamp_ns=2000)
+
+        best = engine.get_best_sell_order()
+        assert best is o1
+        assert best.order_id == 201
+
+        prioritized = engine.get_prioritized_asks()
+        assert len(prioritized) == 2
+        assert prioritized[0] is o1
+        assert prioritized[1] is o2
+        assert engine.get_asks(priority=True) == [o1, o2]
+
+    def test_three_sell_orders_equal_prices_fifo(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_SELL
+        engine = MatchingEngine()
+        o1 = engine.submit_order(201, SIDE_SELL, 450.0, 100, timestamp_ns=1000)
+        o2 = engine.submit_order(202, SIDE_SELL, 450.0, 50, timestamp_ns=2000)
+        o3 = engine.submit_order(203, SIDE_SELL, 450.0, 80, timestamp_ns=3000)
+
+        assert engine.get_best_sell_order() is o1
+        prioritized = engine.get_prioritized_asks()
+        assert [o.order_id for o in prioritized] == [201, 202, 203]
+
+
+# ---------------------------------------------------------------------------
+# 22. Different BUY prices overriding arrival order
+# ---------------------------------------------------------------------------
+class TestDifferentBuyPricesOverrideArrival:
+    """Verify that a higher BUY price strictly overrides arrival order."""
+
+    def test_buy_price_overrides_arrival_spec_example(self):
+        """Spec example:
+        Order 101: price 500, first arrival
+        Order 102: price 510, second arrival
+        Order 103: price 510, third arrival
+        Expected selection order: 102, 103, 101.
+        Time priority must never override a better price.
+        """
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        o101 = engine.submit_order(101, SIDE_BUY, 500.0, 100, timestamp_ns=1000)
+        o102 = engine.submit_order(102, SIDE_BUY, 510.0, 50, timestamp_ns=2000)
+        o103 = engine.submit_order(103, SIDE_BUY, 510.0, 80, timestamp_ns=3000)
+
+        # 102 has higher price than 101, and earlier arrival than 103
+        assert engine.get_best_buy_order() is o102
+
+        prioritized = engine.get_prioritized_bids()
+        assert [o.order_id for o in prioritized] == [102, 103, 101]
+        assert [o.price for o in prioritized] == [510.0, 510.0, 500.0]
+
+    def test_higher_buy_price_arriving_last_gets_top_priority(self):
+        """A BUY order arriving last with the highest price gets top priority."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        o1 = engine.submit_order(1, SIDE_BUY, 100.0, 10, timestamp_ns=1000)
+        o2 = engine.submit_order(2, SIDE_BUY, 100.0, 10, timestamp_ns=2000)
+        o3 = engine.submit_order(3, SIDE_BUY, 105.0, 10, timestamp_ns=3000)
+
+        assert engine.get_best_buy_order() is o3
+        prioritized = engine.get_prioritized_bids()
+        assert [o.order_id for o in prioritized] == [3, 1, 2]
+
+
+# ---------------------------------------------------------------------------
+# 23. Different SELL prices overriding arrival order
+# ---------------------------------------------------------------------------
+class TestDifferentSellPricesOverrideArrival:
+    """Verify that a lower SELL price strictly overrides arrival order."""
+
+    def test_sell_price_overrides_arrival_spec_example(self):
+        """Spec example:
+        Order 201: price 520, first arrival
+        Order 202: price 510, second arrival
+        Order 203: price 510, third arrival
+        Expected selection order: 202, 203, 201.
+        Time priority must never override a better (lower) SELL price.
+        """
+        from chronos.matching_engine import MatchingEngine, SIDE_SELL
+        engine = MatchingEngine()
+        o201 = engine.submit_order(201, SIDE_SELL, 520.0, 100, timestamp_ns=1000)
+        o202 = engine.submit_order(202, SIDE_SELL, 510.0, 40, timestamp_ns=2000)
+        o203 = engine.submit_order(203, SIDE_SELL, 510.0, 80, timestamp_ns=3000)
+
+        # 202 has lower price than 201, and earlier arrival than 203
+        assert engine.get_best_sell_order() is o202
+
+        prioritized = engine.get_prioritized_asks()
+        assert [o.order_id for o in prioritized] == [202, 203, 201]
+        assert [o.price for o in prioritized] == [510.0, 510.0, 520.0]
+
+    def test_lower_sell_price_arriving_last_gets_top_priority(self):
+        """A SELL order arriving last with the lowest price gets top priority."""
+        from chronos.matching_engine import MatchingEngine, SIDE_SELL
+        engine = MatchingEngine()
+        o1 = engine.submit_order(1, SIDE_SELL, 200.0, 10, timestamp_ns=1000)
+        o2 = engine.submit_order(2, SIDE_SELL, 200.0, 10, timestamp_ns=2000)
+        o3 = engine.submit_order(3, SIDE_SELL, 195.0, 10, timestamp_ns=3000)
+
+        assert engine.get_best_sell_order() is o3
+        prioritized = engine.get_prioritized_asks()
+        assert [o.order_id for o in prioritized] == [3, 1, 2]
+
+
+# ---------------------------------------------------------------------------
+# 24. Interleaved BUY and SELL arrivals
+# ---------------------------------------------------------------------------
+class TestInterleavedBuySellArrivals:
+    """Verify price-time priority remains independent for bids and asks when interleaved."""
+
+    def test_interleaved_arrivals_preserve_independent_priorities(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        # Interleaved order submission
+        b1 = engine.submit_order(1, SIDE_BUY, 100.0, 10, timestamp_ns=100)
+        s1 = engine.submit_order(2, SIDE_SELL, 105.0, 20, timestamp_ns=200)
+        b2 = engine.submit_order(3, SIDE_BUY, 102.0, 15, timestamp_ns=300)
+        b3 = engine.submit_order(4, SIDE_BUY, 102.0, 25, timestamp_ns=400)
+        s2 = engine.submit_order(5, SIDE_SELL, 103.0, 30, timestamp_ns=500)
+        s3 = engine.submit_order(6, SIDE_SELL, 103.0, 40, timestamp_ns=600)
+
+        # Best BUY should be b2 (price 102, earlier than b3)
+        assert engine.get_best_buy_order() is b2
+        # Prioritized bids: b2 (102, ts 300), b3 (102, ts 400), b1 (100, ts 100)
+        assert [b.order_id for b in engine.get_prioritized_bids()] == [3, 4, 1]
+
+        # Best SELL should be s2 (price 103, earlier than s3)
+        assert engine.get_best_sell_order() is s2
+        # Prioritized asks: s2 (103, ts 500), s3 (103, ts 600), s1 (105, ts 200)
+        assert [s.order_id for s in engine.get_prioritized_asks()] == [5, 6, 2]
+
+        # Verify raw arrival storage is intact
+        assert [b.order_id for b in engine.get_bids()] == [1, 3, 4]
+        assert [s.order_id for s in engine.get_asks()] == [2, 5, 6]
+
+
+# ---------------------------------------------------------------------------
+# 25. Repeated priority inspection without state mutation
+# ---------------------------------------------------------------------------
+class TestRepeatedPriorityInspectionNoMutation:
+    """Verify that multiple priority inspections do not modify stored state or order quantities."""
+
+    def test_repeated_priority_inspection_immutability(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        engine.submit_order(101, SIDE_BUY, 500.0, 100, timestamp_ns=1000)
+        engine.submit_order(102, SIDE_BUY, 510.0, 50, timestamp_ns=2000)
+        engine.submit_order(103, SIDE_BUY, 510.0, 80, timestamp_ns=3000)
+        engine.submit_order(201, SIDE_SELL, 520.0, 60, timestamp_ns=4000)
+        engine.submit_order(202, SIDE_SELL, 515.0, 70, timestamp_ns=5000)
+
+        # Baseline snapshot
+        bids_before = [(b.order_id, b.price_cents, b.quantity, b.sequence_num) for b in engine.get_bids()]
+        asks_before = [(a.order_id, a.price_cents, a.quantity, a.sequence_num) for a in engine.get_asks()]
+        order_count_before = engine.order_count()
+
+        # Perform 10 consecutive priority inspection calls
+        for _ in range(10):
+            p_bids = engine.get_prioritized_bids()
+            p_asks = engine.get_prioritized_asks()
+            best_buy = engine.get_best_buy_order()
+            best_sell = engine.get_best_sell_order()
+
+            assert [o.order_id for o in p_bids] == [102, 103, 101]
+            assert [o.order_id for o in p_asks] == [202, 201]
+            assert best_buy.order_id == 102
+            assert best_sell.order_id == 202
+
+        # Verify nothing mutated
+        bids_after = [(b.order_id, b.price_cents, b.quantity, b.sequence_num) for b in engine.get_bids()]
+        asks_after = [(a.order_id, a.price_cents, a.quantity, a.sequence_num) for a in engine.get_asks()]
+        assert bids_after == bids_before
+        assert asks_after == asks_before
+        assert engine.order_count() == order_count_before
+
+    def test_inspection_does_not_change_order_quantities(self):
+        """Quantities must remain completely unchanged after priority inspection."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        b = engine.submit_order(1, SIDE_BUY, 100.0, 777, timestamp_ns=100)
+        a = engine.submit_order(2, SIDE_SELL, 105.0, 888, timestamp_ns=200)
+
+        _ = engine.get_prioritized_bids()
+        _ = engine.get_prioritized_asks()
+        _ = engine.get_best_buy_order()
+        _ = engine.get_best_sell_order()
+
+        assert b.quantity == 777
+        assert a.quantity == 888
+        assert engine.get_bids()[0].quantity == 777
+        assert engine.get_asks()[0].quantity == 888
+
+
+# ---------------------------------------------------------------------------
+# 26. Empty order-book behavior
+# ---------------------------------------------------------------------------
+class TestEmptyOrderBookTimePriority:
+    """Verify empty order-book behavior for time-priority inspection methods."""
+
+    def test_empty_book_returns_empty_lists_and_none(self):
+        from chronos.matching_engine import MatchingEngine
+        engine = MatchingEngine()
+
+        assert engine.get_prioritized_bids() == []
+        assert engine.get_prioritized_asks() == []
+        assert engine.get_bids_by_priority() == []
+        assert engine.get_asks_by_priority() == []
+        assert engine.get_buy_orders_by_priority() == []
+        assert engine.get_sell_orders_by_priority() == []
+        assert engine.prioritized_bids() == []
+        assert engine.prioritized_asks() == []
+        assert engine.get_bids(priority=True) == []
+        assert engine.get_asks(priority=True) == []
+        assert engine.get_best_buy_order() is None
+        assert engine.get_best_sell_order() is None
+
+    def test_single_order_prioritized_book(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        o = engine.submit_order(1, SIDE_BUY, 100.0, 10, timestamp_ns=100)
+        assert engine.get_prioritized_bids() == [o]
+        assert engine.get_best_buy_order() is o
+
+
+# ---------------------------------------------------------------------------
+# 27. Existing price-priority behavior remains correct
+# ---------------------------------------------------------------------------
+class TestExistingPricePriorityRemainsCorrect:
+    """Verify Day 3 price-priority and crossing detection functionality remains intact."""
+
+    def test_day3_price_priority_bids_asks(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(101, SIDE_BUY, 500.0, 100, timestamp_ns=1000)
+        engine.submit_order(102, SIDE_BUY, 510.0, 50, timestamp_ns=2000)
+        engine.submit_order(103, SIDE_BUY, 505.0, 80, timestamp_ns=3000)
+
+        engine.submit_order(201, SIDE_SELL, 515.0, 100, timestamp_ns=1000)
+        engine.submit_order(202, SIDE_SELL, 508.0, 40, timestamp_ns=2000)
+        engine.submit_order(203, SIDE_SELL, 520.0, 80, timestamp_ns=3000)
+
+        assert engine.get_best_buy_order().order_id == 102
+        assert engine.get_best_buy_price() == 510.0
+        assert engine.get_best_buy_price_cents() == 51000
+
+        assert engine.get_best_sell_order().order_id == 202
+        assert engine.get_best_sell_price() == 508.0
+        assert engine.get_best_sell_price_cents() == 50800
+
+        assert engine.has_crossing_prices() is True
+        assert engine.crossing_prices() is True
+
+    def test_day3_aliases_still_work(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        b = engine.submit_order(1, SIDE_BUY, 100.0, 10, timestamp_ns=100)
+        s = engine.submit_order(2, SIDE_SELL, 110.0, 10, timestamp_ns=200)
+
+        assert engine.best_bid() is b
+        assert engine.best_ask() is s
+        assert engine.best_buy_price() == 100.0
+        assert engine.best_sell_price() == 110.0
+        assert engine.has_crossing_prices() is False
+
+
+# ---------------------------------------------------------------------------
+# 28. Deterministic order selection when arrival timestamps are equal
+# ---------------------------------------------------------------------------
+class TestDeterministicEqualTimestamps:
+    """Verify deterministic FIFO selection when arrival timestamps are identical."""
+
+    def test_equal_timestamps_broken_by_engine_arrival_sequence(self):
+        """When multiple orders have identical timestamps, engine sequence_num preserves FIFO."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+
+        # All orders have the exact same timestamp_ns (e.g. within same clock tick)
+        same_ts = 1_700_000_000_000
+        o1 = engine.submit_order(101, SIDE_BUY, 500.0, 100, timestamp_ns=same_ts)
+        o2 = engine.submit_order(102, SIDE_BUY, 500.0, 50, timestamp_ns=same_ts)
+        o3 = engine.submit_order(103, SIDE_BUY, 500.0, 80, timestamp_ns=same_ts)
+
+        assert o1.sequence_num == 1
+        assert o2.sequence_num == 2
+        assert o3.sequence_num == 3
+
+        best = engine.get_best_buy_order()
+        assert best is o1
+        assert best.order_id == 101
+
+        prioritized = engine.get_prioritized_bids()
+        assert [o.order_id for o in prioritized] == [101, 102, 103]
+
+    def test_equal_timestamps_sell_side_broken_by_engine_sequence(self):
+        """SELL orders with identical timestamps preserve deterministic FIFO order."""
+        from chronos.matching_engine import MatchingEngine, SIDE_SELL
+        engine = MatchingEngine()
+
+        same_ts = 2_500_000_000_000
+        o1 = engine.submit_order(201, SIDE_SELL, 350.0, 30, timestamp_ns=same_ts)
+        o2 = engine.submit_order(202, SIDE_SELL, 350.0, 40, timestamp_ns=same_ts)
+        o3 = engine.submit_order(203, SIDE_SELL, 350.0, 50, timestamp_ns=same_ts)
+
+        assert engine.get_best_sell_order() is o1
+        assert [o.order_id for o in engine.get_prioritized_asks()] == [201, 202, 203]
+
+    def test_equal_timestamps_with_mixed_prices(self):
+        """Equal timestamps across mixed prices: price takes priority, FIFO within price level."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+
+        same_ts = 3_000_000_000_000
+        o1 = engine.submit_order(1, SIDE_BUY, 100.0, 10, timestamp_ns=same_ts)  # seq 1
+        o2 = engine.submit_order(2, SIDE_BUY, 105.0, 20, timestamp_ns=same_ts)  # seq 2
+        o3 = engine.submit_order(3, SIDE_BUY, 105.0, 30, timestamp_ns=same_ts)  # seq 3
+        o4 = engine.submit_order(4, SIDE_BUY, 100.0, 40, timestamp_ns=same_ts)  # seq 4
+
+        # Expected priority: 105 level (o2 then o3), followed by 100 level (o1 then o4)
+        prioritized = engine.get_prioritized_bids()
+        assert [o.order_id for o in prioritized] == [2, 3, 1, 4]
+        assert engine.get_best_buy_order() is o2
+
+
