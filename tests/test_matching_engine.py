@@ -107,6 +107,7 @@ class TestSubmitValidOrder:
             "side": 2,
             "price_cents": 5025,
             "quantity": 10,
+            "remaining_quantity": 10,
             "timestamp_ns": 12345,
         }
 
@@ -1396,5 +1397,345 @@ class TestDeterministicEqualTimestamps:
         prioritized = engine.get_prioritized_bids()
         assert [o.order_id for o in prioritized] == [2, 3, 1, 4]
         assert engine.get_best_buy_order() is o2
+
+
+# ===========================================================================
+# Day 5: Partial Order Matching Tests
+# ===========================================================================
+
+class TestPartialMatchImport:
+    """Verify Day 5 classes and methods can be imported and are available."""
+
+    def test_import_trade_result(self):
+        from chronos.matching_engine import TradeResult
+        assert TradeResult is not None
+
+    def test_import_execute_partial_match(self):
+        from chronos.matching_engine import MatchingEngine
+        engine = MatchingEngine()
+        assert hasattr(engine, "execute_partial_match")
+        assert callable(engine.execute_partial_match)
+
+
+class TestCOrderRemainingQuantityField:
+    """Verify COrder remaining_quantity initialization and properties."""
+
+    def test_initial_remaining_quantity_equals_quantity(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        order = engine.submit_order(100, SIDE_BUY, 25.50, 75, timestamp_ns=1000)
+        assert hasattr(order, "remaining_quantity")
+        assert order.remaining_quantity == 75
+        assert order.quantity == 75
+
+    def test_order_as_dict_contains_remaining_quantity(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_SELL
+        engine = MatchingEngine()
+        order = engine.submit_order(101, SIDE_SELL, 30.00, 50, timestamp_ns=2000)
+        d = order.as_dict()
+        assert "remaining_quantity" in d
+        assert d["remaining_quantity"] == 50
+        assert d["quantity"] == 50
+
+
+class TestPartialMatchBuyGreaterThanSell:
+    """BUY qty > SELL qty: SELL fully fills, BUY partially fills."""
+
+    def test_buy_100_sell_40_equal_price(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        buy = engine.submit_order(1, SIDE_BUY, 5.00, 100, timestamp_ns=1000)
+        sell = engine.submit_order(2, SIDE_SELL, 5.00, 40, timestamp_ns=2000)
+
+        trade = engine.execute_partial_match()
+        assert trade is not None
+        assert trade.executed_quantity == 40
+        assert trade.buy_remaining_quantity == 60
+        assert trade.sell_remaining_quantity == 0
+        assert trade.buy_order_id == 1
+        assert trade.sell_order_id == 2
+        assert trade.execution_price_cents == 500
+        assert trade.execution_price == 5.00
+
+        # BUY remains in book with updated remaining_quantity; original quantity untouched
+        assert engine.bid_count() == 1
+        assert engine.ask_count() == 0
+        assert buy.remaining_quantity == 60
+        assert buy.quantity == 100
+        assert sell.remaining_quantity == 0
+        assert sell.quantity == 40
+
+    def test_buy_remaining_quantity_updated(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        buy = engine.submit_order(10, SIDE_BUY, 10.00, 200, timestamp_ns=100)
+        engine.submit_order(20, SIDE_SELL, 10.00, 50, timestamp_ns=200)
+
+        trade = engine.execute_partial_match()
+        assert trade.executed_quantity == 50
+        assert buy.remaining_quantity == 150
+        assert engine.bid_count() == 1
+
+
+class TestPartialMatchSellGreaterThanBuy:
+    """SELL qty > BUY qty: BUY fully fills, SELL partially fills."""
+
+    def test_buy_30_sell_100_equal_price(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        buy = engine.submit_order(1, SIDE_BUY, 5.00, 30, timestamp_ns=1000)
+        sell = engine.submit_order(2, SIDE_SELL, 5.00, 100, timestamp_ns=2000)
+
+        trade = engine.execute_partial_match()
+        assert trade is not None
+        assert trade.executed_quantity == 30
+        assert trade.buy_remaining_quantity == 0
+        assert trade.sell_remaining_quantity == 70
+        assert trade.buy_order_id == 1
+        assert trade.sell_order_id == 2
+        assert trade.execution_price_cents == 500
+
+        # BUY fully filled (removed), SELL partially filled (remains in book)
+        assert engine.bid_count() == 0
+        assert engine.ask_count() == 1
+        assert sell.remaining_quantity == 70
+        assert sell.quantity == 100
+        assert buy.remaining_quantity == 0
+        assert buy.quantity == 30
+
+
+class TestPartialMatchEqualQuantities:
+    """Equal quantities: both orders fully fill, both removed from book."""
+
+    def test_equal_quantities_both_removed(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        buy = engine.submit_order(1, SIDE_BUY, 5.00, 50, timestamp_ns=1000)
+        sell = engine.submit_order(2, SIDE_SELL, 5.00, 50, timestamp_ns=2000)
+
+        trade = engine.execute_partial_match()
+        assert trade is not None
+        assert trade.executed_quantity == 50
+        assert trade.buy_remaining_quantity == 0
+        assert trade.sell_remaining_quantity == 0
+        assert engine.bid_count() == 0
+        assert engine.ask_count() == 0
+        assert buy.remaining_quantity == 0
+        assert sell.remaining_quantity == 0
+
+
+class TestPartialMatchCrossingPrice:
+    """BUY price > SELL price: trade executes at resting SELL price."""
+
+    def test_crossing_price_executes_at_sell_price(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 10.00, 100, timestamp_ns=1000)
+        engine.submit_order(2, SIDE_SELL, 9.00, 40, timestamp_ns=2000)
+
+        trade = engine.execute_partial_match()
+        assert trade is not None
+        assert trade.execution_price_cents == 900   # Resting SELL price
+        assert trade.execution_price == 9.00
+        assert trade.executed_quantity == 40
+
+    def test_crossing_price_at_cent_precision(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 50.25, 10, timestamp_ns=1000)
+        engine.submit_order(2, SIDE_SELL, 50.10, 10, timestamp_ns=2000)
+
+        trade = engine.execute_partial_match()
+        assert trade is not None
+        assert trade.execution_price_cents == 5010
+        assert trade.execution_price == 50.10
+
+
+class TestNonCrossingPricesNoExecution:
+    """BUY price < SELL price: no trade should occur."""
+
+    def test_no_match_when_prices_dont_cross(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 5.00, 100, timestamp_ns=1000)
+        engine.submit_order(2, SIDE_SELL, 6.00, 100, timestamp_ns=2000)
+
+        trade = engine.execute_partial_match()
+        assert trade is None
+        assert engine.bid_count() == 1
+        assert engine.ask_count() == 1
+
+    def test_no_match_empty_sell_book(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 5.00, 100, timestamp_ns=1000)
+        trade = engine.execute_partial_match()
+        assert trade is None
+
+    def test_no_match_empty_buy_book(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(2, SIDE_SELL, 5.00, 100, timestamp_ns=1000)
+        trade = engine.execute_partial_match()
+        assert trade is None
+
+    def test_no_match_empty_engine(self):
+        from chronos.matching_engine import MatchingEngine
+        engine = MatchingEngine()
+        trade = engine.execute_partial_match()
+        assert trade is None
+
+
+class TestNoNegativeQuantities:
+    """Remaining quantities must never go negative."""
+
+    def test_remaining_quantities_non_negative(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        buy = engine.submit_order(1, SIDE_BUY, 5.00, 50, timestamp_ns=1000)
+        sell = engine.submit_order(2, SIDE_SELL, 5.00, 50, timestamp_ns=2000)
+
+        trade = engine.execute_partial_match()
+        assert buy.remaining_quantity >= 0
+        assert sell.remaining_quantity >= 0
+        assert trade.buy_remaining_quantity >= 0
+        assert trade.sell_remaining_quantity >= 0
+
+
+class TestTradeResultOrderIDs:
+    """TradeResult must carry the correct BUY and SELL order IDs."""
+
+    def test_correct_order_ids_in_trade_result(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(42, SIDE_BUY, 5.00, 100, timestamp_ns=1000)
+        engine.submit_order(99, SIDE_SELL, 5.00, 30, timestamp_ns=2000)
+
+        trade = engine.execute_partial_match()
+        assert trade.buy_order_id == 42
+        assert trade.sell_order_id == 99
+
+
+class TestPartialFillTimePriority:
+    """Partially filled resting orders retain their original time priority."""
+
+    def test_partially_filled_order_retains_sequence_num(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        buy1 = engine.submit_order(1, SIDE_BUY, 5.00, 100, timestamp_ns=1000)
+        buy2 = engine.submit_order(2, SIDE_BUY, 5.00, 50, timestamp_ns=2000)
+        engine.submit_order(3, SIDE_SELL, 5.00, 40, timestamp_ns=3000)
+
+        seq_before = buy1.sequence_num
+        trade = engine.execute_partial_match()
+        assert trade is not None
+        assert buy1.sequence_num == seq_before   # sequence_num unchanged
+        # buy1 is still in book with priority over buy2
+        bids = engine.get_bids(priority=True)
+        assert bids[0].order_id == 1   # buy1 still has first FIFO priority
+
+    def test_partial_fill_does_not_change_priority_order(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        buy_early = engine.submit_order(10, SIDE_BUY, 5.00, 200, timestamp_ns=1000)
+        buy_late  = engine.submit_order(20, SIDE_BUY, 5.00, 100, timestamp_ns=2000)
+        engine.submit_order(30, SIDE_SELL, 5.00, 50, timestamp_ns=3000)
+
+        # buy_early should be matched first (earlier FIFO)
+        trade = engine.execute_partial_match()
+        assert trade.buy_order_id == 10
+        assert buy_early.remaining_quantity == 150
+        # buy_early still top priority
+        assert engine.get_best_buy_order().order_id == 10
+
+    def test_ask_partially_filled_retains_sequence_num(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        sell1 = engine.submit_order(101, SIDE_SELL, 10.00, 200, timestamp_ns=1000)
+        sell2 = engine.submit_order(102, SIDE_SELL, 10.00, 100, timestamp_ns=2000)
+        engine.submit_order(201, SIDE_BUY, 10.00, 50, timestamp_ns=3000)
+
+        seq_before = sell1.sequence_num
+        trade = engine.execute_partial_match()
+        assert trade is not None
+        assert trade.sell_order_id == 101
+        assert sell1.sequence_num == seq_before
+        assert sell1.remaining_quantity == 150
+        assert engine.get_best_sell_order().order_id == 101
+
+
+class TestFullyFilledCounterpartRemoved:
+    """Fully filled counterpart must be removed from the book."""
+
+    def test_fully_filled_sell_removed(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 5.00, 100, timestamp_ns=1000)
+        sell = engine.submit_order(2, SIDE_SELL, 5.00, 40, timestamp_ns=2000)
+
+        engine.execute_partial_match()
+        assert sell.remaining_quantity == 0
+        assert all(o.order_id != 2 for o in engine.get_asks())
+
+    def test_fully_filled_buy_removed(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        buy = engine.submit_order(1, SIDE_BUY, 5.00, 30, timestamp_ns=1000)
+        engine.submit_order(2, SIDE_SELL, 5.00, 100, timestamp_ns=2000)
+
+        engine.execute_partial_match()
+        assert buy.remaining_quantity == 0
+        assert all(o.order_id != 1 for o in engine.get_bids())
+
+
+class TestPriceTimePriorityPreservedAfterPartialFill:
+    """Price-time priority still selects the best order after partial fills."""
+
+    def test_price_priority_still_selects_best_after_partial_fill(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        buy_high = engine.submit_order(1, SIDE_BUY, 10.00, 50, timestamp_ns=1000)
+        buy_low  = engine.submit_order(2, SIDE_BUY, 9.00, 200, timestamp_ns=2000)
+        engine.submit_order(3, SIDE_SELL, 9.00, 30, timestamp_ns=3000)
+
+        trade = engine.execute_partial_match()
+        # buy_high (price 10) has priority; trade executes against it
+        assert trade.buy_order_id == 1
+        assert buy_high.remaining_quantity == 20
+        # After partial fill, buy_high (rem=20) still has price priority over buy_low
+        assert engine.get_best_buy_order().order_id == 1
+
+
+class TestTradeResultAsDictAndRepr:
+    """TradeResult attributes, as_dict(), and __repr__()."""
+
+    def test_trade_result_as_dict(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 5.00, 100, timestamp_ns=1000)
+        engine.submit_order(2, SIDE_SELL, 5.00, 40, timestamp_ns=2000)
+
+        trade = engine.execute_partial_match()
+        d = trade.as_dict()
+        assert d["buy_order_id"] == 1
+        assert d["sell_order_id"] == 2
+        assert d["executed_quantity"] == 40
+        assert d["execution_price_cents"] == 500
+        assert d["execution_price"] == 5.00
+        assert d["buy_remaining_quantity"] == 60
+        assert d["sell_remaining_quantity"] == 0
+
+    def test_trade_result_repr(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 5.00, 100, timestamp_ns=1000)
+        engine.submit_order(2, SIDE_SELL, 5.00, 40, timestamp_ns=2000)
+
+        trade = engine.execute_partial_match()
+        r = repr(trade)
+        assert "TradeResult" in r
+        assert "buy=1" in r
+        assert "sell=2" in r
+        assert "exec_qty=40" in r
 
 
