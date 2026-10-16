@@ -26,6 +26,18 @@ Week 2, Day 4:
 - Priority inspection APIs for best orders and prioritized order sequences (get_prioritized_bids, get_prioritized_asks).
 - Safe, non-mutating inspection leaving book state and quantities intact.
 
+Week 2, Day 5:
+- Partial fill execution: ``execute_partial_match()`` matches the single highest-priority
+  BUY against the single highest-priority SELL when prices cross.
+- Executed quantity = min(buy_remaining_quantity, sell_remaining_quantity).
+- Execution price policy: resting order's price (maker price = best SELL / lowest ask).
+- Partially filled resting orders retain their original arrival sequence (no re-queue).
+- Fully filled orders are removed from the order book.
+- ``TradeResult`` cdef class carries buy_order_id, sell_order_id, executed_quantity,
+  execution_price_cents, buy_remaining_quantity, sell_remaining_quantity.
+- ``remaining_quantity`` field added to COrder to track live fill state separately
+  from the original ``quantity`` field (quantity is never modified after submission).
+
 Price Representation
 --------------------
 The Week 1 binary protocol stores prices as ``double`` (64-bit IEEE 754
@@ -40,8 +52,8 @@ Side Representation
 -------------------
 Reuses the Week 1 ``Side`` convention:
 
-* ``1`` → BUY
-* ``2`` → SELL
+* ``1`` -> BUY
+* ``2`` -> SELL
 """
 
 # ---------------------------------------------------------------------------
@@ -84,17 +96,24 @@ cdef class COrder:
         Converted from the protocol's ``double`` price via
         ``round(price * 100)``.
     quantity : unsigned int
-        Number of shares/contracts (must be > 0).
+        Original number of shares/contracts submitted (must be > 0).
+        This field is never modified after submission.
+    remaining_quantity : unsigned int
+        Live remaining shares/contracts available for matching.
+        Equals ``quantity`` on submission; decremented on each partial fill.
+        Fully filled orders have ``remaining_quantity == 0``.
     timestamp_ns : unsigned long long
         Arrival timestamp in nanoseconds (or sequence number).
     sequence_num : unsigned long long
         Deterministic arrival sequence assigned by the matching engine.
+        Never modified after the order is accepted (no re-queue on partial fill).
     """
 
     cdef public unsigned long long order_id
     cdef public int side
     cdef public long long price_cents
     cdef public unsigned int quantity
+    cdef public unsigned int remaining_quantity
     cdef public unsigned long long timestamp_ns
     cdef public unsigned long long sequence_num
 
@@ -111,6 +130,7 @@ cdef class COrder:
         self.side = side
         self.price_cents = price_cents
         self.quantity = quantity
+        self.remaining_quantity = quantity  # starts equal to quantity; decremented on fills
         self.timestamp_ns = timestamp_ns
         self.sequence_num = sequence_num
 
@@ -124,6 +144,7 @@ cdef class COrder:
         return (
             f"COrder(id={self.order_id}, side={side_str}, "
             f"price_cents={self.price_cents}, qty={self.quantity}, "
+            f"rem={self.remaining_quantity}, "
             f"ts={self.timestamp_ns})"
         )
 
@@ -134,12 +155,95 @@ cdef class COrder:
             "side": self.side,
             "price_cents": self.price_cents,
             "quantity": self.quantity,
+            "remaining_quantity": self.remaining_quantity,
             "timestamp_ns": self.timestamp_ns,
         }
 
 
 # ---------------------------------------------------------------------------
-# Helper: convert protocol float price → integer cents
+# Trade result (Week 2, Day 5)
+# ---------------------------------------------------------------------------
+cdef class TradeResult:
+    """Immutable record of a single partial or full fill execution.
+
+    Created by ``MatchingEngine.execute_partial_match()`` on every successful
+    trade.  All fields are C-level typed for cache-friendliness.
+
+    Execution-price policy
+    ----------------------
+    The execution price is always the **resting SELL order's price** (lowest
+    ask / maker price).  This is the standard exchange convention: the passive
+    (resting) side sets the price; the aggressive (incoming) side accepts it.
+    For the single-shot ``execute_partial_match()`` call both orders are in
+    the book, so the best SELL price is used as the canonical execution price.
+
+    Attributes
+    ----------
+    buy_order_id : unsigned long long
+    sell_order_id : unsigned long long
+    executed_quantity : unsigned int
+        Shares actually transferred in this fill.
+    execution_price_cents : long long
+        Execution price in integer cents.
+    buy_remaining_quantity : unsigned int
+        Shares remaining in the BUY order after this fill.
+    sell_remaining_quantity : unsigned int
+        Shares remaining in the SELL order after this fill.
+    """
+
+    cdef public unsigned long long buy_order_id
+    cdef public unsigned long long sell_order_id
+    cdef public unsigned int executed_quantity
+    cdef public long long execution_price_cents
+    cdef public unsigned int buy_remaining_quantity
+    cdef public unsigned int sell_remaining_quantity
+
+    def __init__(
+        self,
+        unsigned long long buy_order_id,
+        unsigned long long sell_order_id,
+        unsigned int executed_quantity,
+        long long execution_price_cents,
+        unsigned int buy_remaining_quantity,
+        unsigned int sell_remaining_quantity,
+    ):
+        self.buy_order_id = buy_order_id
+        self.sell_order_id = sell_order_id
+        self.executed_quantity = executed_quantity
+        self.execution_price_cents = execution_price_cents
+        self.buy_remaining_quantity = buy_remaining_quantity
+        self.sell_remaining_quantity = sell_remaining_quantity
+
+    @property
+    def execution_price(self):
+        """Return the execution price as a float dollar amount."""
+        return self.execution_price_cents / 100.0
+
+    def __repr__(self):
+        return (
+            f"TradeResult("
+            f"buy={self.buy_order_id}, sell={self.sell_order_id}, "
+            f"exec_qty={self.executed_quantity}, "
+            f"price_cents={self.execution_price_cents}, "
+            f"buy_rem={self.buy_remaining_quantity}, "
+            f"sell_rem={self.sell_remaining_quantity})"
+        )
+
+    def as_dict(self):
+        """Return a plain-Python dictionary snapshot of the trade result."""
+        return {
+            "buy_order_id": self.buy_order_id,
+            "sell_order_id": self.sell_order_id,
+            "executed_quantity": self.executed_quantity,
+            "execution_price_cents": self.execution_price_cents,
+            "execution_price": self.execution_price,
+            "buy_remaining_quantity": self.buy_remaining_quantity,
+            "sell_remaining_quantity": self.sell_remaining_quantity,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Helper: convert protocol float price -> integer cents
 # ---------------------------------------------------------------------------
 cpdef long long price_to_cents(double price):
     """Convert a floating-point dollar price to integer cents.
@@ -249,7 +353,7 @@ _SELL_PRIORITY_KEY = cmp_to_key(_sell_cmp)
 # Limit Order Book & Matching Engine
 # ---------------------------------------------------------------------------
 cdef class MatchingEngine:
-    """Cython Matching Engine and Limit Order Book (Week 2, Day 4).
+    """Cython Matching Engine and Limit Order Book (Week 2, Day 5).
 
     Capabilities
     ------------
@@ -264,11 +368,11 @@ cdef class MatchingEngine:
     * Deterministic arrival preservation for equal prices.
     * Crossing-price detection (best BUY price >= best SELL price).
     * Clear and re-initialize order book state.
+    * **Day 5**: Single partial-fill execution via ``execute_partial_match()``.
 
     Not yet implemented (scheduled for later working days)
     ------------------------------------------------------
-    * Trade execution / partial fills.
-    * Complete FIFO order matching.
+    * Multi-order matching (one incoming order sweeping multiple resting orders).
     * Ring-buffer zero-copy IPC integration.
     """
 
@@ -619,7 +723,7 @@ cdef class MatchingEngine:
         side : int
             ``1`` (BUY) or ``2`` (SELL).
         price : double
-            Dollar price — will be converted to integer cents internally.
+            Dollar price -- will be converted to integer cents internally.
         quantity : unsigned int
             Must be > 0.
         timestamp_ns : unsigned long long
@@ -791,6 +895,91 @@ cdef class MatchingEngine:
             else:
                 raise ValueError(f"Invalid side {ord_obj.side}")
         return self.submit_order(*args, **kwargs)
+
+    # ---- partial-fill execution (Week 2, Day 5) ---------------------------
+
+    cpdef object execute_partial_match(self):
+        """Execute one partial fill between the best BUY and best SELL orders.
+
+        Partial-fill algorithm
+        ----------------------
+        1. Retrieve the best BUY (highest price, FIFO tie-break) and the best
+           SELL (lowest price, FIFO tie-break).
+        2. Check that prices cross: ``buy.price_cents >= sell.price_cents``.
+           If not, return ``None`` -- no trade is possible.
+        3. Compute ``executed_quantity = min(buy.remaining_quantity,
+           sell.remaining_quantity)``.  Both are unsigned; the minimum is always
+           >= 1 since orders with remaining_quantity == 0 are never kept in the
+           book.
+        4. Execution price = best SELL's ``price_cents`` (resting maker price).
+        5. Decrement ``remaining_quantity`` on both orders by ``executed_quantity``.
+           C-level unsigned arithmetic; exec_qty <= each remaining_quantity by
+           construction, so no underflow occurs.
+        6. Remove any fully filled order (``remaining_quantity == 0``) from its
+           book side.  A partially filled resting order stays with its original
+           ``sequence_num`` intact (no re-queue, no priority change).
+        7. Return a ``TradeResult`` describing the fill.
+
+        Price-time priority is preserved because:
+        * Selection always uses get_best_buy_order / get_best_sell_order.
+        * A partially filled order's sequence_num is never updated.
+        * Fully filled orders are immediately removed.
+
+        Returns
+        -------
+        TradeResult
+            On a successful match.
+        None
+            If either book side is empty or prices do not cross.
+        """
+        # Guard: both sides must be non-empty
+        if not self._bids or not self._asks:
+            return None
+
+        # Select the single highest-priority orders on each side
+        cdef COrder best_buy = self.get_best_buy_order()
+        cdef COrder best_sell = self.get_best_sell_order()
+
+        if best_buy is None or best_sell is None:
+            return None
+
+        # Price-crossing check using integer cents (no float equality risk)
+        if best_buy.price_cents < best_sell.price_cents:
+            return None
+
+        # Executed quantity: minimum of the two remaining quantities
+        cdef unsigned int exec_qty
+        if best_buy.remaining_quantity <= best_sell.remaining_quantity:
+            exec_qty = best_buy.remaining_quantity
+        else:
+            exec_qty = best_sell.remaining_quantity
+
+        # Execution price: resting SELL order's price (lowest ask / maker price)
+        cdef long long exec_price_cents = best_sell.price_cents
+
+        # Update remaining quantities (exec_qty <= each remaining_quantity by construction)
+        best_buy.remaining_quantity = best_buy.remaining_quantity - exec_qty
+        best_sell.remaining_quantity = best_sell.remaining_quantity - exec_qty
+
+        # Capture post-fill remaining quantities for the trade result
+        cdef unsigned int buy_rem = best_buy.remaining_quantity
+        cdef unsigned int sell_rem = best_sell.remaining_quantity
+
+        # Remove fully filled orders from the book; leave partial fills in place
+        if best_buy.remaining_quantity == 0:
+            self._bids.remove(best_buy)
+
+        if best_sell.remaining_quantity == 0:
+            self._asks.remove(best_sell)
+
+        return TradeResult(
+            buy_order_id=best_buy.order_id,
+            sell_order_id=best_sell.order_id,
+            executed_quantity=exec_qty,
+            execution_price_cents=exec_price_cents,
+            buy_remaining_quantity=buy_rem,
+            sell_remaining_quantity=sell_rem,
+        )
 
 
 # Module-level alias for convenience and alternative naming conventions
