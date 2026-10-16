@@ -81,12 +81,21 @@ class BestAsk(NamedTuple):
     quantity: int
 
 
+class PriceLevel(NamedTuple):
+    """Container representing a single price level and its aggregated quantity."""
+
+    price: float
+    quantity: int
+
+
 # Clearly labeled demonstration BUY orders (fixed sample data for testing & demo mode)
 SAMPLE_BUY_ORDERS: List[Dict[str, Any]] = [
     {"order_id": 101, "side": 1, "price": 500.0, "quantity": 100, "source": "DEMO_SAMPLE_DATA"},
     {"order_id": 102, "side": 1, "price": 505.0, "quantity": 80, "source": "DEMO_SAMPLE_DATA"},
     {"order_id": 103, "side": 1, "price": 510.0, "quantity": 100, "source": "DEMO_SAMPLE_DATA"},
     {"order_id": 104, "side": 1, "price": 510.0, "quantity": 50, "source": "DEMO_SAMPLE_DATA"},
+    {"order_id": 105, "side": 1, "price": 495.0, "quantity": 120, "source": "DEMO_SAMPLE_DATA"},
+    {"order_id": 106, "side": 1, "price": 490.0, "quantity": 150, "source": "DEMO_SAMPLE_DATA"},
 ]
 
 # Clearly labeled demonstration SELL orders (fixed sample data for testing & demo mode)
@@ -94,6 +103,8 @@ SAMPLE_SELL_ORDERS: List[Dict[str, Any]] = [
     {"order_id": 201, "side": 2, "price": 515.0, "quantity": 100, "source": "DEMO_SAMPLE_DATA"},
     {"order_id": 202, "side": 2, "price": 505.0, "quantity": 40, "source": "DEMO_SAMPLE_DATA"},
     {"order_id": 203, "side": 2, "price": 510.0, "quantity": 80, "source": "DEMO_SAMPLE_DATA"},
+    {"order_id": 204, "side": 2, "price": 520.0, "quantity": 70, "source": "DEMO_SAMPLE_DATA"},
+    {"order_id": 205, "side": 2, "price": 525.0, "quantity": 90, "source": "DEMO_SAMPLE_DATA"},
 ]
 
 
@@ -222,11 +233,123 @@ def _extract_order_price_qty(
     return (price, qty)
 
 
+def aggregate_orders_by_price(
+    orders: Optional[Iterable[Any]],
+    expected_side: Optional[Union[int, str]] = None,
+) -> Dict[float, int]:
+    """Aggregate total quantities by distinct price for the given orders and side.
+
+    Prices are normalized (rounded to 6 decimal places) to avoid floating-point representation drift.
+    Orders with non-positive price or quantity are ignored.
+
+    Args:
+        orders: Iterable of order objects, dicts, or tuples.
+        expected_side: 1 for BUY, 2 for SELL, or None for any side.
+
+    Returns:
+        Dictionary mapping distinct float price to aggregated integer quantity.
+    """
+    if orders is None:
+        return {}
+
+    aggregated: Dict[float, int] = {}
+    for order in orders:
+        parsed = _extract_order_price_qty(order, expected_side=expected_side)
+        if parsed is not None:
+            p, q = parsed
+            if p > 0 and q > 0:
+                norm_p = round(p, 6)
+                aggregated[norm_p] = aggregated.get(norm_p, 0) + q
+
+    return aggregated
+
+
+def calculate_buy_depth(
+    orders: Optional[Iterable[Any]],
+    max_levels: int = 5,
+) -> List[PriceLevel]:
+    """Calculate BUY order-book depth up to max_levels distinct prices.
+
+    Price levels are sorted in descending order (highest price first).
+    Orders at the same price level have their quantities aggregated.
+
+    Args:
+        orders: An iterable collection of BUY orders.
+        max_levels: Maximum number of distinct price levels to return (default: 5).
+
+    Returns:
+        List of PriceLevel(price, quantity) sorted descending by price.
+    """
+    if orders is None or max_levels <= 0:
+        return []
+
+    agg = aggregate_orders_by_price(orders, expected_side=1)
+    if not agg:
+        return []
+
+    sorted_prices = sorted(agg.keys(), reverse=True)
+    return [PriceLevel(price=p, quantity=agg[p]) for p in sorted_prices[:max_levels]]
+
+
+def calculate_sell_depth(
+    orders: Optional[Iterable[Any]],
+    max_levels: int = 5,
+) -> List[PriceLevel]:
+    """Calculate SELL order-book depth up to max_levels distinct prices.
+
+    Price levels are sorted in ascending order (lowest price first).
+    Orders at the same price level have their quantities aggregated.
+
+    Args:
+        orders: An iterable collection of SELL orders.
+        max_levels: Maximum number of distinct price levels to return (default: 5).
+
+    Returns:
+        List of PriceLevel(price, quantity) sorted ascending by price.
+    """
+    if orders is None or max_levels <= 0:
+        return []
+
+    agg = aggregate_orders_by_price(orders, expected_side=2)
+    if not agg:
+        return []
+
+    sorted_prices = sorted(agg.keys(), reverse=False)
+    return [PriceLevel(price=p, quantity=agg[p]) for p in sorted_prices[:max_levels]]
+
+
+def format_depth_rows(
+    depth: Optional[List[PriceLevel]],
+    max_levels: int = 5,
+    placeholder: str = PLACEHOLDER,
+) -> List[Tuple[str, str]]:
+    """Format price depth levels into string (price, quantity) tuples for display.
+
+    If depth contains fewer than max_levels, remaining rows are padded with placeholder.
+
+    Args:
+        depth: List of PriceLevel instances.
+        max_levels: Target number of display rows (default: 5).
+        placeholder: String to display for empty levels (default: PLACEHOLDER).
+
+    Returns:
+        List of (price_str, quantity_str) tuples of length max_levels.
+    """
+    rows: List[Tuple[str, str]] = []
+    levels = depth or []
+    for level in levels[:max_levels]:
+        rows.append((format_price(level.price), str(level.quantity)))
+
+    while len(rows) < max_levels:
+        rows.append((placeholder, placeholder))
+
+    return rows
+
+
 def calculate_best_bid(orders: Optional[Iterable[Any]]) -> BestBid:
     """Calculate the Best Bid (highest BUY price and aggregated quantity).
 
-    Finds the highest BUY price available in the collection of BUY orders and sums
-    the quantities of all orders posted at that exact highest price level.
+    Reuses calculate_buy_depth to maintain strict consistency with order-book depth.
 
     Args:
         orders: An iterable collection of BUY orders in dict, tuple, or object form.
@@ -235,37 +358,16 @@ def calculate_best_bid(orders: Optional[Iterable[Any]]) -> BestBid:
         BestBid(price=None, quantity=0) if collection is empty or contains no valid bids.
         BestBid(price=highest_price, quantity=aggregated_quantity) otherwise.
     """
-    if orders is None:
+    depth = calculate_buy_depth(orders, max_levels=1)
+    if not depth:
         return BestBid(price=None, quantity=0)
-
-    extracted: List[Tuple[float, int]] = []
-    for order in orders:
-        parsed = _extract_order_price_qty(order, expected_side=1)
-        if parsed is not None:
-            p, q = parsed
-            if p > 0 and q > 0:
-                extracted.append((p, q))
-
-    if not extracted:
-        return BestBid(price=None, quantity=0)
-
-    # Find highest buy price
-    max_price = max(p for p, _ in extracted)
-
-    # Aggregate quantities for all orders matching highest price (within float precision)
-    aggregated_qty = sum(
-        q for p, q in extracted
-        if abs(p - max_price) < 1e-6
-    )
-
-    return BestBid(price=max_price, quantity=aggregated_qty)
+    return BestBid(price=depth[0].price, quantity=depth[0].quantity)
 
 
 def calculate_best_ask(orders: Optional[Iterable[Any]]) -> BestAsk:
     """Calculate the Best Ask (lowest SELL price and aggregated quantity).
 
-    Finds the lowest SELL price available in the collection of SELL orders and sums
-    the quantities of all orders posted at that exact lowest price level.
+    Reuses calculate_sell_depth to maintain strict consistency with order-book depth.
 
     Args:
         orders: An iterable collection of SELL orders in dict, tuple, or object form.
@@ -274,30 +376,10 @@ def calculate_best_ask(orders: Optional[Iterable[Any]]) -> BestAsk:
         BestAsk(price=None, quantity=0) if collection is empty or contains no valid asks.
         BestAsk(price=lowest_price, quantity=aggregated_quantity) otherwise.
     """
-    if orders is None:
+    depth = calculate_sell_depth(orders, max_levels=1)
+    if not depth:
         return BestAsk(price=None, quantity=0)
-
-    extracted: List[Tuple[float, int]] = []
-    for order in orders:
-        parsed = _extract_order_price_qty(order, expected_side=2)
-        if parsed is not None:
-            p, q = parsed
-            if p > 0 and q > 0:
-                extracted.append((p, q))
-
-    if not extracted:
-        return BestAsk(price=None, quantity=0)
-
-    # Find lowest sell price
-    min_price = min(p for p, _ in extracted)
-
-    # Aggregate quantities for all orders matching lowest price (within float precision)
-    aggregated_qty = sum(
-        q for p, q in extracted
-        if abs(p - min_price) < 1e-6
-    )
-
-    return BestAsk(price=min_price, quantity=aggregated_qty)
+    return BestAsk(price=depth[0].price, quantity=depth[0].quantity)
 
 
 def calculate_spread(
@@ -419,7 +501,7 @@ def build_order_book_lines(
     width: int,
     bid_rows: Optional[List[Tuple[str, str]]] = None,
     ask_rows: Optional[List[Tuple[str, str]]] = None,
-    num_placeholder_rows: int = 3,
+    num_placeholder_rows: int = 5,
 ) -> List[str]:
     """Return Order Book section lines with two columns (Bids | Asks).
 
@@ -625,6 +707,12 @@ class TerminalDashboard:
         spread_val = calculate_spread(best_ask_obj, best_bid_obj)
         spread_str = format_spread(spread_val)
 
+        # Order book depth (top 5 levels)
+        buy_depth = calculate_buy_depth(b_orders, max_levels=5)
+        sell_depth = calculate_sell_depth(s_orders, max_levels=5)
+        bid_rows = format_depth_rows(buy_depth, max_levels=5)
+        ask_rows = format_depth_rows(sell_depth, max_levels=5)
+
         width = min(cols - 4, 72)
         lines: List[str] = []
         lines += build_header_lines(width, status=self.status_message)
@@ -638,7 +726,7 @@ class TerminalDashboard:
             ask_qty=ask_qty_str,
         )
         lines.append("")
-        lines += build_order_book_lines(width)
+        lines += build_order_book_lines(width, bid_rows=bid_rows, ask_rows=ask_rows)
         lines.append("")
         lines += build_performance_lines(width)
         lines.append("")
@@ -792,6 +880,12 @@ class TerminalDashboard:
         spread_val = calculate_spread(best_ask_obj, best_bid_obj)
         spread_str = format_spread(spread_val)
 
+        # Order book depth (top 5 levels)
+        buy_depth = calculate_buy_depth(b_orders, max_levels=5)
+        sell_depth = calculate_sell_depth(s_orders, max_levels=5)
+        bid_rows = format_depth_rows(buy_depth, max_levels=5)
+        ask_rows = format_depth_rows(sell_depth, max_levels=5)
+
         attrs = self._build_attrs()
         width = min(max_x - 4, 72)
         start_x = 2
@@ -843,9 +937,12 @@ class TerminalDashboard:
         )
         put(sub_hdr, attrs["label"])
 
-        for _ in range(3):
-            bid_cell = f"  {PLACEHOLDER:>8}  {PLACEHOLDER:>6}"
-            ask_cell = f"  {PLACEHOLDER:>8}  {PLACEHOLDER:>6}"
+        max_rows = max(len(bid_rows), len(ask_rows))
+        for i in range(max_rows):
+            bp, bq = bid_rows[i] if i < len(bid_rows) else (PLACEHOLDER, PLACEHOLDER)
+            ap, aq = ask_rows[i] if i < len(ask_rows) else (PLACEHOLDER, PLACEHOLDER)
+            bid_cell = f"  {bp:>8}  {bq:>6}"
+            ask_cell = f"  {ap:>8}  {aq:>6}"
             self._safe_addstr(stdscr, y, start_x, f"{bid_cell:<{half + 2}}", attrs["bid"])
             self._safe_addstr(stdscr, y, start_x + half + 2, ask_cell, attrs["ask"])
             y += 1

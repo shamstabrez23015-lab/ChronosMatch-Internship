@@ -34,9 +34,11 @@ from chronos.dashboard import (
     BestBid,
     BestAsk,
     DashboardConfig,
+    PriceLevel,
     SAMPLE_BUY_ORDERS,
     SAMPLE_SELL_ORDERS,
     TerminalDashboard,
+    aggregate_orders_by_price,
     build_header_lines,
     build_market_summary_lines,
     build_order_book_lines,
@@ -44,11 +46,14 @@ from chronos.dashboard import (
     build_footer_lines,
     calculate_best_bid,
     calculate_best_ask,
+    calculate_buy_depth,
+    calculate_sell_depth,
     calculate_spread,
     format_best_bid_price,
     format_best_bid_qty,
     format_best_ask_price,
     format_best_ask_qty,
+    format_depth_rows,
     format_price,
     format_spread,
     get_sample_buy_orders,
@@ -949,5 +954,281 @@ def test_build_market_summary_includes_ask_qty():
     assert "505.00" in joined
     assert "40" in joined
     assert "5.00" in joined
+
+
+# ===========================================================================
+# Day 5 - Order Book Depth (top 5 BUY and SELL price levels with aggregation)
+# ===========================================================================
+
+
+def test_buy_depth_single_price_level():
+    """1. Verify BUY depth calculation with a single BUY price level."""
+    orders = [{"price": 500.0, "quantity": 100}]
+    depth = calculate_buy_depth(orders)
+
+    assert len(depth) == 1
+    assert depth[0] == (500.0, 100)
+    assert depth[0].price == 500.0
+    assert depth[0].quantity == 100
+    assert isinstance(depth[0], PriceLevel)
+
+
+def test_buy_depth_multiple_price_levels():
+    """2. Verify BUY depth calculation with multiple distinct BUY price levels."""
+    orders = [
+        {"price": 500.0, "quantity": 100},
+        {"price": 505.0, "quantity": 80},
+        {"price": 510.0, "quantity": 150},
+    ]
+    depth = calculate_buy_depth(orders)
+
+    assert len(depth) == 3
+    assert depth == [
+        PriceLevel(510.0, 150),
+        PriceLevel(505.0, 80),
+        PriceLevel(500.0, 100),
+    ]
+
+
+def test_buy_depth_descending_sorting():
+    """3. Verify correct descending sorting for BUY depth (highest price first)."""
+    # Spec example:
+    # BUY 500, quantity 100
+    # BUY 510, quantity 50
+    # BUY 505, quantity 80
+    # BUY 510, quantity 100
+    # Expected: 510 (150), 505 (80), 500 (100)
+    orders = [
+        {"price": 500.0, "quantity": 100},
+        {"price": 510.0, "quantity": 50},
+        {"price": 505.0, "quantity": 80},
+        {"price": 510.0, "quantity": 100},
+    ]
+    depth = calculate_buy_depth(orders)
+
+    assert [lvl.price for lvl in depth] == [510.0, 505.0, 500.0]
+    assert [lvl.quantity for lvl in depth] == [150, 80, 100]
+
+
+def test_sell_depth_ascending_sorting():
+    """4. Verify correct ascending sorting for SELL depth (lowest price first)."""
+    # Spec example:
+    # SELL 520, quantity 100
+    # SELL 512, quantity 40
+    # SELL 515, quantity 60
+    # SELL 512, quantity 30
+    # Expected: 512 (70), 515 (60), 520 (100)
+    orders = [
+        {"side": 2, "price": 520.0, "quantity": 100},
+        {"side": 2, "price": 512.0, "quantity": 40},
+        {"side": 2, "price": 515.0, "quantity": 60},
+        {"side": 2, "price": 512.0, "quantity": 30},
+    ]
+    depth = calculate_sell_depth(orders)
+
+    assert [lvl.price for lvl in depth] == [512.0, 515.0, 520.0]
+    assert [lvl.quantity for lvl in depth] == [70, 60, 100]
+
+
+def test_equal_price_quantity_aggregation():
+    """5. Verify aggregation of quantities across multiple orders at identical prices."""
+    buy_orders = [
+        {"price": 500.0, "quantity": 50},
+        {"price": 500.0, "quantity": 75},
+        {"price": 500.0, "quantity": 25},
+    ]
+    buy_depth = calculate_buy_depth(buy_orders)
+    assert len(buy_depth) == 1
+    assert buy_depth[0].price == 500.0
+    assert buy_depth[0].quantity == 150
+
+    sell_orders = [
+        {"side": 2, "price": 505.0, "quantity": 40},
+        {"side": 2, "price": 505.0, "quantity": 60},
+        {"side": 2, "price": 505.0, "quantity": 100},
+    ]
+    sell_depth = calculate_sell_depth(sell_orders)
+    assert len(sell_depth) == 1
+    assert sell_depth[0].price == 505.0
+    assert sell_depth[0].quantity == 200
+
+
+def test_buy_depth_more_than_five_levels_truncated():
+    """6. Verify BUY depth limits display to top 5 distinct highest price levels."""
+    orders = [
+        {"price": 500.0, "quantity": 10},
+        {"price": 501.0, "quantity": 20},
+        {"price": 502.0, "quantity": 30},
+        {"price": 503.0, "quantity": 40},
+        {"price": 504.0, "quantity": 50},
+        {"price": 505.0, "quantity": 60},
+        {"price": 506.0, "quantity": 70},
+    ]
+    depth = calculate_buy_depth(orders, max_levels=5)
+
+    assert len(depth) == 5
+    # Must only contain the 5 highest prices in descending order
+    assert [lvl.price for lvl in depth] == [506.0, 505.0, 504.0, 503.0, 502.0]
+    assert [lvl.quantity for lvl in depth] == [70, 60, 50, 40, 30]
+
+
+def test_sell_depth_more_than_five_levels_truncated():
+    """7. Verify SELL depth limits display to top 5 distinct lowest price levels."""
+    orders = [
+        {"side": 2, "price": 520.0, "quantity": 70},
+        {"side": 2, "price": 519.0, "quantity": 60},
+        {"side": 2, "price": 518.0, "quantity": 50},
+        {"side": 2, "price": 517.0, "quantity": 40},
+        {"side": 2, "price": 516.0, "quantity": 30},
+        {"side": 2, "price": 515.0, "quantity": 20},
+        {"side": 2, "price": 514.0, "quantity": 10},
+    ]
+    depth = calculate_sell_depth(orders, max_levels=5)
+
+    assert len(depth) == 5
+    # Must only contain the 5 lowest prices in ascending order
+    assert [lvl.price for lvl in depth] == [514.0, 515.0, 516.0, 517.0, 518.0]
+    assert [lvl.quantity for lvl in depth] == [10, 20, 30, 40, 50]
+
+
+def test_empty_buy_order_book_depth():
+    """8. Verify empty BUY order book returns empty depth and formats with placeholders."""
+    assert calculate_buy_depth([]) == []
+    assert calculate_buy_depth(None) == []
+
+    formatted = format_depth_rows([])
+    assert len(formatted) == 5
+    for p_str, q_str in formatted:
+        assert p_str == PLACEHOLDER
+        assert q_str == PLACEHOLDER
+
+
+def test_empty_sell_order_book_depth():
+    """9. Verify empty SELL order book returns empty depth and formats with placeholders."""
+    assert calculate_sell_depth([]) == []
+    assert calculate_sell_depth(None) == []
+
+    formatted = format_depth_rows([])
+    assert len(formatted) == 5
+    for p_str, q_str in formatted:
+        assert p_str == PLACEHOLDER
+        assert q_str == PLACEHOLDER
+
+
+def test_correct_order_book_rendering_with_depth():
+    """10. Verify order book rendering with 5 price levels, formatting, and alignment."""
+    dashboard = TerminalDashboard()
+    lines = dashboard.get_display_lines(rows=40, cols=100)
+    full_output = "\n".join(lines)
+
+    # Order book headers
+    assert SECTION_ORDER_BOOK in full_output
+    assert SECTION_BUY_ORDERS in full_output
+    assert SECTION_SELL_ORDERS in full_output
+
+    # Check top 5 demonstration BUY levels are rendered
+    assert "510.00" in full_output
+    assert "505.00" in full_output
+    assert "500.00" in full_output
+    assert "495.00" in full_output
+    assert "490.00" in full_output
+
+    # Check top 5 demonstration SELL levels are rendered
+    assert "505.00" in full_output
+    assert "510.00" in full_output
+    assert "515.00" in full_output
+    assert "520.00" in full_output
+    assert "525.00" in full_output
+
+    # Verify mock curses render window receives order book depth lines
+    win = MockCursesWindow(rows=40, cols=100)
+    dashboard.render(win)
+    rendered_text = " ".join([call[2] for call in win.addstr_calls])
+
+    assert "510.00" in rendered_text
+    assert "490.00" in rendered_text
+    assert "525.00" in rendered_text
+
+
+def test_order_book_depth_alignment_with_best_bid_and_best_ask():
+    """11. Verify the first BUY level matches Best Bid and first SELL level matches Best Ask."""
+    # Test with default demonstration orders
+    dashboard = TerminalDashboard()
+    b_depth = calculate_buy_depth(dashboard.buy_orders)
+    s_depth = calculate_sell_depth(dashboard.sell_orders)
+    best_bid = calculate_best_bid(dashboard.buy_orders)
+    best_ask = calculate_best_ask(dashboard.sell_orders)
+
+    assert b_depth[0].price == best_bid.price
+    assert b_depth[0].quantity == best_bid.quantity
+    assert s_depth[0].price == best_ask.price
+    assert s_depth[0].quantity == best_ask.quantity
+
+    # Test with custom arbitrary orders
+    custom_buys = [
+        {"price": 400.0, "quantity": 10},
+        {"price": 420.0, "quantity": 55},
+        {"price": 410.0, "quantity": 25},
+    ]
+    custom_sells = [
+        {"side": 2, "price": 450.0, "quantity": 30},
+        {"side": 2, "price": 430.0, "quantity": 70},
+        {"side": 2, "price": 440.0, "quantity": 40},
+    ]
+    custom_b_depth = calculate_buy_depth(custom_buys)
+    custom_s_depth = calculate_sell_depth(custom_sells)
+    custom_best_bid = calculate_best_bid(custom_buys)
+    custom_best_ask = calculate_best_ask(custom_sells)
+
+    assert custom_b_depth[0].price == custom_best_bid.price == 420.0
+    assert custom_b_depth[0].quantity == custom_best_bid.quantity == 55
+    assert custom_s_depth[0].price == custom_best_ask.price == 430.0
+    assert custom_s_depth[0].quantity == custom_best_ask.quantity == 70
+
+
+def test_preservation_of_all_existing_dashboard_behavior():
+    """12. Verify all existing sections, controls, and features remain intact."""
+    dashboard = TerminalDashboard()
+    lines = dashboard.get_display_lines(rows=40, cols=100)
+    text = "\n".join(lines)
+
+    # Header
+    assert APP_TITLE in text
+    assert APP_SUBTITLE in text
+    assert "Demo: Sample Data" in text
+
+    # Market Summary
+    assert SECTION_MARKET_SUMMARY in text
+    assert LABEL_BEST_BID in text
+    assert LABEL_BID_QTY in text
+    assert LABEL_BEST_ASK in text
+    assert LABEL_ASK_QTY in text
+    assert LABEL_SPREAD in text
+    assert "510.00" in text
+    assert "150" in text
+    assert "505.00" in text
+    assert "40" in text
+    assert "-5.00" in text
+
+    # Performance
+    assert SECTION_PERFORMANCE in text
+    assert LABEL_TOTAL_ORDERS in text
+    assert LABEL_THROUGHPUT in text
+    assert LABEL_LATENCY in text
+
+    # Footer
+    assert QUIT_MESSAGE in text
+
+    # Q to quit input
+    assert dashboard.handle_input(ord("q")) is False
+    assert dashboard.handle_input(ord("Q")) is False
+    assert dashboard.handle_input(ord("x")) is True
+
+    # Small terminal message
+    small_lines = dashboard.get_display_lines(rows=10, cols=30)
+    small_text = "\n".join(small_lines)
+    assert "too small" in small_text.lower()
+    assert QUIT_MESSAGE in small_text
+
 
 
