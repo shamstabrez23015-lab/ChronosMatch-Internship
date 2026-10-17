@@ -353,7 +353,7 @@ _SELL_PRIORITY_KEY = cmp_to_key(_sell_cmp)
 # Limit Order Book & Matching Engine
 # ---------------------------------------------------------------------------
 cdef class MatchingEngine:
-    """Cython Matching Engine and Limit Order Book (Week 2, Day 5).
+    """Cython Matching Engine and Limit Order Book (Week 2, Day 6).
 
     Capabilities
     ------------
@@ -369,10 +369,12 @@ cdef class MatchingEngine:
     * Crossing-price detection (best BUY price >= best SELL price).
     * Clear and re-initialize order book state.
     * **Day 5**: Single partial-fill execution via ``execute_partial_match()``.
+    * **Day 6**: Multi-order matching via ``match_order()``.  A single incoming
+      order sweeps across multiple compatible resting orders using strict
+      price-time priority, producing one ``TradeResult`` per fill.
 
     Not yet implemented (scheduled for later working days)
     ------------------------------------------------------
-    * Multi-order matching (one incoming order sweeping multiple resting orders).
     * Ring-buffer zero-copy IPC integration.
     """
 
@@ -980,6 +982,216 @@ cdef class MatchingEngine:
             buy_remaining_quantity=buy_rem,
             sell_remaining_quantity=sell_rem,
         )
+
+    # ---- multi-order matching (Week 2, Day 6) -----------------------------
+
+    cpdef list match_order(
+        self,
+        unsigned long long order_id,
+        int side,
+        double price,
+        unsigned int quantity,
+        unsigned long long timestamp_ns,
+    ):
+        """Match a single incoming order against multiple compatible resting orders.
+
+        Multi-order matching algorithm (Day 6)
+        ---------------------------------------
+        1. Validate the incoming order (side, price, quantity).
+        2. Convert the incoming price to integer cents.
+        3. Sort the opposite-side book by price-time priority (one sort per call).
+        4. Iterate through the sorted opposite-side orders in priority order:
+           a. Check price compatibility:
+              - Incoming BUY: ``incoming_price_cents >= resting_sell.price_cents``
+              - Incoming SELL: ``incoming_price_cents <= resting_buy.price_cents``
+           b. Compute ``exec_qty = min(incoming_remaining, resting.remaining_quantity)``.
+           c. Decrement both remaining quantities by ``exec_qty``.
+           d. Execution price = resting order's ``price_cents`` (maker price).
+           e. Produce a ``TradeResult`` for this fill.
+           f. If the resting order is fully filled, mark it for removal.
+           g. If the incoming order is fully filled, stop.
+        5. Remove all fully filled resting orders from the book.
+        6. If the incoming order has remaining quantity, add it to the
+           appropriate book side with its original arrival priority.
+        7. Return the list of ``TradeResult`` records in execution order.
+
+        Execution price policy
+        ----------------------
+        Each fill uses the **resting order's price** (maker price), which is the
+        standard exchange convention.  When an incoming BUY sweeps across SELL
+        orders at different price levels, each fill records the SELL order's price.
+        When an incoming SELL sweeps across BUY orders, each fill records the
+        BUY order's price.
+
+        Parameters
+        ----------
+        order_id : unsigned long long
+            Unique order identifier for the incoming order.
+        side : int
+            ``1`` (BUY) or ``2`` (SELL).
+        price : double
+            Dollar price of the incoming order.
+        quantity : unsigned int
+            Number of shares/contracts. Must be > 0.
+        timestamp_ns : unsigned long long
+            Arrival timestamp in nanoseconds.
+
+        Returns
+        -------
+        list[TradeResult]
+            A list of ``TradeResult`` objects, one per fill, in execution order.
+            Empty list if no fills occurred (opposite book empty or no
+            compatible prices).
+
+        Raises
+        ------
+        ValueError
+            If side, price, or quantity is invalid.
+        """
+        # --- validation (same rules as submit_order) ---
+        if side != _SIDE_BUY and side != _SIDE_SELL:
+            raise ValueError(
+                f"Invalid side {side}: must be {_SIDE_BUY} (BUY) or {_SIDE_SELL} (SELL)"
+            )
+        if price <= 0.0:
+            raise ValueError(
+                f"Invalid price {price}: must be positive"
+            )
+        if quantity == 0:
+            raise ValueError(
+                "Invalid quantity 0: must be positive"
+            )
+
+        cdef long long incoming_price_cents = price_to_cents(price)
+        cdef unsigned int incoming_remaining = quantity
+
+        # Assign a sequence number to the incoming order now so that if it
+        # ends up resting in the book it preserves its original arrival order.
+        self._sequence_counter += 1
+        cdef unsigned long long incoming_seq = self._sequence_counter
+
+        cdef list trades = []
+        cdef list opposite_sorted
+        cdef list to_remove = []
+        cdef COrder resting
+        cdef COrder new_order
+        cdef unsigned int exec_qty
+        cdef long long exec_price_cents
+        cdef Py_ssize_t i, n
+
+        if side == _SIDE_BUY:
+            # Incoming BUY matches against resting SELLs (lowest price first)
+            if not self._asks:
+                # No resting sells; add incoming to bids
+                pass
+            else:
+                opposite_sorted = self.get_prioritized_asks()
+                n = len(opposite_sorted)
+                for i in range(n):
+                    if incoming_remaining == 0:
+                        break
+                    resting = <COrder>opposite_sorted[i]
+                    # Price compatibility: BUY price >= SELL price
+                    if incoming_price_cents < resting.price_cents:
+                        break  # sorted by price asc; no further matches possible
+                    # Compute fill quantity
+                    if incoming_remaining <= resting.remaining_quantity:
+                        exec_qty = incoming_remaining
+                    else:
+                        exec_qty = resting.remaining_quantity
+                    # Execution price: resting SELL's price (maker price)
+                    exec_price_cents = resting.price_cents
+                    # Update quantities
+                    incoming_remaining = incoming_remaining - exec_qty
+                    resting.remaining_quantity = resting.remaining_quantity - exec_qty
+                    # Record trade
+                    trades.append(TradeResult(
+                        buy_order_id=order_id,
+                        sell_order_id=resting.order_id,
+                        executed_quantity=exec_qty,
+                        execution_price_cents=exec_price_cents,
+                        buy_remaining_quantity=incoming_remaining,
+                        sell_remaining_quantity=resting.remaining_quantity,
+                    ))
+                    # Mark fully filled resting orders for removal
+                    if resting.remaining_quantity == 0:
+                        to_remove.append(resting)
+
+                # Remove fully filled resting SELL orders from the book
+                for i in range(len(to_remove)):
+                    self._asks.remove(<COrder>to_remove[i])
+
+            # If incoming BUY has remaining quantity, add to bids book
+            if incoming_remaining > 0:
+                new_order = COrder(
+                    order_id=order_id,
+                    side=_SIDE_BUY,
+                    price_cents=incoming_price_cents,
+                    quantity=quantity,
+                    timestamp_ns=timestamp_ns,
+                    sequence_num=incoming_seq,
+                )
+                new_order.remaining_quantity = incoming_remaining
+                self._bids.append(new_order)
+                self._order_count += 1
+
+        else:
+            # Incoming SELL matches against resting BUYs (highest price first)
+            if not self._bids:
+                # No resting buys; add incoming to asks
+                pass
+            else:
+                opposite_sorted = self.get_prioritized_bids()
+                n = len(opposite_sorted)
+                for i in range(n):
+                    if incoming_remaining == 0:
+                        break
+                    resting = <COrder>opposite_sorted[i]
+                    # Price compatibility: SELL price <= BUY price
+                    if incoming_price_cents > resting.price_cents:
+                        break  # sorted by price desc; no further matches possible
+                    # Compute fill quantity
+                    if incoming_remaining <= resting.remaining_quantity:
+                        exec_qty = incoming_remaining
+                    else:
+                        exec_qty = resting.remaining_quantity
+                    # Execution price: resting BUY's price (maker price)
+                    exec_price_cents = resting.price_cents
+                    # Update quantities
+                    incoming_remaining = incoming_remaining - exec_qty
+                    resting.remaining_quantity = resting.remaining_quantity - exec_qty
+                    # Record trade
+                    trades.append(TradeResult(
+                        buy_order_id=resting.order_id,
+                        sell_order_id=order_id,
+                        executed_quantity=exec_qty,
+                        execution_price_cents=exec_price_cents,
+                        buy_remaining_quantity=resting.remaining_quantity,
+                        sell_remaining_quantity=incoming_remaining,
+                    ))
+                    # Mark fully filled resting orders for removal
+                    if resting.remaining_quantity == 0:
+                        to_remove.append(resting)
+
+                # Remove fully filled resting BUY orders from the book
+                for i in range(len(to_remove)):
+                    self._bids.remove(<COrder>to_remove[i])
+
+            # If incoming SELL has remaining quantity, add to asks book
+            if incoming_remaining > 0:
+                new_order = COrder(
+                    order_id=order_id,
+                    side=_SIDE_SELL,
+                    price_cents=incoming_price_cents,
+                    quantity=quantity,
+                    timestamp_ns=timestamp_ns,
+                    sequence_num=incoming_seq,
+                )
+                new_order.remaining_quantity = incoming_remaining
+                self._asks.append(new_order)
+                self._order_count += 1
+
+        return trades
 
 
 # Module-level alias for convenience and alternative naming conventions
