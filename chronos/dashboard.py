@@ -49,8 +49,13 @@ LABEL_BID_ASK_SPREAD = LABEL_SPREAD
 
 # Performance field labels
 LABEL_TOTAL_ORDERS = "Total Orders Processed"
+LABEL_ORDERS_PROCESSED = LABEL_TOTAL_ORDERS
 LABEL_THROUGHPUT = "Throughput (orders/sec)"
 LABEL_LATENCY = "Latency (microseconds)"
+
+# Demonstration / sample constants
+DEMO_ORDERS_PROCESSED = 125
+SAMPLE_ORDERS_PROCESSED = DEMO_ORDERS_PROCESSED
 
 # Placeholder value used when data is not yet available
 PLACEHOLDER = "--"
@@ -231,6 +236,29 @@ def _extract_order_price_qty(
         return None
 
     return (price, qty)
+
+
+def _extract_order_id(order: Any) -> Optional[Any]:
+    """Extract order ID from various order representations (dict, object, tuple).
+
+    Args:
+        order: The order object, dict, or tuple.
+
+    Returns:
+        The extracted order ID, or None if not present or cannot be determined.
+    """
+    if order is None:
+        return None
+    if isinstance(order, dict):
+        return order.get("order_id", order.get("id"))
+    if hasattr(order, "order_id"):
+        return getattr(order, "order_id")
+    if hasattr(order, "id"):
+        return getattr(order, "id")
+    if isinstance(order, (tuple, list)) and len(order) >= 3:
+        if isinstance(order[0], int):
+            return order[0]
+    return None
 
 
 def aggregate_orders_by_price(
@@ -443,6 +471,38 @@ def format_spread(spread: Optional[Union[float, int]]) -> str:
     return format_price(spread)
 
 
+def format_orders_processed(count: Optional[Union[int, str]]) -> str:
+    """Format processed-orders counter with thousands separators, or PLACEHOLDER if None.
+
+    Args:
+        count: Non-negative integer count, integer-convertible string, or None.
+
+    Returns:
+        Formatted string with commas (e.g., '125', '12,500', '0') or PLACEHOLDER ('--').
+
+    Raises:
+        ValueError: If count is negative.
+    """
+    if count is None:
+        return PLACEHOLDER
+    try:
+        val = int(count)
+    except (ValueError, TypeError):
+        return PLACEHOLDER
+    if val < 0:
+        raise ValueError(f"Orders processed count cannot be negative: {val}")
+    return f"{val:,}"
+
+
+# Alias matching total orders label
+format_total_orders = format_orders_processed
+
+
+def get_sample_orders_processed() -> int:
+    """Return the demonstration count of processed orders based on sample data."""
+    return DEMO_ORDERS_PROCESSED
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -549,17 +609,34 @@ def build_order_book_lines(
 
 def build_performance_lines(
     width: int,
-    total_orders: str = PLACEHOLDER,
+    total_orders: Union[str, int] = PLACEHOLDER,
     throughput: str = PLACEHOLDER,
     latency: str = PLACEHOLDER,
+    orders_processed: Optional[Union[str, int]] = None,
 ) -> List[str]:
-    """Return Performance Metrics section lines."""
+    """Return Performance Metrics section lines.
+
+    Args:
+        width: Available content width in characters.
+        total_orders: Total processed orders (integer, formatted string, or PLACEHOLDER).
+        throughput: Throughput metric string.
+        latency: Latency metric string.
+        orders_processed: Optional alias for total_orders.
+    """
+    raw_val = orders_processed if orders_processed is not None else total_orders
+    if isinstance(raw_val, int):
+        orders_str = format_orders_processed(raw_val)
+    elif raw_val is None:
+        orders_str = PLACEHOLDER
+    else:
+        orders_str = str(raw_val)
+
     divider = "-" * width
     col_w = max(width - 4, 10)
     return [
         f"  {SECTION_PERFORMANCE}",
         divider,
-        f"  {LABEL_TOTAL_ORDERS:<{col_w - 10}} {total_orders:>8}",
+        f"  {LABEL_TOTAL_ORDERS:<{col_w - 10}} {orders_str:>8}",
         f"  {LABEL_THROUGHPUT:<{col_w - 10}} {throughput:>8}",
         f"  {LABEL_LATENCY:<{col_w - 10}} {latency:>8}",
         divider,
@@ -588,8 +665,9 @@ class TerminalDashboard:
         buy_orders: Optional[List[Any]] = None,
         sell_orders: Optional[List[Any]] = None,
         use_sample_data: bool = True,
+        orders_processed: int = 0,
     ) -> None:
-        """Initialize the dashboard with optional configuration and order data."""
+        """Initialize the dashboard with optional configuration, order data, and counter."""
         self.config = config or DashboardConfig()
         self.is_running = False
         self.frame_count = 0
@@ -616,6 +694,101 @@ class TerminalDashboard:
             self.is_sell_sample_data = False
 
         self.is_sample_data = self.is_buy_sample_data or self.is_sell_sample_data
+
+        try:
+            init_val = int(orders_processed)
+        except (ValueError, TypeError) as err:
+            raise ValueError(
+                f"Orders processed count must be an integer, got: {orders_processed}"
+            ) from err
+        if init_val < 0:
+            raise ValueError(f"Orders processed count cannot be negative: {orders_processed}")
+        self._orders_processed: int = init_val
+        self._processed_order_ids: set = set()
+
+    @property
+    def orders_processed(self) -> int:
+        """Return the current number of processed orders."""
+        return self._orders_processed
+
+    @orders_processed.setter
+    def orders_processed(self, value: int) -> None:
+        """Set the processed orders counter, rejecting negative values."""
+        try:
+            int_val = int(value)
+        except (ValueError, TypeError) as err:
+            raise ValueError(f"Orders processed count must be an integer, got: {value}") from err
+        if int_val < 0:
+            raise ValueError(f"Orders processed count cannot be negative: {value}")
+        self._orders_processed = int_val
+
+    def set_orders_processed(self, count: int) -> None:
+        """Explicitly set the processed orders count.
+
+        Args:
+            count: Non-negative integer count.
+
+        Raises:
+            ValueError: If count is negative.
+        """
+        self.orders_processed = count
+
+    def update_orders_processed(self, count: int) -> None:
+        """Alias for set_orders_processed, ready for live engine snapshot integration."""
+        self.set_orders_processed(count)
+
+    def increment_orders_processed(self, delta: int = 1) -> int:
+        """Increment the processed orders counter by delta.
+
+        Args:
+            delta: Non-negative integer to increment by (default: 1).
+
+        Returns:
+            The updated counter value.
+
+        Raises:
+            ValueError: If delta is negative.
+        """
+        try:
+            int_delta = int(delta)
+        except (ValueError, TypeError) as err:
+            raise ValueError(f"Increment delta must be an integer, got: {delta}") from err
+        if int_delta < 0:
+            raise ValueError(f"Increment delta cannot be negative: {delta}")
+        self.orders_processed += int_delta
+        return self.orders_processed
+
+    def record_order_processed(self, order: Optional[Any] = None) -> int:
+        """Record a single processed order event.
+
+        The counter represents the number of orders accepted or processed by the engine,
+        not the number of trades executed. A single order creating multiple fills counts
+        as one processed order.
+
+        Args:
+            order: Optional order representation (dict, object, tuple, or None).
+                   If an order_id is present, duplicate events for the same order are ignored.
+
+        Returns:
+            The updated orders_processed count.
+        """
+        order_id = _extract_order_id(order)
+        if order_id is not None:
+            if order_id in self._processed_order_ids:
+                return self.orders_processed
+            self._processed_order_ids.add(order_id)
+
+        self.increment_orders_processed(1)
+        return self.orders_processed
+
+    def on_order_processed(self, order: Optional[Any] = None) -> int:
+        """Event handler callback for order processed events (alias for record_order_processed)."""
+        return self.record_order_processed(order)
+
+    def reset_orders_processed(self) -> None:
+        """Reset the processed orders counter and seen order IDs to zero/empty."""
+        self._orders_processed = 0
+        self._processed_order_ids.clear()
 
     @property
     def status_message(self) -> str:
@@ -680,6 +853,7 @@ class TerminalDashboard:
         cols: int,
         buy_orders: Optional[List[Any]] = None,
         sell_orders: Optional[List[Any]] = None,
+        orders_processed: Optional[int] = None,
     ) -> List[str]:
         """Generate all display lines for the current state.
 
@@ -713,6 +887,9 @@ class TerminalDashboard:
         bid_rows = format_depth_rows(buy_depth, max_levels=5)
         ask_rows = format_depth_rows(sell_depth, max_levels=5)
 
+        orders_cnt = self.orders_processed if orders_processed is None else orders_processed
+        total_orders_str = format_orders_processed(orders_cnt)
+
         width = min(cols - 4, 72)
         lines: List[str] = []
         lines += build_header_lines(width, status=self.status_message)
@@ -728,7 +905,7 @@ class TerminalDashboard:
         lines.append("")
         lines += build_order_book_lines(width, bid_rows=bid_rows, ask_rows=ask_rows)
         lines.append("")
-        lines += build_performance_lines(width)
+        lines += build_performance_lines(width, total_orders=total_orders_str)
         lines.append("")
         lines += build_footer_lines(width)
         return lines
@@ -841,6 +1018,7 @@ class TerminalDashboard:
         stdscr: Any,
         buy_orders: Optional[List[Any]] = None,
         sell_orders: Optional[List[Any]] = None,
+        orders_processed: Optional[int] = None,
     ) -> None:
         """Render a single frame of the dashboard onto the curses window."""
         try:
@@ -856,7 +1034,11 @@ class TerminalDashboard:
         # Small-terminal fallback
         if not self.is_terminal_size_sufficient(max_y, max_x):
             lines = self.get_display_lines(
-                max_y, max_x, buy_orders=buy_orders, sell_orders=sell_orders
+                max_y,
+                max_x,
+                buy_orders=buy_orders,
+                sell_orders=sell_orders,
+                orders_processed=orders_processed,
             )
             for idx, line in enumerate(lines):
                 self._safe_addstr(stdscr, idx, 0, line)
@@ -950,10 +1132,13 @@ class TerminalDashboard:
         put(divider, attrs["border"])
         blank()
 
+        orders_cnt = self.orders_processed if orders_processed is None else orders_processed
+        total_orders_str = format_orders_processed(orders_cnt)
+
         # ---- Performance Metrics ----
         put(f"  {SECTION_PERFORMANCE}", attrs["section"])
         put(divider, attrs["border"])
-        put(f"  {LABEL_TOTAL_ORDERS:<{col_w - 10}} {PLACEHOLDER:>8}", attrs["label"])
+        put(f"  {LABEL_TOTAL_ORDERS:<{col_w - 10}} {total_orders_str:>8}", attrs["label"])
         put(f"  {LABEL_THROUGHPUT:<{col_w - 10}} {PLACEHOLDER:>8}", attrs["label"])
         put(f"  {LABEL_LATENCY:<{col_w - 10}} {PLACEHOLDER:>8}", attrs["label"])
         put(divider, attrs["border"])
