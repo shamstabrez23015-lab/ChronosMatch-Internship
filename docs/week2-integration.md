@@ -531,3 +531,84 @@ Execute the pytest suite across components:
   python scripts/benchmark_ipc.py --orders 300000 --rate 100000
   ```
   *Expected behavior*: Spawns concurrent producer and consumer processes over a temporary ring buffer, reporting end-to-end elapsed time, throughput (~100,000 orders/sec), and microsecond latency statistics.
+
+---
+
+## 12. Day 6 Integration Test Foundation & Boundary Analysis
+
+Working Day 6 establishes an automated integration test foundation in `tests/test_pipeline_integration.py` to systematically verify subsystem boundaries linking the Week 1 IPC pipeline and the Week 2 Cython matching engine before executing Day 7 full end-to-end order-flow testing.
+
+### 12.1 Overview of Integration Test Suite
+
+The integration test suite (`tests/test_pipeline_integration.py`) defines 19 executable tests grouped into six subsystem boundary classes using real components without mock objects or placeholder assertions:
+
+| Test Boundary Class | Subsystem Scope | Test Count | Key Invariants Verified |
+| :--- | :--- | :---: | :--- |
+| `TestBinaryProtocolBoundary` | Binary Serialization / Struct Layout | 4 | 32-byte cache alignment (`ORDER_SIZE`), bi-directional packing/unpacking fidelity, zero-copy buffer offset packing, boundary values (uint64 order IDs, nanosecond timestamps, floating-point prices). |
+| `TestRingBufferBoundary` | SPSC Shared Memory Ring Buffer | 3 | Single order write/read preservation, multi-order sequential FIFO transfer, batch write/read (`write_batch`, `read_batch_raw`, `read_batch_orders`), slot indexing and buffer capacity tracking. |
+| `TestConsumerComponentBoundary` | Real Consumer Process Component | 2 | `ZeroCopyConsumer` draining real memory-mapped ring buffer, progress metrics calculation, duration-bounded and count-bounded safe loop termination. |
+| `TestBinaryToEngineAdaptationBoundary` | Binary Protocol to Engine Ingestion | 4 | Mapping decoded `Order` NamedTuples and raw tuples to `MatchingEngine.submit_order`, float dollar price conversion to integer cents (`price_to_cents`), price priority sorting (`get_best_buy_order`), FIFO time priority preservation at identical prices. |
+| `TestDay5ScenariosCompatibilityBoundary` | Day 5 Trading Scenarios Integration | 5 | All 10 deterministic scenarios verified for 32-byte protocol serialization, scenario transfer through ring buffer, exact-match execution (`SCENARIO_1_EXACT_MATCH`), partial-fill execution (`SCENARIO_4_PARTIAL_FILL_BUY_LARGER`), non-crossing spread preservation (`SCENARIO_3_NO_TRADE`). |
+| `TestIntegratedOrderFlowPipeline` | Multi-Step Boundary Flow | 1 | Complete 4-step pipeline: Raw batch creation -> Ring buffer batch write -> Raw batch drain -> MatchingEngine ingestion -> Price priority verification -> Trade execution (`execute_partial_match`) -> Post-match book state verification. |
+
+### 12.2 Working Integration Boundaries
+
+The following subsystem boundaries are fully implemented, verified, and operational:
+
+1. **Binary Protocol Boundary (`chronos/protocol.py`)**:
+   - `Order.pack()` compiles exactly to 32 bytes (`<QQdIHBB`).
+   - `Order.unpack(buffer)` and `unpack_order_raw(view, offset)` faithfully decode all seven fields (`order_id`, `timestamp_ns`, `price`, `quantity`, `symbol_id`, `side`, `order_type`).
+   - String properties (`symbol_str`, `side_str`, `order_type_str`) correctly resolve symbol registry IDs and enumeration types.
+2. **Shared Memory Ring Buffer Boundary (`chronos/ring_buffer.py`)**:
+   - `MmapRingBuffer` correctly writes and reads orders in lock-free single-producer single-consumer mode.
+   - Sequential writes preserve strict arrival order (FIFO queue semantics).
+   - Zero-copy batch writing (`write_batch`) and reading (`read_batch_raw`) amortize CPU synchronization overhead.
+   - Resource isolation via temporary files, page-aligned headers (4,096 bytes), and cache-line separation (offset 64 for write head, offset 128 for read tail) functions reliably across Windows and POSIX environments.
+3. **Consumer Component Boundary (`chronos/consumer.py`)**:
+   - `ZeroCopyConsumer` drains raw order tuples from `MmapRingBuffer` in configurable batch sizes.
+   - Tracks real-time elapsed time, total orders processed, throughput rate, and min/max/average transit latencies.
+4. **Binary Decoded Order to Matching Engine Adaptation**:
+   - Real unpacked orders adapt directly into `MatchingEngine.submit_order(order_id, side, price, quantity, timestamp_ns)`.
+   - Floating-point prices are safely converted into integer cent ticks via `price_to_cents()`.
+   - Engine assigns monotonic `sequence_num` and segregates orders into `_bids` and `_asks`.
+   - Engine price priority (`get_best_buy_order()`, `get_best_sell_order()`) and FIFO time priority operate accurately on binary-decoded orders.
+5. **Day 5 Reusable Trading Scenarios Compatibility (`tests/trading_scenarios.py`)**:
+   - All 10 deterministic trading scenarios serialize into valid 32-byte protocol frames.
+   - Scenarios transferred through the ring buffer execute correctly in `MatchingEngine.execute_partial_match()`, yielding trade results and remaining quantities identical to Day 5 mathematical specifications.
+
+### 12.3 Incomplete Integration Boundaries & Identified Gaps
+
+The Day 6 integration test foundation identified the following specific architectural gaps required for full end-to-end operation:
+
+1. **Protocol vs. Engine Field Mismatch (`symbol_id` and `order_type`)**:
+   - **Current State**: The binary protocol defines 7 fields (`order_id`, `timestamp_ns`, `price`, `quantity`, `symbol_id`, `side`, `order_type`). `COrder` and `MatchingEngine.submit_order` accept only 5 parameters (`order_id`, `side`, `price`, `quantity`, `timestamp_ns`).
+   - **Gap**: `symbol_id` and `order_type` are not stored in `COrder`. The matching engine currently acts as a single-symbol limit book. Ingestion of multi-ticker streams requires a multi-symbol router (mapping `symbol_id -> MatchingEngine`).
+   - **Cancellation & Market Orders**: `order_type == 3` (CANCEL) and `order_type == 2` (MARKET) cannot be processed directly by `submit_order` today without dedicated dispatching logic.
+2. **Missing Formal Integration Adapter Component (`chronos/adapter.py`)**:
+   - **Current State**: In the Day 6 integration tests, adaptation between the ring buffer consumer and the matching engine is performed directly via Python argument mapping:
+     ```python
+     matching_engine.submit_order(
+         order_id=raw[0],
+         side=raw[5],
+         price=raw[2],
+         quantity=raw[3],
+         timestamp_ns=raw[1],
+     )
+     ```
+   - **Gap**: An operational adapter service is needed to continuously drain the buffer in a background worker, route orders by symbol, dispatch cancellations, and feed `MatchingEngine` instances.
+3. **Decoupled Telemetry Snapshot Provider for Terminal Dashboard**:
+   - **Current State**: `TerminalDashboard` (`chronos/dashboard.py`) currently renders demonstration sample data or placeholder rows.
+   - **Gap**: `MatchingEngine` executes at 100k+ orders/sec and does not maintain an atomic telemetry snapshot buffer. To drive the 10–100Hz curses dashboard without slowing down the matching loop, a thread-safe snapshot provider (sampling `best_bid`, `best_ask`, `spread`, depth levels, throughput, latency) must be implemented.
+
+### 12.4 Day 7 Work Required
+
+The following tasks are scheduled for Day 7 end-to-end integration:
+
+1. **End-to-End Pipeline Worker (`chronos/pipeline.py` / `scripts/run_pipeline.py`)**:
+   - Implement the coordinated pipeline process connecting `MarketFirehose` (Producer) -> `MmapRingBuffer` (Shared Memory) -> `PipelineConsumer` (Engine Ingestion) -> `MatchingEngine` (LOB Execution).
+2. **Order Pipeline Adapter (`chronos/adapter.py`)**:
+   - Implement `OrderAdapter` or `MultiSymbolBookRouter` to handle symbol demultiplexing, order type dispatching (`LIMIT`, `MARKET`, `CANCEL`), and batch ingestion.
+3. **Live Telemetry Dashboard Bridge**:
+   - Connect `TerminalDashboard` to real matching engine telemetry snapshots, displaying live Best Bid, Best Ask, Bid-Ask Spread, Level-2 Depth rows, and real-time transit latency distributions.
+4. **End-to-End Order-Flow Integration Test Suite**:
+   - Implement integration tests validating live multi-process streaming: synthetic orders generated -> written to ring buffer -> consumed and matched by Cython engine -> telemetry verified in dashboard output.
