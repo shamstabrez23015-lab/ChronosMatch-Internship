@@ -2433,3 +2433,566 @@ class TestMultiMatchWithPreFilledRestingOrders:
         remaining = engine.get_asks()[0]
         assert remaining.order_id == 2
         assert remaining.remaining_quantity == 20
+
+
+# ===========================================================================
+# 47. Day 7 — Best Bid from Multiple BUY Prices
+# ===========================================================================
+class TestDay7BestBidMultiplePrices:
+    """Verify Best Bid selection across multiple BUY orders with distinct price levels."""
+
+    def test_best_bid_from_multiple_ascending_prices(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 100.0, 50, 100)
+        engine.submit_order(2, SIDE_BUY, 105.0, 40, 200)
+        engine.submit_order(3, SIDE_BUY, 110.0, 30, 300)
+
+        best = engine.get_best_bid()
+        assert best is not None
+        assert best.order_id == 3
+        assert best.price == 110.0
+        assert best.price_cents == 11000
+        assert engine.get_best_bid_price() == 110.0
+        assert engine.get_best_bid_price_cents() == 11000
+
+    def test_best_bid_from_multiple_descending_prices(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 110.0, 30, 100)
+        engine.submit_order(2, SIDE_BUY, 105.0, 40, 200)
+        engine.submit_order(3, SIDE_BUY, 100.0, 50, 300)
+
+        best = engine.get_best_bid()
+        assert best is not None
+        assert best.order_id == 1
+        assert best.price == 110.0
+        assert engine.get_best_bid_price() == 110.0
+
+    def test_best_bid_from_multiple_random_prices(self):
+        import random
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        rng = random.Random(123)
+        prices = [round(rng.uniform(50.0, 250.0), 2) for _ in range(30)]
+        max_p = max(prices)
+
+        engine = MatchingEngine()
+        for i, p in enumerate(prices, start=1):
+            engine.submit_order(i, SIDE_BUY, p, 10, i * 1000)
+
+        assert engine.get_best_bid_price() == max_p
+        assert engine.get_best_bid().price == max_p
+
+    def test_best_bid_quantity_single_and_aggregate(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 105.0, 50, 100)
+        engine.submit_order(2, SIDE_BUY, 105.0, 75, 200)
+        engine.submit_order(3, SIDE_BUY, 102.0, 30, 300)
+
+        # Top order has quantity 50
+        assert engine.get_best_bid_quantity(aggregate=False) == 50
+        # Aggregated quantity at price level 105.0 is 50 + 75 = 125
+        assert engine.get_best_bid_quantity(aggregate=True) == 125
+        assert engine.get_best_bid_qty() == 125
+
+
+# ===========================================================================
+# 48. Day 7 — Best Ask from Multiple SELL Prices
+# ===========================================================================
+class TestDay7BestAskMultiplePrices:
+    """Verify Best Ask selection across multiple SELL orders with distinct price levels."""
+
+    def test_best_ask_from_multiple_ascending_prices(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_SELL, 200.0, 25, 100)
+        engine.submit_order(2, SIDE_SELL, 205.0, 35, 200)
+        engine.submit_order(3, SIDE_SELL, 210.0, 45, 300)
+
+        best = engine.get_best_ask()
+        assert best is not None
+        assert best.order_id == 1
+        assert best.price == 200.0
+        assert best.price_cents == 20000
+        assert engine.get_best_ask_price() == 200.0
+        assert engine.get_best_ask_price_cents() == 20000
+
+    def test_best_ask_from_multiple_descending_prices(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_SELL, 210.0, 45, 100)
+        engine.submit_order(2, SIDE_SELL, 205.0, 35, 200)
+        engine.submit_order(3, SIDE_SELL, 200.0, 25, 300)
+
+        best = engine.get_best_ask()
+        assert best is not None
+        assert best.order_id == 3
+        assert best.price == 200.0
+        assert engine.get_best_ask_price() == 200.0
+
+    def test_best_ask_from_multiple_random_prices(self):
+        import random
+        from chronos.matching_engine import MatchingEngine, SIDE_SELL
+        rng = random.Random(456)
+        prices = [round(rng.uniform(100.0, 300.0), 2) for _ in range(30)]
+        min_p = min(prices)
+
+        engine = MatchingEngine()
+        for i, p in enumerate(prices, start=1):
+            engine.submit_order(i, SIDE_SELL, p, 15, i * 1000)
+
+        assert engine.get_best_ask_price() == min_p
+        assert engine.get_best_ask().price == min_p
+
+    def test_best_ask_quantity_single_and_aggregate(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_SELL, 150.0, 40, 100)
+        engine.submit_order(2, SIDE_SELL, 150.0, 60, 200)
+        engine.submit_order(3, SIDE_SELL, 155.0, 80, 300)
+
+        assert engine.get_best_ask_quantity(aggregate=False) == 40
+        assert engine.get_best_ask_quantity(aggregate=True) == 100
+        assert engine.get_best_ask_qty() == 100
+
+
+# ===========================================================================
+# 49. Day 7 — Empty Sides Handling
+# ===========================================================================
+class TestDay7EmptySidesHandling:
+    """Verify safe and consistent behavior when either or both book sides are empty."""
+
+    def test_empty_engine_both_sides(self):
+        from chronos.matching_engine import MatchingEngine
+        engine = MatchingEngine()
+        assert engine.get_best_bid() is None
+        assert engine.get_best_ask() is None
+        assert engine.get_best_bid_price() is None
+        assert engine.get_best_ask_price() is None
+        assert engine.get_best_bid_price_cents() is None
+        assert engine.get_best_ask_price_cents() is None
+        assert engine.get_best_bid_quantity() == 0
+        assert engine.get_best_ask_quantity() == 0
+        assert engine.get_spread() is None
+        assert engine.get_spread_cents() is None
+        assert engine.has_crossing_prices() is False
+
+    def test_empty_buy_side_with_active_asks(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_SELL, 100.0, 50, 100)
+
+        assert engine.get_best_bid() is None
+        assert engine.get_best_bid_price() is None
+        assert engine.get_best_bid_quantity() == 0
+        assert engine.get_best_ask() is not None
+        assert engine.get_best_ask_price() == 100.0
+        assert engine.get_best_ask_quantity() == 50
+        assert engine.get_spread() is None
+
+    def test_empty_sell_side_with_active_bids(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 99.0, 40, 100)
+
+        assert engine.get_best_bid() is not None
+        assert engine.get_best_bid_price() == 99.0
+        assert engine.get_best_bid_quantity() == 40
+        assert engine.get_best_ask() is None
+        assert engine.get_best_ask_price() is None
+        assert engine.get_best_ask_quantity() == 0
+        assert engine.get_spread() is None
+
+
+# ===========================================================================
+# 50. Day 7 — Best Prices After Better-Priced Order Inserted
+# ===========================================================================
+class TestDay7BetterPricedOrderInsertion:
+    """Verify best prices immediately update when a better-priced order is inserted."""
+
+    def test_better_buy_price_becomes_top_of_book(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 100.0, 50, 100)
+        assert engine.get_best_bid_price() == 100.0
+
+        # Insert a better BUY (higher price)
+        engine.submit_order(2, SIDE_BUY, 102.50, 30, 200)
+        assert engine.get_best_bid_price() == 102.50
+        assert engine.get_best_bid().order_id == 2
+        assert engine.get_best_bid_quantity(aggregate=False) == 30
+
+        # Insert a worse BUY (lower price) - best remains order 2
+        engine.submit_order(3, SIDE_BUY, 101.0, 40, 300)
+        assert engine.get_best_bid_price() == 102.50
+        assert engine.get_best_bid().order_id == 2
+
+    def test_better_sell_price_becomes_top_of_book(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_SELL, 110.0, 50, 100)
+        assert engine.get_best_ask_price() == 110.0
+
+        # Insert a better SELL (lower price)
+        engine.submit_order(2, SIDE_SELL, 107.50, 25, 200)
+        assert engine.get_best_ask_price() == 107.50
+        assert engine.get_best_ask().order_id == 2
+        assert engine.get_best_ask_quantity(aggregate=False) == 25
+
+        # Insert a worse SELL (higher price) - best remains order 2
+        engine.submit_order(3, SIDE_SELL, 109.0, 35, 300)
+        assert engine.get_best_ask_price() == 107.50
+        assert engine.get_best_ask().order_id == 2
+
+
+# ===========================================================================
+# 51. Day 7 — Best Prices and Quantities After Partial Fill
+# ===========================================================================
+class TestDay7BestPricesAfterPartialFill:
+    """Verify top-of-book price and quantity state after partial executions."""
+
+    def test_best_bid_retained_with_decremented_quantity(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 100.0, 100, 100)
+        engine.submit_order(2, SIDE_BUY, 98.0, 50, 200)
+
+        # Incoming SELL for 40 @ 100.0 partially fills BUY #1
+        trades = engine.match_order(
+            order_id=10, side=SIDE_SELL, price=100.0, quantity=40, timestamp_ns=300
+        )
+        assert len(trades) == 1
+        assert trades[0].executed_quantity == 40
+
+        # Best bid is still order #1 at 100.0, but with remaining_quantity = 60
+        best = engine.get_best_bid()
+        assert best.order_id == 1
+        assert best.price == 100.0
+        assert best.remaining_quantity == 60
+        assert best.quantity == 100  # original quantity preserved
+        assert engine.get_best_bid_quantity() == 60
+
+    def test_best_ask_retained_with_decremented_quantity(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_SELL, 105.0, 80, 100)
+        engine.submit_order(2, SIDE_SELL, 108.0, 40, 200)
+
+        # Incoming BUY for 50 @ 105.0 partially fills SELL #1
+        trades = engine.match_order(
+            order_id=20, side=SIDE_BUY, price=105.0, quantity=50, timestamp_ns=300
+        )
+        assert len(trades) == 1
+        assert trades[0].executed_quantity == 50
+
+        # Best ask is still order #1 at 105.0, with remaining_quantity = 30
+        best = engine.get_best_ask()
+        assert best.order_id == 1
+        assert best.price == 105.0
+        assert best.remaining_quantity == 30
+        assert best.quantity == 80  # original quantity preserved
+        assert engine.get_best_ask_quantity() == 30
+
+
+# ===========================================================================
+# 52. Day 7 — Best Prices After Full Fill Removes Top Order
+# ===========================================================================
+class TestDay7BestPricesAfterFullFillRemovesTopOrder:
+    """Verify next priority order seamlessly becomes top-of-book after full fills."""
+
+    def test_full_fill_promotes_next_best_buy(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 100.0, 50, 100)
+        engine.submit_order(2, SIDE_BUY, 95.0, 70, 200)
+
+        # Incoming SELL matches exactly 50 @ 100.0, fully removing order #1
+        trades = engine.match_order(
+            order_id=10, side=SIDE_SELL, price=100.0, quantity=50, timestamp_ns=300
+        )
+        assert len(trades) == 1
+
+        # Order #1 is removed; Order #2 @ 95.0 is now top-of-book
+        assert engine.bid_count() == 1
+        best = engine.get_best_bid()
+        assert best.order_id == 2
+        assert best.price == 95.0
+        assert best.remaining_quantity == 70
+        assert engine.get_best_bid_price() == 95.0
+        assert engine.get_best_bid_quantity() == 70
+
+    def test_full_fill_promotes_next_best_sell(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_SELL, 110.0, 30, 100)
+        engine.submit_order(2, SIDE_SELL, 115.0, 60, 200)
+
+        # Incoming BUY matches exactly 30 @ 110.0, fully removing order #1
+        trades = engine.match_order(
+            order_id=20, side=SIDE_BUY, price=110.0, quantity=30, timestamp_ns=300
+        )
+        assert len(trades) == 1
+
+        # Order #1 is removed; Order #2 @ 115.0 is now top-of-book
+        assert engine.ask_count() == 1
+        best = engine.get_best_ask()
+        assert best.order_id == 2
+        assert best.price == 115.0
+        assert best.remaining_quantity == 60
+        assert engine.get_best_ask_price() == 115.0
+        assert engine.get_best_ask_quantity() == 60
+
+    def test_exhausting_all_orders_leaves_side_safely_empty(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 100.0, 50, 100)
+
+        engine.match_order(
+            order_id=10, side=SIDE_SELL, price=100.0, quantity=50, timestamp_ns=200
+        )
+
+        assert engine.bid_count() == 0
+        assert engine.get_best_bid() is None
+        assert engine.get_best_bid_price() is None
+        assert engine.get_best_bid_quantity() == 0
+
+
+# ===========================================================================
+# 53. Day 7 — Equal-Price FIFO Priority Behavior
+# ===========================================================================
+class TestDay7EqualPriceFIFOBehavior:
+    """Verify strict FIFO time priority at equal price levels."""
+
+    def test_equal_price_bids_fifo_arrival_sequence(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        engine.submit_order(101, SIDE_BUY, 150.0, 20, 1000)
+        engine.submit_order(102, SIDE_BUY, 150.0, 30, 2000)
+        engine.submit_order(103, SIDE_BUY, 150.0, 40, 3000)
+
+        # Earliest arrival (101) must be best bid
+        assert engine.get_best_bid().order_id == 101
+
+        # Aggregated quantity is 20 + 30 + 40 = 90
+        assert engine.get_best_bid_quantity(aggregate=True) == 90
+        assert engine.get_best_bid_quantity(aggregate=False) == 20
+
+    def test_equal_price_bids_fifo_advancement_on_fills(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(101, SIDE_BUY, 150.0, 20, 1000)
+        engine.submit_order(102, SIDE_BUY, 150.0, 30, 2000)
+        engine.submit_order(103, SIDE_BUY, 150.0, 40, 3000)
+
+        # Fill 101 completely
+        engine.match_order(1, SIDE_SELL, 150.0, 20, 4000)
+        assert engine.get_best_bid().order_id == 102
+        assert engine.get_best_bid_quantity(aggregate=True) == 70
+
+        # Fill 102 partially (10 remaining)
+        engine.match_order(2, SIDE_SELL, 150.0, 20, 5000)
+        assert engine.get_best_bid().order_id == 102
+        assert engine.get_best_bid().remaining_quantity == 10
+        assert engine.get_best_bid_quantity(aggregate=True) == 50
+
+        # Fill 102 completely
+        engine.match_order(3, SIDE_SELL, 150.0, 10, 6000)
+        assert engine.get_best_bid().order_id == 103
+        assert engine.get_best_bid_quantity(aggregate=True) == 40
+
+    def test_equal_price_asks_fifo_advancement_on_fills(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(201, SIDE_SELL, 160.0, 15, 1000)
+        engine.submit_order(202, SIDE_SELL, 160.0, 25, 2000)
+        engine.submit_order(203, SIDE_SELL, 160.0, 35, 3000)
+
+        assert engine.get_best_ask().order_id == 201
+        assert engine.get_best_ask_quantity(aggregate=True) == 75
+
+        # Fill 201 completely
+        engine.match_order(1, SIDE_BUY, 160.0, 15, 4000)
+        assert engine.get_best_ask().order_id == 202
+        assert engine.get_best_ask_quantity(aggregate=True) == 60
+
+
+# ===========================================================================
+# 54. Day 7 — Non-Mutating Order-Book Inspection
+# ===========================================================================
+class TestDay7NonMutatingInspection:
+    """Verify that inspecting top-of-book and depth never mutates book state."""
+
+    def test_repeated_inspection_calls_leave_state_identical(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 100.0, 50, 100)
+        engine.submit_order(2, SIDE_BUY, 99.0, 30, 200)
+        engine.submit_order(3, SIDE_SELL, 105.0, 40, 300)
+
+        for _ in range(10):
+            _ = engine.get_best_bid()
+            _ = engine.get_best_ask()
+            _ = engine.get_best_bid_price()
+            _ = engine.get_best_ask_price()
+            _ = engine.get_best_bid_quantity()
+            _ = engine.get_best_ask_quantity()
+            _ = engine.get_spread()
+            _ = engine.get_spread_cents()
+            _ = engine.get_top_of_book()
+            _ = engine.get_prioritized_bids()
+            _ = engine.get_prioritized_asks()
+
+        assert engine.bid_count() == 2
+        assert engine.ask_count() == 1
+        assert engine.order_count() == 3
+        assert engine.get_best_bid().remaining_quantity == 50
+        assert engine.get_best_ask().remaining_quantity == 40
+
+    def test_mutating_returned_prioritized_list_does_not_mutate_book(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 100.0, 50, 100)
+        engine.submit_order(2, SIDE_BUY, 102.0, 30, 200)
+
+        bids = engine.get_prioritized_bids()
+        bids.clear()
+
+        # Internal book remains intact
+        assert engine.bid_count() == 2
+        assert engine.get_best_bid().order_id == 2
+
+
+# ===========================================================================
+# 55. Day 7 — Consistency After Multi-Order Matching
+# ===========================================================================
+class TestDay7ConsistencyAfterMultiOrderMatching:
+    """Verify top-of-book and depth consistency after multi-order sweeps."""
+
+    def test_buy_sweeps_multiple_sells_leaving_correct_top_ask(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_SELL, 100.0, 30, 100)
+        engine.submit_order(2, SIDE_SELL, 101.0, 40, 200)
+        engine.submit_order(3, SIDE_SELL, 102.0, 50, 300)
+
+        # Incoming BUY sweeps all of #1 and 20 of #2
+        trades = engine.match_order(
+            order_id=99, side=SIDE_BUY, price=101.50, quantity=50, timestamp_ns=400
+        )
+        assert len(trades) == 2
+
+        # #1 is removed; #2 now has 20 remaining at 101.0
+        assert engine.ask_count() == 2
+        best_ask = engine.get_best_ask()
+        assert best_ask.order_id == 2
+        assert best_ask.price == 101.0
+        assert best_ask.remaining_quantity == 20
+        assert engine.get_best_ask_quantity(aggregate=False) == 20
+
+    def test_incoming_residual_rests_as_new_top_of_book(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_SELL, 100.0, 30, 100)
+
+        # Incoming BUY for 80 @ 102.0 matches 30 @ 100.0, leaving 50 residual @ 102.0
+        trades = engine.match_order(
+            order_id=99, side=SIDE_BUY, price=102.0, quantity=80, timestamp_ns=200
+        )
+        assert len(trades) == 1
+        assert trades[0].executed_quantity == 30
+
+        # Asks are now empty
+        assert engine.ask_count() == 0
+        assert engine.get_best_ask() is None
+
+        # Bids has the residual 50 @ 102.0 as top-of-book
+        assert engine.bid_count() == 1
+        best_bid = engine.get_best_bid()
+        assert best_bid.order_id == 99
+        assert best_bid.price == 102.0
+        assert best_bid.remaining_quantity == 50
+        assert engine.get_best_bid_quantity() == 50
+
+
+# ===========================================================================
+# 56. Day 7 — Zero Remaining Quantity Safety
+# ===========================================================================
+class TestDay7ZeroRemainingQuantitySafety:
+    """Verify that zero-remaining-quantity orders never persist as active resting orders."""
+
+    def test_reject_adding_corder_with_zero_remaining_quantity(self):
+        from chronos.matching_engine import COrder, MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        cord = COrder(
+            order_id=1, side=SIDE_BUY, price_cents=10000, quantity=50, timestamp_ns=100
+        )
+        cord.remaining_quantity = 0  # simulate already-filled order
+
+        with pytest.raises(ValueError, match="Invalid remaining_quantity 0"):
+            engine.add_buy_order(cord)
+
+        cord_sell = COrder(
+            order_id=2, side=SIDE_SELL, price_cents=10500, quantity=30, timestamp_ns=200
+        )
+        cord_sell.remaining_quantity = 0
+
+        with pytest.raises(ValueError, match="Invalid remaining_quantity 0"):
+            engine.add_sell_order(cord_sell)
+
+    def test_get_best_orders_ignores_any_zero_remaining_quantity(self):
+        from chronos.matching_engine import COrder, MatchingEngine, SIDE_BUY
+        engine = MatchingEngine()
+        o1 = engine.submit_order(1, SIDE_BUY, 105.0, 50, 100)
+        o2 = engine.submit_order(2, SIDE_BUY, 100.0, 30, 200)
+
+        # Manually set o1 remaining_quantity to 0
+        o1.remaining_quantity = 0
+
+        # get_best_bid must skip o1 and select active order o2
+        best = engine.get_best_bid()
+        assert best.order_id == 2
+        assert best.price == 100.0
+
+
+# ===========================================================================
+# 57. Day 7 — Top of Book and Spread API
+# ===========================================================================
+class TestDay7TopOFBookAndSpreadAPI:
+    """Verify Top-of-Book snapshot and spread calculation APIs."""
+
+    def test_spread_calculation_normal_market(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 150.0, 100, 100)
+        engine.submit_order(2, SIDE_SELL, 152.50, 50, 200)
+
+        assert engine.get_spread() == 2.50
+        assert engine.get_spread_cents() == 250
+        assert engine.spread() == 2.50
+        assert engine.has_crossing_prices() is False
+
+    def test_spread_calculation_crossing_market(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 155.0, 100, 100)
+        engine.submit_order(2, SIDE_SELL, 152.0, 50, 200)
+
+        assert engine.get_spread() == -3.0
+        assert engine.get_spread_cents() == -300
+        assert engine.has_crossing_prices() is True
+
+    def test_top_of_book_dict_snapshot(self):
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 100.0, 50, 100)
+        engine.submit_order(2, SIDE_BUY, 100.0, 75, 200)
+        engine.submit_order(3, SIDE_SELL, 102.0, 40, 300)
+
+        tob = engine.get_top_of_book()
+        assert tob["best_bid_price"] == 100.0
+        assert tob["best_bid_quantity"] == 125
+        assert tob["best_ask_price"] == 102.0
+        assert tob["best_ask_quantity"] == 40
+        assert tob["spread"] == 2.0
+

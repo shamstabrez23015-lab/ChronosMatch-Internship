@@ -33,10 +33,19 @@ Week 2, Day 5:
 - Execution price policy: resting order's price (maker price = best SELL / lowest ask).
 - Partially filled resting orders retain their original arrival sequence (no re-queue).
 - Fully filled orders are removed from the order book.
-- ``TradeResult`` cdef class carries buy_order_id, sell_order_id, executed_quantity,
-  execution_price_cents, buy_remaining_quantity, sell_remaining_quantity.
-- ``remaining_quantity`` field added to COrder to track live fill state separately
-  from the original ``quantity`` field (quantity is never modified after submission).
+Week 2, Day 6:
+- Multi-order matching: ``match_order()`` sweeps an incoming order across multiple
+  compatible resting orders using strict price-time priority.
+
+Week 2, Day 7:
+- Best Bid / Best Ask Access and Order-Book State Management:
+  * Best bid: Highest remaining BUY price and available quantity.
+  * Best ask: Lowest remaining SELL price and available quantity.
+  * Quantity accessors: ``get_best_bid_quantity()``, ``get_best_ask_quantity()`` (individual or aggregate).
+  * Bid-ask spread inspection: ``get_spread()``, ``get_spread_cents()``, ``spread()``.
+  * Top-of-book telemetry snapshot: ``get_top_of_book()``, ``top_of_book()``.
+  * Order-book state consistency guarantees: FIFO preservation, zero-remaining-quantity active order exclusion.
+  * 100% non-mutating inspection leaving book state and arrival sequence intact.
 
 Price Representation
 --------------------
@@ -488,28 +497,32 @@ cdef class MatchingEngine:
 
         Primary rule: Highest price.
         Secondary rule: Earlier arrival (FIFO).
+        Only active resting orders with remaining_quantity > 0 are included.
         Stored book state is NOT modified.
         """
         cdef Py_ssize_t n = len(self._bids)
         if n == 0:
             return []
-        if n == 1:
-            return list(self._bids)
-        return sorted(self._bids, key=_BUY_PRIORITY_KEY)
+        cdef list active = [o for o in self._bids if (<COrder>o).remaining_quantity > 0]
+        if len(active) <= 1:
+            return list(active)
+        return sorted(active, key=_BUY_PRIORITY_KEY)
 
     cpdef list get_prioritized_asks(self):
         """Return a new list copy of SELL orders sorted in Price-Time Priority order.
 
         Primary rule: Lowest price.
         Secondary rule: Earlier arrival (FIFO).
+        Only active resting orders with remaining_quantity > 0 are included.
         Stored book state is NOT modified.
         """
         cdef Py_ssize_t n = len(self._asks)
         if n == 0:
             return []
-        if n == 1:
-            return list(self._asks)
-        return sorted(self._asks, key=_SELL_PRIORITY_KEY)
+        cdef list active = [o for o in self._asks if (<COrder>o).remaining_quantity > 0]
+        if len(active) <= 1:
+            return list(active)
+        return sorted(active, key=_SELL_PRIORITY_KEY)
 
     cpdef list get_bids_by_priority(self):
         """Alias for ``get_prioritized_bids()``."""
@@ -543,23 +556,26 @@ cdef class MatchingEngine:
         def __get__(self):
             return _OrderListView(self._asks)
 
-    # ---- price priority & best order retrieval (Week 2, Day 3 & Day 4) ----
+    # ---- price priority & best order retrieval (Week 2, Day 3 & Day 4 & Day 7) ----
 
     cpdef COrder get_best_buy_order(self):
         """Return the BUY order with the highest price-time priority.
 
         Primary rule: Highest price.
         Secondary rule: At equal prices, earlier arrival (FIFO) has priority.
-        Returns ``None`` if the BUY book is empty.
+        Only considers active resting orders with remaining_quantity > 0.
+        Returns ``None`` if the BUY book is empty or has no active orders.
         """
         if not self._bids:
             return None
-        cdef COrder best = <COrder>self._bids[0]
+        cdef COrder best = None
         cdef COrder current
         cdef Py_ssize_t i, n = len(self._bids)
-        for i in range(1, n):
+        for i in range(n):
             current = <COrder>self._bids[i]
-            if _compare_buy_orders(current, best) > 0:
+            if current.remaining_quantity == 0:
+                continue
+            if best is None or _compare_buy_orders(current, best) > 0:
                 best = current
         return best
 
@@ -568,16 +584,19 @@ cdef class MatchingEngine:
 
         Primary rule: Lowest price.
         Secondary rule: At equal prices, earlier arrival (FIFO) has priority.
-        Returns ``None`` if the SELL book is empty.
+        Only considers active resting orders with remaining_quantity > 0.
+        Returns ``None`` if the SELL book is empty or has no active orders.
         """
         if not self._asks:
             return None
-        cdef COrder best = <COrder>self._asks[0]
+        cdef COrder best = None
         cdef COrder current
         cdef Py_ssize_t i, n = len(self._asks)
-        for i in range(1, n):
+        for i in range(n):
             current = <COrder>self._asks[i]
-            if _compare_sell_orders(current, best) > 0:
+            if current.remaining_quantity == 0:
+                continue
+            if best is None or _compare_sell_orders(current, best) > 0:
                 best = current
         return best
 
@@ -675,6 +694,154 @@ cdef class MatchingEngine:
     cpdef object get_best_ask_price_cents(self):
         """Alias for ``get_best_sell_price_cents()``."""
         return self.get_best_sell_price_cents()
+
+    # Best quantity inspection (Day 7)
+    cpdef unsigned int get_best_buy_quantity(self, bint aggregate=True):
+        """Return the available quantity at the best BUY price level.
+
+        Parameters
+        ----------
+        aggregate : bint, default True
+            If True, returns the sum of remaining quantities for all active BUY
+            orders sharing the highest price.
+            If False, returns the remaining quantity of the single highest-priority
+            BUY order.
+
+        Returns
+        -------
+        unsigned int
+            Total remaining quantity (0 if empty).
+        """
+        cdef COrder best = self.get_best_buy_order()
+        if best is None:
+            return 0
+        if not aggregate:
+            return best.remaining_quantity
+
+        cdef unsigned int total_qty = 0
+        cdef COrder order
+        cdef long long best_cents = best.price_cents
+        cdef Py_ssize_t i, n = len(self._bids)
+        for i in range(n):
+            order = <COrder>self._bids[i]
+            if order.price_cents == best_cents and order.remaining_quantity > 0:
+                total_qty += order.remaining_quantity
+        return total_qty
+
+    cpdef unsigned int get_best_bid_quantity(self, bint aggregate=True):
+        """Alias for ``get_best_buy_quantity(aggregate=aggregate)``."""
+        return self.get_best_buy_quantity(aggregate=aggregate)
+
+    cpdef unsigned int get_best_bid_qty(self, bint aggregate=True):
+        """Alias for ``get_best_buy_quantity(aggregate=aggregate)``."""
+        return self.get_best_buy_quantity(aggregate=aggregate)
+
+    cpdef unsigned int best_bid_quantity(self, bint aggregate=True):
+        """Alias for ``get_best_buy_quantity(aggregate=aggregate)``."""
+        return self.get_best_buy_quantity(aggregate=aggregate)
+
+    cpdef unsigned int best_bid_qty(self, bint aggregate=True):
+        """Alias for ``get_best_buy_quantity(aggregate=aggregate)``."""
+        return self.get_best_buy_quantity(aggregate=aggregate)
+
+    cpdef unsigned int best_buy_quantity(self, bint aggregate=True):
+        """Alias for ``get_best_buy_quantity(aggregate=aggregate)``."""
+        return self.get_best_buy_quantity(aggregate=aggregate)
+
+    cpdef unsigned int get_best_sell_quantity(self, bint aggregate=True):
+        """Return the available quantity at the best SELL price level.
+
+        Parameters
+        ----------
+        aggregate : bint, default True
+            If True, returns the sum of remaining quantities for all active SELL
+            orders sharing the lowest price.
+            If False, returns the remaining quantity of the single lowest-priority
+            SELL order.
+
+        Returns
+        -------
+        unsigned int
+            Total remaining quantity (0 if empty).
+        """
+        cdef COrder best = self.get_best_sell_order()
+        if best is None:
+            return 0
+        if not aggregate:
+            return best.remaining_quantity
+
+        cdef unsigned int total_qty = 0
+        cdef COrder order
+        cdef long long best_cents = best.price_cents
+        cdef Py_ssize_t i, n = len(self._asks)
+        for i in range(n):
+            order = <COrder>self._asks[i]
+            if order.price_cents == best_cents and order.remaining_quantity > 0:
+                total_qty += order.remaining_quantity
+        return total_qty
+
+    cpdef unsigned int get_best_ask_quantity(self, bint aggregate=True):
+        """Alias for ``get_best_sell_quantity(aggregate=aggregate)``."""
+        return self.get_best_sell_quantity(aggregate=aggregate)
+
+    cpdef unsigned int get_best_ask_qty(self, bint aggregate=True):
+        """Alias for ``get_best_sell_quantity(aggregate=aggregate)``."""
+        return self.get_best_sell_quantity(aggregate=aggregate)
+
+    cpdef unsigned int best_ask_quantity(self, bint aggregate=True):
+        """Alias for ``get_best_sell_quantity(aggregate=aggregate)``."""
+        return self.get_best_sell_quantity(aggregate=aggregate)
+
+    cpdef unsigned int best_ask_qty(self, bint aggregate=True):
+        """Alias for ``get_best_sell_quantity(aggregate=aggregate)``."""
+        return self.get_best_sell_quantity(aggregate=aggregate)
+
+    cpdef unsigned int best_sell_quantity(self, bint aggregate=True):
+        """Alias for ``get_best_sell_quantity(aggregate=aggregate)``."""
+        return self.get_best_sell_quantity(aggregate=aggregate)
+
+    # Spread inspection (Day 7)
+    cpdef object get_spread(self):
+        """Return the bid-ask spread (best ask price - best bid price) as a float, or None if either side is empty."""
+        cdef object best_buy = self.get_best_buy_price()
+        cdef object best_sell = self.get_best_sell_price()
+        if best_buy is None or best_sell is None:
+            return None
+        return round(best_sell - best_buy, 6)
+
+    cpdef object get_spread_cents(self):
+        """Return the bid-ask spread in integer cents, or None if either side is empty."""
+        cdef object best_buy = self.get_best_buy_price_cents()
+        cdef object best_sell = self.get_best_sell_price_cents()
+        if best_buy is None or best_sell is None:
+            return None
+        return best_sell - best_buy
+
+    cpdef object spread(self):
+        """Alias for ``get_spread()``."""
+        return self.get_spread()
+
+    # Top-of-book snapshot (Day 7)
+    cpdef dict get_top_of_book(self):
+        """Return a dictionary snapshot of top-of-book (best bid, best ask, spread)."""
+        cdef COrder bb = self.get_best_buy_order()
+        cdef COrder ba = self.get_best_sell_order()
+        cdef object bid_price = bb.price if bb is not None else None
+        cdef object ask_price = ba.price if ba is not None else None
+        cdef unsigned int bid_qty = self.get_best_bid_quantity(aggregate=True) if bb is not None else 0
+        cdef unsigned int ask_qty = self.get_best_ask_quantity(aggregate=True) if ba is not None else 0
+        cdef object sp = self.get_spread()
+        return {
+            "best_bid_price": bid_price,
+            "best_bid_quantity": bid_qty,
+            "best_ask_price": ask_price,
+            "best_ask_quantity": ask_qty,
+            "spread": sp,
+        }
+
+    cpdef dict top_of_book(self):
+        """Alias for ``get_top_of_book()``."""
+        return self.get_top_of_book()
 
     # Crossing price detection
     cpdef bint has_crossing_prices(self):
@@ -797,6 +964,8 @@ cdef class MatchingEngine:
                 raise ValueError(f"Invalid price_cents {ord_obj.price_cents}: must be positive")
             if ord_obj.quantity == 0:
                 raise ValueError("Invalid quantity 0: must be positive")
+            if ord_obj.remaining_quantity == 0:
+                raise ValueError("Invalid remaining_quantity 0: order is already fully filled")
             self._sequence_counter += 1
             ord_obj.sequence_num = self._sequence_counter
             self._bids.append(ord_obj)
@@ -851,6 +1020,8 @@ cdef class MatchingEngine:
                 raise ValueError(f"Invalid price_cents {ord_obj.price_cents}: must be positive")
             if ord_obj.quantity == 0:
                 raise ValueError("Invalid quantity 0: must be positive")
+            if ord_obj.remaining_quantity == 0:
+                raise ValueError("Invalid remaining_quantity 0: order is already fully filled")
             self._sequence_counter += 1
             ord_obj.sequence_num = self._sequence_counter
             self._asks.append(ord_obj)
