@@ -63,6 +63,12 @@ from chronos.dashboard import (
     get_sample_buy_orders,
     get_sample_sell_orders,
     get_sample_orders_processed,
+    calculate_throughput,
+    calculate_throughput_from_counts,
+    format_throughput,
+    get_sample_throughput,
+    DEMO_THROUGHPUT,
+    NO_SAMPLE_THROUGHPUT,
 )
 
 
@@ -1480,6 +1486,324 @@ def test_orders_processed_refresh_and_quit_behavior_remain_intact():
     assert dashboard.is_running is False
     assert dashboard.frame_count == 2
     assert dashboard.orders_processed == 125
+
+
+# ===========================================================================
+# Day 7 - Throughput Metric tests
+# ===========================================================================
+
+
+class FakeClock:
+    """Injectable fake monotonic clock for deterministic testing without sleeps."""
+
+    def __init__(self, start: float = 100.0) -> None:
+        self.current_time = start
+
+    def __call__(self) -> float:
+        return self.current_time
+
+    def advance(self, seconds: float) -> None:
+        self.current_time += seconds
+
+
+def test_throughput_correct_calculation_for_known_delta_and_elapsed():
+    """1. Correct throughput calculation for known count delta and elapsed interval."""
+    # delta = 500 orders, elapsed = 1.0 second -> 500.0 orders/sec
+    assert calculate_throughput(500, 1.0) == 500.0
+
+    # delta = 1000 orders, elapsed = 2.0 seconds -> 500.0 orders/sec
+    assert calculate_throughput(1000, 2.0) == 500.0
+
+    # delta = 150 orders, elapsed = 0.5 seconds -> 300.0 orders/sec
+    assert calculate_throughput(150, 0.5) == 300.0
+
+    # delta = 1 order, elapsed = 0.001 seconds -> 1000.0 orders/sec
+    assert calculate_throughput(1, 0.001) == 1000.0
+
+    # delta = 100 orders, elapsed = 3.0 seconds -> 33.33 orders/sec (rounded to 2 decimal places)
+    assert calculate_throughput(100, 3.0) == 33.33
+
+    # Using calculate_throughput_from_counts helper
+    assert calculate_throughput_from_counts(1500, 500, 2.0) == 500.0
+
+
+def test_throughput_zero_elapsed_time_without_crashing():
+    """2. Zero elapsed time without crashing or division by zero."""
+    # Pure function with zero elapsed time returns None safely
+    assert calculate_throughput(100, 0) is None
+    assert calculate_throughput(0, 0.0) is None
+    assert calculate_throughput_from_counts(100, 0, 0) is None
+
+    # Dashboard state update with zero elapsed time
+    clock = FakeClock(100.0)
+    dashboard = TerminalDashboard(clock=clock, orders_processed=0)
+
+    # Establish baseline
+    dashboard.update_throughput()
+
+    # Attempt to update again with zero elapsed time (clock did not advance)
+    dashboard.increment_orders_processed(50)
+    val = dashboard.update_throughput()
+    # Does not crash or divide by zero; returns previous throughput (None)
+    assert val is None
+
+    # Render and get_display_lines calls with zero elapsed time must not crash
+    win = MockCursesWindow(rows=40, cols=100)
+    dashboard.render(win)
+    lines = dashboard.get_display_lines(rows=40, cols=100)
+    assert len(lines) > 0
+
+
+def test_throughput_no_new_orders_produces_zero_or_no_sample_state():
+    """3. No new orders produces zero over an elapsed interval, or documented no-sample state."""
+    # Zero orders over valid interval produces 0.0
+    assert calculate_throughput(0, 1.0) == 0.0
+    assert calculate_throughput(0, 5.0) == 0.0
+
+    # In dashboard: counter value that does not advance over an elapsed interval produces 0.0
+    clock = FakeClock(100.0)
+    dashboard = TerminalDashboard(clock=clock, orders_processed=100)
+    dashboard.update_throughput()  # baseline at t=100.0, count=100
+
+    # 2 seconds pass, but no orders are added (delta = 0)
+    clock.advance(2.0)
+    tp = dashboard.update_throughput()
+    assert tp == 0.0
+    assert dashboard.get_throughput_display() == "0.00"
+
+    # Initial state with no elapsed interval produces project's no-sample state
+    fresh_dashboard = TerminalDashboard(use_sample_data=False)
+    assert fresh_dashboard.throughput is None
+    assert fresh_dashboard.get_throughput_display() == NO_SAMPLE_THROUGHPUT
+    assert format_throughput(None) == NO_SAMPLE_THROUGHPUT
+
+
+def test_throughput_increasing_processed_orders_updates_throughput():
+    """4. Increasing processed-order counts update throughput across refresh cycles."""
+    clock = FakeClock(100.0)
+    dashboard = TerminalDashboard(clock=clock, orders_processed=0)
+    dashboard.update_throughput()  # baseline at t=100.0, count=0
+
+    # Interval 1: 500 orders processed in 1.0 second
+    clock.advance(1.0)
+    dashboard.increment_orders_processed(500)
+    dashboard.update_throughput()
+    assert dashboard.throughput == 500.0
+    assert "500.00" in dashboard.get_throughput_display()
+
+    # Interval 2: 250 orders processed in 1.0 second
+    clock.advance(1.0)
+    dashboard.increment_orders_processed(250)
+    dashboard.update_throughput()
+    assert dashboard.throughput == 250.0
+    assert "250.00" in dashboard.get_throughput_display()
+
+    # Interval 3: 2000 orders processed in 2.0 seconds -> 1000 orders/sec
+    clock.advance(2.0)
+    dashboard.increment_orders_processed(2000)
+    dashboard.update_throughput()
+    assert dashboard.throughput == 1000.0
+    assert "1,000.00" in dashboard.get_throughput_display()
+
+
+def test_throughput_redrawing_dashboard_does_not_change_order_count():
+    """5. Redrawing the dashboard does not change the processed-order count."""
+    clock = FakeClock(100.0)
+    dashboard = TerminalDashboard(clock=clock, orders_processed=125)
+    win = MockCursesWindow(rows=40, cols=100)
+
+    # Establish baseline
+    dashboard.update_throughput()
+    clock.advance(1.0)
+
+    # Redraw 10 times via render and get_display_lines
+    for _ in range(10):
+        dashboard.render(win)
+        dashboard.get_display_lines(rows=40, cols=100)
+
+    # Counter must remain exactly 125
+    assert dashboard.orders_processed == 125
+
+
+def test_throughput_deterministic_injected_clock_behavior():
+    """6. Monotonic clock behavior or injected deterministic clock values."""
+    import time
+
+    # Verify default clock is time.monotonic
+    default_dashboard = TerminalDashboard()
+    assert default_dashboard._clock is time.monotonic
+
+    # Injected deterministic clock
+    clock = FakeClock(50.0)
+    dashboard = TerminalDashboard(clock=clock, orders_processed=10)
+    dashboard.update_throughput()
+
+    # Step-by-step verification without sleep
+    clock.advance(0.5)
+    dashboard.increment_orders_processed(100)
+    assert dashboard.update_throughput() == 200.0
+
+    clock.advance(0.5)
+    dashboard.increment_orders_processed(150)
+    assert dashboard.update_throughput() == 300.0
+
+
+def test_throughput_invalid_intervals_and_deltas_handled_safely():
+    """7. Invalid or negative elapsed intervals and deltas are handled safely."""
+    # Negative elapsed interval
+    assert calculate_throughput(100, -1.0) is None
+    assert calculate_throughput(100, -0.001) is None
+
+    # Negative delta orders
+    assert calculate_throughput(-50, 1.0) is None
+
+    # None inputs
+    assert calculate_throughput(None, 1.0) is None
+    assert calculate_throughput(100, None) is None
+    assert calculate_throughput(None, None) is None
+
+    # Non-numeric or invalid types
+    assert calculate_throughput("invalid", 1.0) is None
+    assert calculate_throughput(100, "invalid") is None
+
+    # Float NaN and Inf
+    assert calculate_throughput(float("nan"), 1.0) is None
+    assert calculate_throughput(100, float("nan")) is None
+    assert calculate_throughput(100, float("inf")) is None
+
+    # Dashboard clock backwards jump handled safely
+    clock = FakeClock(100.0)
+    dashboard = TerminalDashboard(clock=clock, orders_processed=50)
+    dashboard.update_throughput()
+    clock.advance(-10.0)  # clock moved backwards
+    assert dashboard.update_throughput() is None  # Handled safely without crash
+
+
+def test_throughput_large_value_formatting():
+    """8. Large throughput values are formatted with thousands separators."""
+    assert format_throughput(0) == "0.00"
+    assert format_throughput(500) == "500.00"
+    assert format_throughput(12500) == "12,500.00"
+    assert format_throughput(1000000) == "1,000,000.00"
+    assert format_throughput(9876543210.5) == "9,876,543,210.50"
+    assert format_throughput(500, include_unit=True) == "500.00 orders/sec"
+    assert format_throughput(500, decimals=0, include_unit=True) == "500 orders/sec"
+    assert format_throughput("DEMO") == "DEMO"
+    assert format_throughput("N/A") == "N/A"
+
+    # Negative value raises ValueError
+    with pytest.raises(ValueError, match="cannot be negative"):
+        format_throughput(-1.0)
+
+    # In build_performance_lines with large throughput
+    lines = build_performance_lines(width=68, throughput=1000000)
+    joined = "\n".join(lines)
+    assert "1,000,000.00" in joined
+
+
+def test_throughput_appears_in_dashboard_output():
+    """9. Throughput metric field appears in the dashboard rendered output."""
+    clock = FakeClock(100.0)
+    dashboard = TerminalDashboard(clock=clock, orders_processed=0)
+    dashboard.update_throughput()
+
+    # Advance clock and orders
+    clock.advance(1.0)
+    dashboard.increment_orders_processed(500)
+
+    display = "\n".join(dashboard.get_display_lines(rows=40, cols=100))
+    assert SECTION_PERFORMANCE in display
+    assert LABEL_THROUGHPUT in display
+    assert "500.00" in display
+
+    # In MockCursesWindow
+    win = MockCursesWindow(rows=40, cols=100)
+    dashboard.render(win)
+    tp_calls = [c[2] for c in win.addstr_calls if LABEL_THROUGHPUT in c[2]]
+    assert len(tp_calls) == 1
+    assert "500.00" in tp_calls[0]
+
+    # Explicit DEMO mode labeling
+    demo_dashboard = TerminalDashboard(use_sample_data=True)
+    demo_display = "\n".join(demo_dashboard.get_display_lines(rows=40, cols=100))
+    assert DEMO_THROUGHPUT in demo_display
+
+
+def test_throughput_existing_orders_processed_counter_remains_correct():
+    """10. Existing processed-order counter remains correct when throughput updates."""
+    clock = FakeClock(100.0)
+    dashboard = TerminalDashboard(clock=clock, orders_processed=50)
+
+    # Process events
+    dashboard.record_order_processed({"order_id": 999, "price": 500.0, "quantity": 10})
+    assert dashboard.orders_processed == 51
+
+    dashboard.increment_orders_processed(49)
+    assert dashboard.orders_processed == 100
+
+    clock.advance(1.0)
+    dashboard.update_throughput()
+    assert dashboard.orders_processed == 100
+
+    # Formatted total orders string matches
+    lines = dashboard.get_display_lines(rows=40, cols=100)
+    perf_idx = next(i for i, line in enumerate(lines) if SECTION_PERFORMANCE in line)
+    footer_idx = next(i for i, line in enumerate(lines) if QUIT_MESSAGE in line)
+    perf_section = "\n".join(lines[perf_idx:footer_idx])
+    assert "100" in perf_section
+
+
+def test_throughput_existing_bid_ask_spread_and_depth_still_render():
+    """11. Existing Best Bid/Ask, Spread, and 5-level Depth sections still render."""
+    clock = FakeClock(100.0)
+    dashboard = TerminalDashboard(clock=clock, orders_processed=125)
+    clock.advance(1.0)
+    dashboard.increment_orders_processed(500)
+
+    display = "\n".join(dashboard.get_display_lines(rows=40, cols=100))
+
+    # Market summary preserved
+    assert SECTION_MARKET_SUMMARY in display
+    assert LABEL_BEST_BID in display
+    assert "510.00" in display
+    assert LABEL_BEST_ASK in display
+    assert "505.00" in display
+    assert LABEL_SPREAD in display
+    assert "-5.00" in display
+
+    # Order book depth preserved
+    assert SECTION_ORDER_BOOK in display
+    assert SECTION_BUY_ORDERS in display
+    assert SECTION_SELL_ORDERS in display
+    assert "490.00" in display
+    assert "525.00" in display
+
+
+def test_throughput_small_terminal_and_quit_behavior_remain_intact():
+    """12. Small terminal fallback and Q-to-quit behavior remain intact with throughput."""
+    clock = FakeClock(100.0)
+    dashboard = TerminalDashboard(clock=clock, orders_processed=125)
+
+    # Small terminal window
+    small_win = MockCursesWindow(rows=5, cols=20)
+    dashboard.render(small_win)
+    assert small_win.erased is True
+    assert small_win.refreshed is True
+    small_output = " ".join([c[2] for c in small_win.addstr_calls])
+    assert "too small" in small_output.lower()
+    assert QUIT_MESSAGE in small_output
+
+    # Input handling
+    assert dashboard.handle_input(ord("q")) is False
+    assert dashboard.handle_input(ord("Q")) is False
+    assert dashboard.handle_input(ord("z")) is True
+
+    # Curses event loop with throughput active
+    loop_win = MockCursesWindow(rows=40, cols=100, keys=[-1, ord("q")])
+    dashboard.run_curses(loop_win, max_iterations=10)
+    assert dashboard.is_running is False
+    assert dashboard.frame_count == 2
+
 
 
 

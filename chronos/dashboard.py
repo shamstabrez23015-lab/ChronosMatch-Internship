@@ -13,7 +13,9 @@ Layout helpers are pure functions and fully testable without a live terminal.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple, Union
+import math
+import time
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple, Union
 
 try:
     import curses
@@ -56,6 +58,9 @@ LABEL_LATENCY = "Latency (microseconds)"
 # Demonstration / sample constants
 DEMO_ORDERS_PROCESSED = 125
 SAMPLE_ORDERS_PROCESSED = DEMO_ORDERS_PROCESSED
+DEMO_THROUGHPUT = "DEMO"
+NO_SAMPLE_THROUGHPUT = "N/A"
+DEMO_SAMPLE_THROUGHPUT = 500.0
 
 # Placeholder value used when data is not yet available
 PLACEHOLDER = "--"
@@ -503,6 +508,110 @@ def get_sample_orders_processed() -> int:
     return DEMO_ORDERS_PROCESSED
 
 
+def calculate_throughput(
+    delta_orders: Union[int, float],
+    elapsed_seconds: Union[int, float],
+) -> Optional[float]:
+    """Calculate throughput as processed orders divided by elapsed seconds.
+
+    Args:
+        delta_orders: Change in processed order count (must be non-negative).
+        elapsed_seconds: Elapsed interval in seconds (must be strictly positive).
+
+    Returns:
+        Throughput in orders/sec rounded to 2 decimal places, or None if
+        elapsed_seconds <= 0, delta_orders < 0, or either input is invalid.
+    """
+    if delta_orders is None or elapsed_seconds is None:
+        return None
+
+    try:
+        d_orders = float(delta_orders)
+        d_time = float(elapsed_seconds)
+    except (ValueError, TypeError):
+        return None
+
+    if math.isnan(d_orders) or math.isinf(d_orders) or math.isnan(d_time) or math.isinf(d_time):
+        return None
+
+    if d_time <= 0 or d_orders < 0:
+        return None
+
+    if d_orders == 0.0:
+        return 0.0
+
+    return round(d_orders / d_time, 2)
+
+
+def calculate_throughput_from_counts(
+    current_count: Union[int, float],
+    previous_count: Union[int, float],
+    elapsed_seconds: Union[int, float],
+) -> Optional[float]:
+    """Calculate throughput from current and previous order counts over elapsed seconds."""
+    if current_count is None or previous_count is None:
+        return None
+    try:
+        c_curr = float(current_count)
+        c_prev = float(previous_count)
+    except (ValueError, TypeError):
+        return None
+    delta = c_curr - c_prev
+    return calculate_throughput(delta, elapsed_seconds)
+
+
+def format_throughput(
+    throughput: Optional[Union[float, int, str]],
+    is_demo: bool = False,
+    include_unit: bool = False,
+    decimals: int = 2,
+) -> str:
+    """Format throughput metric for display.
+
+    Args:
+        throughput: Numeric throughput value, string value, or None.
+        is_demo: If True and throughput is None, return DEMO_THROUGHPUT ('DEMO').
+        include_unit: If True and value is numeric, append ' orders/sec'.
+        decimals: Number of decimal places for numeric values (default: 2).
+
+    Returns:
+        Formatted throughput string (e.g. '500.00', '1,000,000.00', 'DEMO', 'N/A').
+
+    Raises:
+        ValueError: If throughput is a negative number.
+    """
+    if throughput is None:
+        return DEMO_THROUGHPUT if is_demo else NO_SAMPLE_THROUGHPUT
+
+    if isinstance(throughput, str):
+        return throughput
+
+    try:
+        val = float(throughput)
+    except (ValueError, TypeError):
+        return NO_SAMPLE_THROUGHPUT
+
+    if math.isnan(val) or math.isinf(val):
+        return NO_SAMPLE_THROUGHPUT
+
+    if val < 0:
+        raise ValueError(f"Throughput cannot be negative: {val}")
+
+    if decimals > 0:
+        formatted = f"{val:,.{decimals}f}"
+    else:
+        formatted = f"{round(val):,}"
+
+    if include_unit:
+        return f"{formatted} orders/sec"
+    return formatted
+
+
+def get_sample_throughput() -> float:
+    """Return demonstration throughput rate based on sample specification."""
+    return DEMO_SAMPLE_THROUGHPUT
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -610,7 +719,7 @@ def build_order_book_lines(
 def build_performance_lines(
     width: int,
     total_orders: Union[str, int] = PLACEHOLDER,
-    throughput: str = PLACEHOLDER,
+    throughput: Union[str, int, float] = PLACEHOLDER,
     latency: str = PLACEHOLDER,
     orders_processed: Optional[Union[str, int]] = None,
 ) -> List[str]:
@@ -619,7 +728,7 @@ def build_performance_lines(
     Args:
         width: Available content width in characters.
         total_orders: Total processed orders (integer, formatted string, or PLACEHOLDER).
-        throughput: Throughput metric string.
+        throughput: Throughput metric (number, formatted string, or PLACEHOLDER).
         latency: Latency metric string.
         orders_processed: Optional alias for total_orders.
     """
@@ -631,13 +740,20 @@ def build_performance_lines(
     else:
         orders_str = str(raw_val)
 
+    if isinstance(throughput, (int, float)) and not isinstance(throughput, bool):
+        throughput_str = format_throughput(throughput)
+    elif throughput is None:
+        throughput_str = PLACEHOLDER
+    else:
+        throughput_str = str(throughput)
+
     divider = "-" * width
     col_w = max(width - 4, 10)
     return [
         f"  {SECTION_PERFORMANCE}",
         divider,
         f"  {LABEL_TOTAL_ORDERS:<{col_w - 10}} {orders_str:>8}",
-        f"  {LABEL_THROUGHPUT:<{col_w - 10}} {throughput:>8}",
+        f"  {LABEL_THROUGHPUT:<{col_w - 10}} {throughput_str:>8}",
         f"  {LABEL_LATENCY:<{col_w - 10}} {latency:>8}",
         divider,
     ]
@@ -666,8 +782,10 @@ class TerminalDashboard:
         sell_orders: Optional[List[Any]] = None,
         use_sample_data: bool = True,
         orders_processed: int = 0,
+        clock: Optional[Callable[[], float]] = None,
+        throughput: Optional[Union[float, int, str]] = None,
     ) -> None:
-        """Initialize the dashboard with optional configuration, order data, and counter."""
+        """Initialize the dashboard with optional configuration, order data, counter, clock, and throughput."""
         self.config = config or DashboardConfig()
         self.is_running = False
         self.frame_count = 0
@@ -705,6 +823,23 @@ class TerminalDashboard:
             raise ValueError(f"Orders processed count cannot be negative: {orders_processed}")
         self._orders_processed: int = init_val
         self._processed_order_ids: set = set()
+
+        self._clock: Callable[[], float] = clock if clock is not None else time.monotonic
+        self._last_throughput_time: Optional[float] = None
+        self._last_orders_count: Optional[int] = None
+        self._throughput: Optional[float] = None
+        self._throughput_override: Optional[str] = None
+        if throughput is not None:
+            if isinstance(throughput, str):
+                self._throughput_override = throughput
+            else:
+                try:
+                    init_tp = float(throughput)
+                except (ValueError, TypeError) as err:
+                    raise ValueError(f"Throughput must be a number, got: {throughput}") from err
+                if init_tp < 0:
+                    raise ValueError(f"Throughput cannot be negative: {throughput}")
+                self._throughput = init_tp
 
     @property
     def orders_processed(self) -> int:
@@ -789,6 +924,110 @@ class TerminalDashboard:
         """Reset the processed orders counter and seen order IDs to zero/empty."""
         self._orders_processed = 0
         self._processed_order_ids.clear()
+        self.reset_throughput()
+
+    @property
+    def throughput(self) -> Optional[float]:
+        """Return the current throughput in orders/sec, or None if not yet sampled."""
+        return self._throughput
+
+    @throughput.setter
+    def throughput(self, value: Optional[Union[float, int]]) -> None:
+        """Set the throughput value directly.
+
+        Raises:
+            ValueError: If value is negative.
+        """
+        if value is None:
+            self._throughput = None
+            self._throughput_override = None
+            return
+        try:
+            val = float(value)
+        except (ValueError, TypeError) as err:
+            raise ValueError(f"Throughput must be a number, got: {value}") from err
+        if val < 0:
+            raise ValueError(f"Throughput cannot be negative: {value}")
+        self._throughput = val
+        self._throughput_override = None
+
+    def set_throughput(self, value: Optional[Union[float, int, str]]) -> None:
+        """Explicitly set throughput (number, string like 'DEMO' or 'N/A', or None)."""
+        if isinstance(value, str):
+            self._throughput = None
+            self._throughput_override = value
+        else:
+            self.throughput = value
+
+    def update_throughput(self, current_time: Optional[float] = None) -> Optional[float]:
+        """Calculate and update throughput based on processed orders delta and elapsed time.
+
+        Args:
+            current_time: Optional timestamp override in seconds. If None, uses self._clock().
+
+        Returns:
+            The updated throughput value, or current value if elapsed time is zero.
+        """
+        if self._throughput_override is not None:
+            return self._throughput
+
+        try:
+            now = float(current_time) if current_time is not None else float(self._clock())
+        except Exception:
+            return self._throughput
+
+        if self._last_throughput_time is None:
+            self._last_throughput_time = now
+            self._last_orders_count = self.orders_processed
+            return self._throughput
+
+        elapsed = now - self._last_throughput_time
+
+        # Invalid interval (e.g. clock jumped backwards): handle safely without crashing
+        if elapsed < 0:
+            self._last_throughput_time = now
+            self._last_orders_count = self.orders_processed
+            return self._throughput
+
+        # Zero elapsed time: avoid division by zero, return current value unchanged
+        if elapsed == 0:
+            return self._throughput
+
+        # Elapsed > 0: compute delta orders
+        last_count = self._last_orders_count if self._last_orders_count is not None else 0
+        delta_orders = self.orders_processed - last_count
+        if delta_orders < 0:
+            # Counter was reset or moved backwards; reset reference point safely
+            self._last_orders_count = self.orders_processed
+            self._last_throughput_time = now
+            return self._throughput
+
+        calc = calculate_throughput(delta_orders, elapsed)
+        self._throughput = calc
+        self._last_orders_count = self.orders_processed
+        self._last_throughput_time = now
+        return self._throughput
+
+    def get_throughput(self) -> Optional[float]:
+        """Return the current throughput in orders/sec."""
+        return self._throughput
+
+    def get_throughput_display(self, include_unit: bool = False) -> str:
+        """Return the formatted throughput string for display."""
+        if self._throughput_override is not None:
+            return self._throughput_override
+
+        if self._throughput is not None:
+            return format_throughput(self._throughput, include_unit=include_unit)
+
+        return DEMO_THROUGHPUT if self.is_sample_data else NO_SAMPLE_THROUGHPUT
+
+    def reset_throughput(self) -> None:
+        """Reset throughput calculation state and baseline clock."""
+        self._throughput = None
+        self._throughput_override = None
+        self._last_throughput_time = None
+        self._last_orders_count = None
 
     @property
     def status_message(self) -> str:
@@ -854,6 +1093,7 @@ class TerminalDashboard:
         buy_orders: Optional[List[Any]] = None,
         sell_orders: Optional[List[Any]] = None,
         orders_processed: Optional[int] = None,
+        throughput: Optional[Union[float, int, str]] = None,
     ) -> List[str]:
         """Generate all display lines for the current state.
 
@@ -890,6 +1130,15 @@ class TerminalDashboard:
         orders_cnt = self.orders_processed if orders_processed is None else orders_processed
         total_orders_str = format_orders_processed(orders_cnt)
 
+        if throughput is not None:
+            if isinstance(throughput, (int, float)) and not isinstance(throughput, bool):
+                throughput_str = format_throughput(throughput)
+            else:
+                throughput_str = str(throughput)
+        else:
+            self.update_throughput()
+            throughput_str = self.get_throughput_display()
+
         width = min(cols - 4, 72)
         lines: List[str] = []
         lines += build_header_lines(width, status=self.status_message)
@@ -905,7 +1154,11 @@ class TerminalDashboard:
         lines.append("")
         lines += build_order_book_lines(width, bid_rows=bid_rows, ask_rows=ask_rows)
         lines.append("")
-        lines += build_performance_lines(width, total_orders=total_orders_str)
+        lines += build_performance_lines(
+            width,
+            total_orders=total_orders_str,
+            throughput=throughput_str,
+        )
         lines.append("")
         lines += build_footer_lines(width)
         return lines
@@ -1019,6 +1272,7 @@ class TerminalDashboard:
         buy_orders: Optional[List[Any]] = None,
         sell_orders: Optional[List[Any]] = None,
         orders_processed: Optional[int] = None,
+        throughput: Optional[Union[float, int, str]] = None,
     ) -> None:
         """Render a single frame of the dashboard onto the curses window."""
         try:
@@ -1039,6 +1293,7 @@ class TerminalDashboard:
                 buy_orders=buy_orders,
                 sell_orders=sell_orders,
                 orders_processed=orders_processed,
+                throughput=throughput,
             )
             for idx, line in enumerate(lines):
                 self._safe_addstr(stdscr, idx, 0, line)
@@ -1135,11 +1390,20 @@ class TerminalDashboard:
         orders_cnt = self.orders_processed if orders_processed is None else orders_processed
         total_orders_str = format_orders_processed(orders_cnt)
 
+        if throughput is not None:
+            if isinstance(throughput, (int, float)) and not isinstance(throughput, bool):
+                throughput_str = format_throughput(throughput)
+            else:
+                throughput_str = str(throughput)
+        else:
+            self.update_throughput()
+            throughput_str = self.get_throughput_display()
+
         # ---- Performance Metrics ----
         put(f"  {SECTION_PERFORMANCE}", attrs["section"])
         put(divider, attrs["border"])
         put(f"  {LABEL_TOTAL_ORDERS:<{col_w - 10}} {total_orders_str:>8}", attrs["label"])
-        put(f"  {LABEL_THROUGHPUT:<{col_w - 10}} {PLACEHOLDER:>8}", attrs["label"])
+        put(f"  {LABEL_THROUGHPUT:<{col_w - 10}} {throughput_str:>8}", attrs["label"])
         put(f"  {LABEL_LATENCY:<{col_w - 10}} {PLACEHOLDER:>8}", attrs["label"])
         put(divider, attrs["border"])
         blank()
