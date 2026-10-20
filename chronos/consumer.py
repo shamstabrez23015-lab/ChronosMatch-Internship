@@ -10,7 +10,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 if sys.platform == "win32":
     try:
@@ -53,9 +53,11 @@ class ZeroCopyConsumer:
         self,
         ring_buffer: MmapRingBuffer,
         batch_size: int = 1000,
+        order_handler: Optional[Callable[[Tuple[int, int, float, int, int, int, int]], Any]] = None,
     ):
         self.ring_buffer = ring_buffer
         self.batch_size = batch_size
+        self.order_handler = order_handler
         self.is_running = False
         self.stats = ConsumerStats()
         self._latencies_sample: List[float] = []
@@ -104,6 +106,9 @@ class ZeroCopyConsumer:
 
                         if len(self._latencies_sample) < max_samples:
                             self._latencies_sample.append(lat_us)
+
+                        if self.order_handler is not None:
+                            self.order_handler(item)
                 else:
                     # Buffer currently empty: brief pause to avoid spinning CPU 100%
                     time.sleep(0.0005)
