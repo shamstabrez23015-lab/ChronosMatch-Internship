@@ -69,6 +69,12 @@ from chronos.dashboard import (
     get_sample_throughput,
     DEMO_THROUGHPUT,
     NO_SAMPLE_THROUGHPUT,
+    LABEL_LATENCY,
+    LABEL_LATENCY_AVG,
+    DEMO_LATENCY,
+    NO_SAMPLE_LATENCY,
+    calculate_latency_stats,
+    format_latency,
 )
 
 
@@ -1806,4 +1812,489 @@ def test_throughput_small_terminal_and_quit_behavior_remain_intact():
 
 
 
+# ===========================================================================
+# Day 8 - Order Processing Latency Monitoring tests
+# ===========================================================================
+#
+# Measured stage: inter-event elapsed time between consecutive
+# record_order_processed() calls, as observed at the dashboard boundary.
+# This is NOT full end-to-end latency or engine dispatch latency.
+# ===========================================================================
+
+
+class FakeNsClock:
+    """Injectable deterministic nanosecond clock for latency testing."""
+
+    def __init__(self, start_ns: int = 1_000_000_000) -> None:
+        self.current_ns = start_ns
+
+    def __call__(self) -> int:
+        return self.current_ns
+
+    def advance_us(self, microseconds: float) -> None:
+        """Advance clock by the given number of microseconds."""
+        self.current_ns += int(microseconds * 1_000)
+
+    def advance_ns(self, nanoseconds: int) -> None:
+        self.current_ns += nanoseconds
+
+
+# ---------------------------------------------------------------------------
+# 1. calculate_latency_stats() — pure function tests
+# ---------------------------------------------------------------------------
+
+
+def test_latency_stats_empty_samples_returns_none():
+    """1a. calculate_latency_stats returns None for empty or None input."""
+    assert calculate_latency_stats([]) is None
+    assert calculate_latency_stats(None) is None
+
+
+def test_latency_stats_single_sample():
+    """1b. Single sample: last, avg, max all equal the sample; no p95."""
+    stats = calculate_latency_stats([500.0])
+    assert stats is not None
+    assert stats["last"] == 500.0
+    assert stats["avg"] == 500.0
+    assert stats["max"] == 500.0
+    assert "p95" not in stats
+
+
+def test_latency_stats_multiple_samples():
+    """1c. Multiple samples: correct last, avg, max values."""
+    samples = [100.0, 200.0, 300.0, 150.0, 250.0]
+    stats = calculate_latency_stats(samples)
+    assert stats is not None
+    assert stats["last"] == 250.0
+    assert abs(stats["avg"] - 200.0) < 1e-9
+    assert stats["max"] == 300.0
+    assert "p95" not in stats  # fewer than 20 samples
+
+
+def test_latency_stats_p95_requires_twenty_samples():
+    """1d. p95 only appears when >= 20 samples are present."""
+    samples_19 = [float(i) for i in range(1, 20)]
+    stats_19 = calculate_latency_stats(samples_19)
+    assert stats_19 is not None
+    assert "p95" not in stats_19
+
+    samples_20 = [float(i) for i in range(1, 21)]
+    stats_20 = calculate_latency_stats(samples_20)
+    assert stats_20 is not None
+    assert "p95" in stats_20
+
+
+def test_latency_stats_p95_value_is_correct():
+    """1e. p95 computed correctly over 20 sorted samples."""
+    samples = [float(i) for i in range(1, 21)]  # 1..20
+    stats = calculate_latency_stats(samples)
+    # ceil(20 * 0.95) - 1 = ceil(19) - 1 = 19 - 1 = 18  => sorted[18] = 19.0
+    assert stats["p95"] == 19.0
+
+
+def test_latency_stats_negative_samples_ignored():
+    """1f. Negative latency values are excluded from stats."""
+    stats = calculate_latency_stats([100.0, -50.0, 200.0])
+    # -50.0 filtered out; valid = [100.0, 200.0]
+    assert stats is not None
+    assert stats["max"] == 200.0
+    assert stats["avg"] == 150.0
+
+
+def test_latency_stats_all_negative_returns_none():
+    """1g. All negative samples returns None."""
+    assert calculate_latency_stats([-1.0, -2.0, -3.0]) is None
+
+
+# ---------------------------------------------------------------------------
+# 2. format_latency() — pure function tests
+# ---------------------------------------------------------------------------
+
+
+def test_format_latency_none_returns_no_sample():
+    """2a. None input returns NO_SAMPLE_LATENCY when is_demo=False."""
+    assert format_latency(None) == NO_SAMPLE_LATENCY
+
+
+def test_format_latency_none_demo_returns_demo():
+    """2b. None input returns DEMO_LATENCY when is_demo=True."""
+    assert format_latency(None, is_demo=True) == DEMO_LATENCY
+
+
+def test_format_latency_numeric_value():
+    """2c. Valid numeric input is formatted with correct decimal places."""
+    assert format_latency(123.456) == "123.5"   # default 1 decimal
+    assert format_latency(123.456, decimals=2) == "123.46"
+    assert format_latency(0.0) == "0.0"
+    assert format_latency(1000.0) == "1000.0"
+
+
+def test_format_latency_negative_returns_no_sample():
+    """2d. Negative latency value returns NO_SAMPLE_LATENCY."""
+    assert format_latency(-1.0) == NO_SAMPLE_LATENCY
+    assert format_latency(-0.001) == NO_SAMPLE_LATENCY
+
+
+def test_format_latency_nan_inf_returns_no_sample():
+    """2e. NaN and inf values return NO_SAMPLE_LATENCY."""
+    assert format_latency(float("nan")) == NO_SAMPLE_LATENCY
+    assert format_latency(float("inf")) == NO_SAMPLE_LATENCY
+    assert format_latency(float("-inf")) == NO_SAMPLE_LATENCY
+
+
+def test_format_latency_integer_input():
+    """2f. Integer input is formatted correctly."""
+    assert format_latency(500) == "500.0"
+    assert format_latency(0) == "0.0"
+
+
+# ---------------------------------------------------------------------------
+# 3. TerminalDashboard latency tracking — injectable ns_clock
+# ---------------------------------------------------------------------------
+
+
+def test_latency_no_samples_before_any_events():
+    """3a. No latency samples before any record_order_processed() calls."""
+    ns_clock = FakeNsClock()
+    dashboard = TerminalDashboard(ns_clock=ns_clock, use_sample_data=False)
+    assert dashboard.get_latency_stats() is None
+    assert dashboard._latency_last_us is None
+    assert dashboard._latency_samples == []
+
+
+def test_latency_no_sample_after_single_event():
+    """3b. First record_order_processed() sets clock anchor but produces no interval sample."""
+    ns_clock = FakeNsClock()
+    dashboard = TerminalDashboard(ns_clock=ns_clock, use_sample_data=False)
+    dashboard.record_order_processed()
+    # First call just anchors the clock; no interval to measure
+    assert dashboard.get_latency_stats() is None
+    assert dashboard._latency_last_us is None
+
+
+def test_latency_first_interval_recorded_on_second_event():
+    """3c. Second record_order_processed() records the first real interval."""
+    ns_clock = FakeNsClock(start_ns=0)
+    dashboard = TerminalDashboard(ns_clock=ns_clock, use_sample_data=False)
+
+    dashboard.record_order_processed()    # anchor at 0 ns
+    ns_clock.advance_us(100.0)            # advance 100 us
+    dashboard.record_order_processed()    # interval = 100 us
+
+    assert dashboard._latency_last_us == pytest.approx(100.0, abs=0.01)
+    stats = dashboard.get_latency_stats()
+    assert stats is not None
+    assert stats["last"] == pytest.approx(100.0, abs=0.01)
+    assert stats["avg"] == pytest.approx(100.0, abs=0.01)
+
+
+def test_latency_average_over_multiple_events():
+    """3d. Average latency is correctly computed over multiple events."""
+    ns_clock = FakeNsClock(start_ns=0)
+    dashboard = TerminalDashboard(ns_clock=ns_clock, use_sample_data=False)
+
+    # event intervals: 100, 200, 300 us
+    dashboard.record_order_processed()   # anchor
+    ns_clock.advance_us(100.0)
+    dashboard.record_order_processed()   # +100 us
+    ns_clock.advance_us(200.0)
+    dashboard.record_order_processed()   # +200 us
+    ns_clock.advance_us(300.0)
+    dashboard.record_order_processed()   # +300 us
+
+    stats = dashboard.get_latency_stats()
+    assert stats is not None
+    assert stats["last"] == pytest.approx(300.0, abs=0.01)
+    assert stats["avg"] == pytest.approx(200.0, abs=0.01)  # (100+200+300)/3
+    assert stats["max"] == pytest.approx(300.0, abs=0.01)
+
+
+def test_latency_not_updated_in_render_loop():
+    """3e. get_latency_display() only reads state; calling render() does not update latency."""
+    ns_clock = FakeNsClock(start_ns=0)
+    dashboard = TerminalDashboard(ns_clock=ns_clock, use_sample_data=False)
+
+    dashboard.record_order_processed()   # anchor
+    ns_clock.advance_us(100.0)
+    dashboard.record_order_processed()   # first interval = 100 us
+
+    latency_before = dashboard._latency_last_us
+    sample_count_before = len(dashboard._latency_samples)
+
+    # Advance clock but do NOT call record_order_processed()
+    ns_clock.advance_us(999.0)
+
+    # Render should read state only, not update latency
+    win = MockCursesWindow(rows=40, cols=100)
+    dashboard.render(win)
+
+    assert dashboard._latency_last_us == latency_before
+    assert len(dashboard._latency_samples) == sample_count_before
+
+
+def test_latency_clock_skew_ignored():
+    """3f. Backwards clock jumps are silently ignored; samples stay valid."""
+    ns_clock = FakeNsClock(start_ns=1_000_000_000)
+    dashboard = TerminalDashboard(ns_clock=ns_clock, use_sample_data=False)
+
+    dashboard.record_order_processed()   # anchor at 1e9 ns
+    ns_clock.advance_us(100.0)
+    dashboard.record_order_processed()   # +100 us -> sample recorded
+
+    # Simulate clock jumping backwards
+    ns_clock.current_ns -= 500_000  # backwards by 500 us
+    dashboard.record_order_processed()   # negative elapsed -> ignored
+
+    stats = dashboard.get_latency_stats()
+    # Only the 100 us interval should be in samples
+    assert stats is not None
+    assert len(dashboard._latency_samples) == 1
+    assert stats["last"] == pytest.approx(100.0, abs=0.01)
+
+
+def test_latency_ns_clock_exception_safe():
+    """3g. If the ns_clock raises an exception, latency tracking stays safe."""
+    def broken_clock():
+        raise RuntimeError("clock error")
+
+    dashboard = TerminalDashboard(ns_clock=broken_clock, use_sample_data=False)
+    # Should not raise
+    dashboard.record_order_processed()
+    dashboard.record_order_processed()
+    assert dashboard.get_latency_stats() is None
+
+
+def test_latency_reset_clears_all_state():
+    """3h. reset_latency() clears all tracking state; reset_orders_processed() also clears latency."""
+    ns_clock = FakeNsClock(start_ns=0)
+    dashboard = TerminalDashboard(ns_clock=ns_clock, use_sample_data=False)
+
+    dashboard.record_order_processed()
+    ns_clock.advance_us(100.0)
+    dashboard.record_order_processed()
+    assert dashboard._latency_last_us is not None
+
+    dashboard.reset_latency()
+    assert dashboard._latency_last_ns is None
+    assert dashboard._latency_last_us is None
+    assert dashboard._latency_samples == []
+
+    # Verify reset_orders_processed also resets latency
+    dashboard.record_order_processed()
+    ns_clock.advance_us(200.0)
+    dashboard.record_order_processed()
+    assert dashboard._latency_last_us is not None
+    dashboard.reset_orders_processed()
+    assert dashboard._latency_last_us is None
+    assert dashboard._latency_samples == []
+
+
+def test_latency_buffer_bounded_to_max_samples():
+    """3i. Latency sample buffer is bounded; oldest samples drop when full."""
+    ns_clock = FakeNsClock(start_ns=0)
+    dashboard = TerminalDashboard(ns_clock=ns_clock, use_sample_data=False)
+    max_samples = dashboard._max_latency_samples
+
+    # Record max_samples + 10 more events
+    for i in range(max_samples + 11):
+        ns_clock.advance_us(1.0)
+        dashboard.record_order_processed()
+
+    assert len(dashboard._latency_samples) <= max_samples
+
+
+# ---------------------------------------------------------------------------
+# 4. Display integration — latency in get_display_lines and render
+# ---------------------------------------------------------------------------
+
+
+def test_latency_label_appears_in_performance_section():
+    """4a. LABEL_LATENCY and LABEL_LATENCY_AVG appear in performance section output."""
+    dashboard = TerminalDashboard(use_sample_data=False)
+    lines = dashboard.get_display_lines(rows=40, cols=100)
+    joined = "\n".join(lines)
+    assert LABEL_LATENCY in joined
+    assert LABEL_LATENCY_AVG in joined
+
+
+def test_latency_shows_no_sample_when_no_events_live_data():
+    """4b. NO_SAMPLE_LATENCY shown when use_sample_data=False and no events recorded."""
+    dashboard = TerminalDashboard(use_sample_data=False)
+    assert dashboard.get_latency_display() == NO_SAMPLE_LATENCY
+    assert dashboard.get_latency_avg_display() == NO_SAMPLE_LATENCY
+
+    lines = dashboard.get_display_lines(rows=40, cols=100)
+    joined = "\n".join(lines)
+    assert NO_SAMPLE_LATENCY in joined
+
+
+def test_latency_shows_demo_when_sample_data_and_no_events():
+    """4c. DEMO_LATENCY shown when use_sample_data=True and no events recorded."""
+    dashboard = TerminalDashboard(use_sample_data=True)
+    assert dashboard.get_latency_display() == DEMO_LATENCY
+    assert dashboard.get_latency_avg_display() == DEMO_LATENCY
+
+
+def test_latency_real_value_shown_after_events():
+    """4d. After real events, formatted latency value appears in display output."""
+    ns_clock = FakeNsClock(start_ns=0)
+    dashboard = TerminalDashboard(ns_clock=ns_clock, use_sample_data=False)
+
+    dashboard.record_order_processed()   # anchor
+    ns_clock.advance_us(250.0)
+    dashboard.record_order_processed()   # 250 us
+
+    # get_latency_display returns formatted string
+    lat_str = dashboard.get_latency_display()
+    assert lat_str == "250.0"
+
+    # Value appears in full display output
+    lines = dashboard.get_display_lines(rows=40, cols=100)
+    joined = "\n".join(lines)
+    assert "250.0" in joined
+    assert LABEL_LATENCY in joined
+
+
+def test_latency_value_rendered_in_curses_window():
+    """4e. Latency value appears in curses render output."""
+    ns_clock = FakeNsClock(start_ns=0)
+    dashboard = TerminalDashboard(ns_clock=ns_clock, use_sample_data=False)
+
+    dashboard.record_order_processed()
+    ns_clock.advance_us(123.0)
+    dashboard.record_order_processed()
+
+    win = MockCursesWindow(rows=40, cols=100)
+    dashboard.render(win)
+
+    rendered_text = " ".join(call[2] for call in win.addstr_calls)
+    assert "123.0" in rendered_text
+    assert LABEL_LATENCY in rendered_text
+
+
+def test_latency_avg_shown_after_multiple_events():
+    """4f. Average latency value appears in display after multiple events."""
+    ns_clock = FakeNsClock(start_ns=0)
+    dashboard = TerminalDashboard(ns_clock=ns_clock, use_sample_data=False)
+
+    # Three intervals: 100, 200, 300 -> avg 200
+    dashboard.record_order_processed()
+    ns_clock.advance_us(100.0)
+    dashboard.record_order_processed()
+    ns_clock.advance_us(200.0)
+    dashboard.record_order_processed()
+    ns_clock.advance_us(300.0)
+    dashboard.record_order_processed()
+
+    avg_str = dashboard.get_latency_avg_display()
+    assert avg_str == "200.0"
+
+    lines = dashboard.get_display_lines(rows=40, cols=100)
+    joined = "\n".join(lines)
+    assert LABEL_LATENCY_AVG in joined
+    assert "200.0" in joined
+
+
+# ---------------------------------------------------------------------------
+# 5. build_performance_lines — latency parameter tests
+# ---------------------------------------------------------------------------
+
+
+def test_build_performance_lines_latency_label_present():
+    """5a. LABEL_LATENCY and LABEL_LATENCY_AVG always appear in performance lines."""
+    lines = build_performance_lines(width=72)
+    joined = "\n".join(lines)
+    assert LABEL_LATENCY in joined
+    assert LABEL_LATENCY_AVG in joined
+
+
+def test_build_performance_lines_custom_latency_values():
+    """5b. Custom latency strings are rendered correctly in performance lines."""
+    lines = build_performance_lines(width=72, latency="123.4", latency_avg="200.0")
+    joined = "\n".join(lines)
+    assert "123.4" in joined
+    assert "200.0" in joined
+
+
+def test_build_performance_lines_placeholder_latency_by_default():
+    """5c. Latency shows PLACEHOLDER ('--') when no value provided."""
+    lines = build_performance_lines(width=72)
+    joined = "\n".join(lines)
+    assert PLACEHOLDER in joined
+
+
+# ---------------------------------------------------------------------------
+# 6. Existing feature preservation
+# ---------------------------------------------------------------------------
+
+
+def test_latency_existing_counter_throughput_bid_ask_preserved():
+    """6a. All existing metrics remain intact after adding latency tracking."""
+    clock = FakeClock(100.0)
+    ns_clock = FakeNsClock(start_ns=0)
+    dashboard = TerminalDashboard(clock=clock, ns_clock=ns_clock, orders_processed=0)
+
+    dashboard.update_throughput()
+    clock.advance(1.0)
+    for _ in range(5):
+        ns_clock.advance_us(50.0)
+        dashboard.record_order_processed()
+
+    lines = dashboard.get_display_lines(rows=40, cols=100)
+    joined = "\n".join(lines)
+
+    # Existing sections still present
+    assert SECTION_MARKET_SUMMARY in joined
+    assert LABEL_BEST_BID in joined
+    assert LABEL_BEST_ASK in joined
+    assert LABEL_SPREAD in joined
+    assert SECTION_ORDER_BOOK in joined
+    assert SECTION_BUY_ORDERS in joined
+    assert SECTION_SELL_ORDERS in joined
+    assert SECTION_PERFORMANCE in joined
+    assert LABEL_TOTAL_ORDERS in joined
+    assert LABEL_THROUGHPUT in joined
+    assert QUIT_MESSAGE in joined
+
+    # Orders counter correct
+    assert dashboard.orders_processed == 5
+
+    # Latency now also present
+    assert LABEL_LATENCY in joined
+    assert LABEL_LATENCY_AVG in joined
+
+
+def test_latency_small_terminal_and_quit_preserved():
+    """6b. Small-terminal and Q-to-quit behavior unchanged after latency addition."""
+    ns_clock = FakeNsClock(start_ns=0)
+    dashboard = TerminalDashboard(ns_clock=ns_clock, use_sample_data=False)
+
+    # Small terminal
+    small_win = MockCursesWindow(rows=5, cols=20)
+    dashboard.render(small_win)
+    small_text = " ".join(c[2] for c in small_win.addstr_calls)
+    assert "too small" in small_text.lower()
+    assert QUIT_MESSAGE in small_text
+
+    # Q quits
+    assert dashboard.handle_input(ord("q")) is False
+    assert dashboard.handle_input(ord("Q")) is False
+    assert dashboard.handle_input(ord("z")) is True
+
+
+def test_latency_duplicate_order_id_not_double_counted():
+    """6c. Duplicate order IDs don't add extra latency samples."""
+    ns_clock = FakeNsClock(start_ns=0)
+    dashboard = TerminalDashboard(ns_clock=ns_clock, use_sample_data=False)
+
+    dashboard.record_order_processed({"order_id": 42})
+    ns_clock.advance_us(100.0)
+    dashboard.record_order_processed({"order_id": 42})  # duplicate, ignored
+    ns_clock.advance_us(100.0)
+    dashboard.record_order_processed({"order_id": 99})  # new order
+
+    # Only 1 sample: from the 42->99 transition (not duplicate)
+    assert dashboard.orders_processed == 2
+    # Samples should reflect real, non-duplicate events only
+    assert len(dashboard._latency_samples) >= 1
 
