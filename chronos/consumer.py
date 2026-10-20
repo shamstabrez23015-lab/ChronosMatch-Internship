@@ -54,9 +54,21 @@ class ZeroCopyConsumer:
         ring_buffer: MmapRingBuffer,
         batch_size: int = 1000,
         order_handler: Optional[Callable[[Tuple[int, int, float, int, int, int, int]], Any]] = None,
+        adapter: Optional[Any] = None,
+        engine: Optional[Any] = None,
     ):
         self.ring_buffer = ring_buffer
         self.batch_size = batch_size
+        self.adapter = adapter
+        self.engine = engine
+
+        if adapter is not None and order_handler is None:
+            order_handler = adapter.dispatch_raw_order
+        elif engine is not None and order_handler is None:
+            from chronos.adapter import OrderAdapter
+            self.adapter = OrderAdapter(ring_buffer=ring_buffer, engine=engine)
+            order_handler = self.adapter.dispatch_raw_order
+
         self.order_handler = order_handler
         self.is_running = False
         self.stats = ConsumerStats()
@@ -67,6 +79,7 @@ class ZeroCopyConsumer:
         duration_seconds: Optional[float] = None,
         total_orders: Optional[int] = None,
         print_progress: bool = True,
+        exit_when_empty: bool = False,
     ) -> ConsumerStats:
         """Poll and drain orders from the ring buffer.
 
@@ -84,8 +97,22 @@ class ZeroCopyConsumer:
 
         try:
             while self.is_running:
-                # Batch read raw bytes/tuples from mmap
-                batch = self.ring_buffer.read_batch_raw(self.batch_size)
+                # Early termination checks for bounded execution
+                if total_orders is not None and self.stats.total_orders_read >= total_orders:
+                    break
+                elapsed_now = time.perf_counter() - self.stats.start_time
+                if duration_seconds is not None and elapsed_now >= duration_seconds:
+                    break
+
+                # Batch read raw bytes/tuples from mmap, bounded by remaining total_orders if specified
+                current_batch_size = self.batch_size
+                if total_orders is not None:
+                    remaining_orders = total_orders - self.stats.total_orders_read
+                    if remaining_orders <= 0:
+                        break
+                    current_batch_size = min(self.batch_size, remaining_orders)
+
+                batch = self.ring_buffer.read_batch_raw(current_batch_size)
                 batch_count = len(batch)
 
                 if batch_count > 0:
@@ -110,6 +137,8 @@ class ZeroCopyConsumer:
                         if self.order_handler is not None:
                             self.order_handler(item)
                 else:
+                    if exit_when_empty:
+                        break
                     # Buffer currently empty: brief pause to avoid spinning CPU 100%
                     time.sleep(0.0005)
 
@@ -154,8 +183,46 @@ class ZeroCopyConsumer:
 
         return self.stats
 
+    def drain_available(self, max_orders: Optional[int] = None) -> int:
+        """Drain currently available orders from the ring buffer without sleeping.
+
+        Returns:
+            Number of orders read and processed.
+        """
+        avail = self.ring_buffer.available_to_read()
+        if avail <= 0:
+            return 0
+        limit = avail if max_orders is None else min(avail, max_orders)
+        batch = self.ring_buffer.read_batch_raw(limit)
+        batch_count = len(batch)
+        if batch_count > 0:
+            self.stats.total_orders_read += batch_count
+            now_ns = time.time_ns()
+            for item in batch:
+                order_ts_ns = item[1]
+                lat_us = max(0.0, (now_ns - order_ts_ns) / 1_000.0)
+                if lat_us < self.stats.min_latency_us:
+                    self.stats.min_latency_us = lat_us
+                if lat_us > self.stats.max_latency_us:
+                    self.stats.max_latency_us = lat_us
+                if len(self._latencies_sample) < 50_000:
+                    self._latencies_sample.append(lat_us)
+                if self.order_handler is not None:
+                    self.order_handler(item)
+        return batch_count
+
     def stop(self) -> None:
         self.is_running = False
+
+    def close(self) -> None:
+        """Stop consumer and release resources."""
+        self.stop()
+
+    def __enter__(self) -> ZeroCopyConsumer:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
 
     def _print_status_line(self) -> None:
         stat = self.stats
