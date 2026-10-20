@@ -55,6 +55,21 @@ LABEL_ORDERS_PROCESSED = LABEL_TOTAL_ORDERS
 LABEL_THROUGHPUT = "Throughput (orders/sec)"
 LABEL_LATENCY = "Latency (microseconds)"
 
+# Latency label detail: measures inter-event elapsed time between consecutive
+# record_order_processed() calls recorded by the dashboard. This reflects the
+# spacing between processing events observed at the dashboard boundary, NOT
+# full end-to-end network or engine dispatch latency.
+LABEL_LATENCY_LAST = "Last Event Interval (us)"
+LABEL_LATENCY_AVG  = "Avg Event Interval (us)"
+LABEL_LATENCY_MAX  = "Max Event Interval (us)"
+LABEL_LATENCY_P95  = "P95 Event Interval (us)"
+
+# Latency demo/sample constants
+DEMO_LATENCY = "DEMO"
+NO_SAMPLE_LATENCY = "N/A"
+# Minimum samples required before p95/max are considered accurate
+_LATENCY_MIN_SAMPLES_FOR_P95 = 20
+
 # Demonstration / sample constants
 DEMO_ORDERS_PROCESSED = 125
 SAMPLE_ORDERS_PROCESSED = DEMO_ORDERS_PROCESSED
@@ -613,6 +628,70 @@ def get_sample_throughput() -> float:
 
 
 # ---------------------------------------------------------------------------
+# Latency helpers (pure functions, no curses dependency)
+# ---------------------------------------------------------------------------
+
+
+def calculate_latency_stats(
+    samples_us: List[float],
+) -> Optional[Dict[str, float]]:
+    """Calculate latency statistics from a list of microsecond samples.
+
+    Args:
+        samples_us: List of non-negative float latency measurements in microseconds.
+
+    Returns:
+        Dict with keys 'last', 'avg', 'max', and optionally 'p95' (when >= 20 samples),
+        or None if samples is empty or None.
+    """
+    if not samples_us:
+        return None
+    try:
+        valid = [float(s) for s in samples_us if s is not None and float(s) >= 0]
+    except (ValueError, TypeError):
+        return None
+    if not valid:
+        return None
+
+    result: Dict[str, float] = {
+        "last": valid[-1],
+        "avg": sum(valid) / len(valid),
+        "max": max(valid),
+    }
+    if len(valid) >= _LATENCY_MIN_SAMPLES_FOR_P95:
+        sorted_vals = sorted(valid)
+        p95_idx = max(0, int(math.ceil(len(sorted_vals) * 0.95)) - 1)
+        result["p95"] = sorted_vals[p95_idx]
+    return result
+
+
+def format_latency(
+    value_us: Optional[Union[float, int]],
+    decimals: int = 1,
+    is_demo: bool = False,
+) -> str:
+    """Format a latency value in microseconds for display.
+
+    Args:
+        value_us: Latency in microseconds (non-negative float or int), or None.
+        decimals: Decimal places for the formatted value (default: 1).
+        is_demo: If True and value_us is None, return DEMO_LATENCY ('DEMO').
+
+    Returns:
+        Formatted string like '123.4', or 'DEMO'/'N/A' when no value is available.
+    """
+    if value_us is None:
+        return DEMO_LATENCY if is_demo else NO_SAMPLE_LATENCY
+    try:
+        val = float(value_us)
+    except (ValueError, TypeError):
+        return NO_SAMPLE_LATENCY
+    if math.isnan(val) or math.isinf(val) or val < 0:
+        return NO_SAMPLE_LATENCY
+    return f"{val:.{decimals}f}"
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -721,15 +800,21 @@ def build_performance_lines(
     total_orders: Union[str, int] = PLACEHOLDER,
     throughput: Union[str, int, float] = PLACEHOLDER,
     latency: str = PLACEHOLDER,
+    latency_avg: str = PLACEHOLDER,
     orders_processed: Optional[Union[str, int]] = None,
 ) -> List[str]:
     """Return Performance Metrics section lines.
+
+    Latency values reflect the inter-event elapsed time between consecutive
+    record_order_processed() calls as observed by the dashboard. This is NOT
+    full end-to-end network or engine dispatch latency.
 
     Args:
         width: Available content width in characters.
         total_orders: Total processed orders (integer, formatted string, or PLACEHOLDER).
         throughput: Throughput metric (number, formatted string, or PLACEHOLDER).
-        latency: Latency metric string.
+        latency: Last inter-event interval string (microseconds).
+        latency_avg: Average inter-event interval string (microseconds).
         orders_processed: Optional alias for total_orders.
     """
     raw_val = orders_processed if orders_processed is not None else total_orders
@@ -755,6 +840,7 @@ def build_performance_lines(
         f"  {LABEL_TOTAL_ORDERS:<{col_w - 10}} {orders_str:>8}",
         f"  {LABEL_THROUGHPUT:<{col_w - 10}} {throughput_str:>8}",
         f"  {LABEL_LATENCY:<{col_w - 10}} {latency:>8}",
+        f"  {LABEL_LATENCY_AVG:<{col_w - 10}} {latency_avg:>8}",
         divider,
     ]
 
@@ -783,9 +869,22 @@ class TerminalDashboard:
         use_sample_data: bool = True,
         orders_processed: int = 0,
         clock: Optional[Callable[[], float]] = None,
+        ns_clock: Optional[Callable[[], int]] = None,
         throughput: Optional[Union[float, int, str]] = None,
     ) -> None:
-        """Initialize the dashboard with optional configuration, order data, counter, clock, and throughput."""
+        """Initialize the dashboard.
+
+        Args:
+            config: Dashboard configuration.
+            buy_orders: Initial buy orders list.
+            sell_orders: Initial sell orders list.
+            use_sample_data: Whether to use sample data when no real data provided.
+            orders_processed: Initial processed orders count.
+            clock: Monotonic clock callable (seconds) for throughput; defaults to time.monotonic.
+            ns_clock: Nanosecond clock callable for latency measurement; defaults to time.perf_counter_ns.
+                      Inject a deterministic clock in tests.
+            throughput: Optional initial throughput override.
+        """
         self.config = config or DashboardConfig()
         self.is_running = False
         self.frame_count = 0
@@ -825,6 +924,7 @@ class TerminalDashboard:
         self._processed_order_ids: set = set()
 
         self._clock: Callable[[], float] = clock if clock is not None else time.monotonic
+        self._ns_clock: Callable[[], int] = ns_clock if ns_clock is not None else time.perf_counter_ns
         self._last_throughput_time: Optional[float] = None
         self._last_orders_count: Optional[int] = None
         self._throughput: Optional[float] = None
@@ -840,6 +940,16 @@ class TerminalDashboard:
                 if init_tp < 0:
                     raise ValueError(f"Throughput cannot be negative: {throughput}")
                 self._throughput = init_tp
+
+        # Latency tracking state
+        # Measures elapsed nanoseconds between consecutive record_order_processed() calls.
+        # This reflects inter-event spacing at the dashboard boundary — not full
+        # end-to-end or engine dispatch latency.
+        self._latency_last_ns: Optional[int] = None   # ns timestamp of last event
+        self._latency_last_us: Optional[float] = None  # last interval in microseconds
+        self._latency_samples: List[float] = []        # rolling sample buffer (microseconds)
+        _MAX_LATENCY_SAMPLES = 1000
+        self._max_latency_samples: int = _MAX_LATENCY_SAMPLES
 
     @property
     def orders_processed(self) -> int:
@@ -894,11 +1004,16 @@ class TerminalDashboard:
         return self.orders_processed
 
     def record_order_processed(self, order: Optional[Any] = None) -> int:
-        """Record a single processed order event.
+        """Record a single processed order event and update latency metrics.
 
         The counter represents the number of orders accepted or processed by the engine,
         not the number of trades executed. A single order creating multiple fills counts
         as one processed order.
+
+        Latency measurement: records the inter-event elapsed time between consecutive
+        calls to this method using the injected nanosecond clock. This reflects the
+        spacing between processing events observed at the dashboard boundary — it is
+        NOT full end-to-end or engine dispatch latency.
 
         Args:
             order: Optional order representation (dict, object, tuple, or None).
@@ -913,6 +1028,10 @@ class TerminalDashboard:
                 return self.orders_processed
             self._processed_order_ids.add(order_id)
 
+        # Measure inter-event latency BEFORE incrementing the counter.
+        # Done on real processing events, not in the render loop.
+        self._record_latency_sample()
+
         self.increment_orders_processed(1)
         return self.orders_processed
 
@@ -920,11 +1039,68 @@ class TerminalDashboard:
         """Event handler callback for order processed events (alias for record_order_processed)."""
         return self.record_order_processed(order)
 
+    def _record_latency_sample(self) -> None:
+        """Record one inter-event latency sample using the nanosecond clock.
+
+        Called only from record_order_processed() — never from the render loop.
+        Safe when ns_clock raises or returns invalid values.
+        """
+        try:
+            now_ns = int(self._ns_clock())
+        except Exception:
+            return
+
+        if self._latency_last_ns is not None:
+            elapsed_ns = now_ns - self._latency_last_ns
+            # Guard against clock skew / backwards jumps
+            if elapsed_ns > 0:
+                elapsed_us = elapsed_ns / 1_000.0
+                self._latency_last_us = elapsed_us
+                if len(self._latency_samples) >= self._max_latency_samples:
+                    # Drop oldest sample to keep buffer bounded
+                    self._latency_samples.pop(0)
+                self._latency_samples.append(elapsed_us)
+
+        self._latency_last_ns = now_ns
+
+    def get_latency_stats(self) -> Optional[Dict[str, float]]:
+        """Return latency statistics computed from recorded samples.
+
+        Returns:
+            Dict with 'last', 'avg', 'max' (and 'p95' when >= 20 samples),
+            all in microseconds. Returns None if no samples have been recorded.
+        """
+        return calculate_latency_stats(self._latency_samples)
+
+    def get_latency_display(self) -> str:
+        """Return formatted last inter-event latency for display (microseconds).
+
+        Returns DEMO_LATENCY when using sample data and no real events recorded.
+        Returns NO_SAMPLE_LATENCY when live data but no events yet.
+        """
+        if self._latency_last_us is not None:
+            return format_latency(self._latency_last_us)
+        return DEMO_LATENCY if self.is_sample_data else NO_SAMPLE_LATENCY
+
+    def get_latency_avg_display(self) -> str:
+        """Return formatted average inter-event latency for display (microseconds)."""
+        stats = self.get_latency_stats()
+        if stats is not None:
+            return format_latency(stats.get("avg"))
+        return DEMO_LATENCY if self.is_sample_data else NO_SAMPLE_LATENCY
+
+    def reset_latency(self) -> None:
+        """Reset all latency tracking state."""
+        self._latency_last_ns = None
+        self._latency_last_us = None
+        self._latency_samples.clear()
+
     def reset_orders_processed(self) -> None:
-        """Reset the processed orders counter and seen order IDs to zero/empty."""
+        """Reset the processed orders counter, seen order IDs, and latency state."""
         self._orders_processed = 0
         self._processed_order_ids.clear()
         self.reset_throughput()
+        self.reset_latency()
 
     @property
     def throughput(self) -> Optional[float]:
@@ -1098,6 +1274,8 @@ class TerminalDashboard:
         """Generate all display lines for the current state.
 
         Useful for noninteractive testing and headless validation.
+        Latency values reflect inter-event spacing between record_order_processed()
+        calls — not full end-to-end latency.
         """
         if not self.is_terminal_size_sufficient(rows, cols):
             return [
@@ -1139,6 +1317,10 @@ class TerminalDashboard:
             self.update_throughput()
             throughput_str = self.get_throughput_display()
 
+        # Latency strings — read from state, never updated here
+        latency_str = self.get_latency_display()
+        latency_avg_str = self.get_latency_avg_display()
+
         width = min(cols - 4, 72)
         lines: List[str] = []
         lines += build_header_lines(width, status=self.status_message)
@@ -1158,6 +1340,8 @@ class TerminalDashboard:
             width,
             total_orders=total_orders_str,
             throughput=throughput_str,
+            latency=latency_str,
+            latency_avg=latency_avg_str,
         )
         lines.append("")
         lines += build_footer_lines(width)
@@ -1399,12 +1583,17 @@ class TerminalDashboard:
             self.update_throughput()
             throughput_str = self.get_throughput_display()
 
+        # Latency strings — read from state, never updated in the render loop
+        latency_str = self.get_latency_display()
+        latency_avg_str = self.get_latency_avg_display()
+
         # ---- Performance Metrics ----
         put(f"  {SECTION_PERFORMANCE}", attrs["section"])
         put(divider, attrs["border"])
         put(f"  {LABEL_TOTAL_ORDERS:<{col_w - 10}} {total_orders_str:>8}", attrs["label"])
         put(f"  {LABEL_THROUGHPUT:<{col_w - 10}} {throughput_str:>8}", attrs["label"])
-        put(f"  {LABEL_LATENCY:<{col_w - 10}} {PLACEHOLDER:>8}", attrs["label"])
+        put(f"  {LABEL_LATENCY:<{col_w - 10}} {latency_str:>8}", attrs["label"])
+        put(f"  {LABEL_LATENCY_AVG:<{col_w - 10}} {latency_avg_str:>8}", attrs["label"])
         put(divider, attrs["border"])
         blank()
 
