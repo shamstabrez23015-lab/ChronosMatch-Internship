@@ -214,10 +214,11 @@ class OrderAdapter:
         total_orders: Optional[int] = None,
         duration_seconds: Optional[float] = None,
         print_progress: bool = False,
+        exit_when_empty: bool = False,
     ) -> AdapterStats:
         """Run with a ZeroCopyConsumer to drain orders and dispatch to the matching engine.
 
-        Bounded execution: stops after total_orders or duration_seconds.
+        Bounded execution: stops after total_orders, duration_seconds, or when empty if exit_when_empty=True.
         """
         if consumer is None:
             if self.ring_buffer is None:
@@ -234,6 +235,7 @@ class OrderAdapter:
             total_orders=total_orders,
             duration_seconds=duration_seconds,
             print_progress=print_progress,
+            exit_when_empty=exit_when_empty,
         )
         if c_stats is not None:
             self.stats.total_orders_read += c_stats.total_orders_read
@@ -245,3 +247,9 @@ class OrderAdapter:
         self.trades.clear()
         self.unhandled_orders.clear()
         self.unrouted_orders.clear()
+
+    def __enter__(self) -> OrderAdapter:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.clear()
