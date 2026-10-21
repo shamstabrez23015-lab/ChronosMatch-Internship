@@ -2298,3 +2298,378 @@ def test_latency_duplicate_order_id_not_double_counted():
     # Samples should reflect real, non-duplicate events only
     assert len(dashboard._latency_samples) >= 1
 
+
+# ==============================================================================
+# Day 9 — Live ChronosMatch Dashboard Integration Tests
+# ==============================================================================
+
+import os
+import tempfile
+import time
+from chronos.live_feed import LiveFeedBridge
+from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+from chronos.ring_buffer import MmapRingBuffer
+from chronos.protocol import ORDER_SIZE, OrderType, Side, SYMBOLS
+from chronos.adapter import OrderAdapter
+from chronos.consumer import ZeroCopyConsumer
+
+
+@pytest.fixture
+def temp_ring_buffer_day9():
+    """Isolated, real MmapRingBuffer on disk with guaranteed cleanup."""
+    fd, path = tempfile.mkstemp(prefix="chronos_day9_ring_", suffix=".bin")
+    os.close(fd)
+    buffer = MmapRingBuffer(filepath=path, capacity=256, slot_size=ORDER_SIZE, create=True)
+    try:
+        yield buffer
+    finally:
+        buffer.close()
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+class TestLiveFeedBridgeUnit:
+    """Unit tests for LiveFeedBridge behavior and edge cases with deterministic inputs."""
+
+    def test_live_feed_initialization_defaults_and_custom(self):
+        engine = MatchingEngine()
+        bridge = LiveFeedBridge(engine=engine, batch_size=500, poll_interval_s=0.05)
+        assert bridge.engine is engine
+        assert bridge.adapter is not None
+        assert bridge.batch_size == 500
+        assert bridge.poll_interval_s == 0.05
+        assert bridge.is_running is False
+        assert bridge.is_connected is True
+
+    def test_live_feed_is_connected_status(self, temp_ring_buffer_day9):
+        bridge = LiveFeedBridge(ring_buffer=temp_ring_buffer_day9)
+        assert bridge.is_connected is True
+        temp_ring_buffer_day9.close()
+        assert bridge.is_connected is False
+
+    def test_live_feed_order_notification_increments_dashboard_counter(self):
+        dashboard = TerminalDashboard(use_sample_data=False)
+        bridge = LiveFeedBridge(dashboard=dashboard)
+        raw_order = (1001, 1_000_000_000, 150.0, 100, 1, 1, 1)
+
+        bridge._handle_raw_order(raw_order)
+        assert dashboard.orders_processed == 1
+        assert bridge.get_stats()["orders_processed"] == 1
+
+    def test_live_feed_duplicate_order_id_deduplicated(self):
+        dashboard = TerminalDashboard(use_sample_data=False)
+        bridge = LiveFeedBridge(dashboard=dashboard)
+        raw_order = (5555, 1_000_000_000, 200.0, 50, 1, 1, 1)
+
+        bridge._handle_raw_order(raw_order)
+        bridge._handle_raw_order(raw_order)
+        assert dashboard.orders_processed == 1
+        assert bridge.get_stats()["orders_processed"] == 2
+
+    def test_live_feed_sync_to_dashboard_bids_and_asks(self):
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 150.25, 100, 1000)
+        engine.submit_order(2, SIDE_SELL, 151.75, 200, 2000)
+
+        dashboard = TerminalDashboard(use_sample_data=False)
+        bridge = LiveFeedBridge(engine=engine, dashboard=dashboard)
+        bridge.sync_to_dashboard()
+
+        assert len(dashboard.buy_orders) == 1
+        assert len(dashboard.sell_orders) == 1
+        assert dashboard.is_sample_data is False
+
+    def test_live_feed_sync_empty_engine_clears_orders(self):
+        engine = MatchingEngine()
+        dashboard = TerminalDashboard(use_sample_data=True)
+        assert dashboard.is_sample_data is True
+
+        bridge = LiveFeedBridge(engine=engine, dashboard=dashboard)
+        bridge.sync_to_dashboard()
+
+        assert dashboard.buy_orders == []
+        assert dashboard.sell_orders == []
+        assert dashboard.is_sample_data is False
+
+    def test_live_feed_stats_reporting(self):
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 100.0, 10, 1000)
+        bridge = LiveFeedBridge(engine=engine)
+        stats = bridge.get_stats()
+
+        assert stats["is_connected"] is True
+        assert stats["engine_order_count"] == 1
+        assert stats["engine_bid_count"] == 1
+        assert stats["engine_ask_count"] == 0
+
+    def test_live_feed_start_and_stop_worker_thread(self):
+        bridge = LiveFeedBridge(poll_interval_s=0.01)
+        assert bridge.is_running is False
+        bridge.start()
+        assert bridge.is_running is True
+        bridge.start()  # idempotent
+        assert bridge.is_running is True
+        bridge.stop()
+        assert bridge.is_running is False
+
+    def test_live_feed_worker_poll_exception_safe(self):
+        dashboard = TerminalDashboard(use_sample_data=False)
+        bridge = LiveFeedBridge(dashboard=dashboard)
+        bridge.sync_to_dashboard = MagicMock(side_effect=RuntimeError("Simulated failure"))
+
+        bridge.start()
+        time.sleep(0.05)
+        bridge.stop()
+        assert bridge.is_running is False
+
+    def test_live_feed_context_manager(self):
+        with LiveFeedBridge(poll_interval_s=0.01) as bridge:
+            bridge.start()
+            assert bridge.is_running is True
+        assert bridge.is_running is False
+
+
+class TestDashboardLiveModeDisplay:
+    """Tests for dashboard display state in live mode."""
+
+    def test_dashboard_live_mode_default_status_connected(self):
+        bridge = LiveFeedBridge()
+        dashboard = TerminalDashboard(live_feed=bridge)
+        assert dashboard.status_message == "Live: Connected"
+        assert dashboard.is_sample_data is False
+
+    def test_dashboard_live_mode_disconnected_status(self):
+        bridge = LiveFeedBridge()
+        bridge.is_connected = False
+        dashboard = TerminalDashboard(live_feed=bridge)
+        assert dashboard.status_message == "Live: Disconnected"
+
+    def test_dashboard_live_mode_status_override(self):
+        bridge = LiveFeedBridge()
+        dashboard = TerminalDashboard(live_feed=bridge)
+        dashboard.status_message = "Custom Live Feed Status"
+        assert dashboard.status_message == "Custom Live Feed Status"
+
+    def test_dashboard_live_mode_empty_book_renders_na(self):
+        bridge = LiveFeedBridge()
+        dashboard = TerminalDashboard(live_feed=bridge)
+        lines = dashboard.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+
+        assert "Live: Connected" in text
+        assert "Demo: Sample Data" not in text
+        assert LABEL_BEST_BID in text
+        assert "N/A" in text
+
+    def test_dashboard_live_mode_with_engine_orders_renders_real_market_summary(self):
+        engine = MatchingEngine()
+        engine.submit_order(101, SIDE_BUY, 250.50, 400, 1000)
+        engine.submit_order(201, SIDE_SELL, 251.50, 300, 2000)
+
+        bridge = LiveFeedBridge(engine=engine)
+        dashboard = TerminalDashboard(live_feed=bridge)
+        lines = dashboard.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+
+        assert "250.50" in text  # Best Bid
+        assert "400" in text     # Bid Qty
+        assert "251.50" in text  # Best Ask
+        assert "300" in text     # Ask Qty
+        assert "1.00" in text    # Spread
+
+    def test_dashboard_live_mode_depth_renders_exact_price_and_quantities(self):
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 100.0, 50, 1000)
+        engine.submit_order(2, SIDE_BUY, 100.0, 30, 1100)  # aggregate at 100.0 -> 80
+        engine.submit_order(3, SIDE_BUY, 99.0, 120, 1200)
+
+        engine.submit_order(4, SIDE_SELL, 102.0, 70, 2000)
+        engine.submit_order(5, SIDE_SELL, 103.0, 90, 2100)
+
+        bridge = LiveFeedBridge(engine=engine)
+        dashboard = TerminalDashboard(live_feed=bridge)
+        lines = dashboard.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+
+        assert "100.00" in text
+        assert "80" in text
+        assert "99.00" in text
+        assert "120" in text
+        assert "102.00" in text
+        assert "70" in text
+        assert "103.00" in text
+        assert "90" in text
+
+    def test_dashboard_live_mode_partial_fill_reflects_remaining_quantity(self):
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 100.0, 100, 1000)
+
+        trades = engine.match_order(2, SIDE_SELL, 100.0, 40, 2000)
+        assert len(trades) == 1
+        assert trades[0].executed_quantity == 40
+
+        bridge = LiveFeedBridge(engine=engine)
+        dashboard = TerminalDashboard(live_feed=bridge)
+        lines = dashboard.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+
+        # Remaining quantity should be 60, NOT original 100
+        assert "100.00" in text
+        assert "60" in text
+
+    def test_dashboard_live_mode_curses_lifecycle_starts_and_stops_feed(self):
+        bridge = LiveFeedBridge(poll_interval_s=0.01)
+        dashboard = TerminalDashboard(live_feed=bridge)
+        mock_win = MockCursesWindow(rows=40, cols=100, keys=[ord("q")])
+
+        dashboard.run_curses(mock_win, max_iterations=2)
+        assert bridge.is_running is False
+        assert dashboard.is_running is False
+
+    def test_dashboard_live_mode_small_terminal_resizing_safe(self):
+        bridge = LiveFeedBridge()
+        dashboard = TerminalDashboard(live_feed=bridge)
+        mock_win = MockCursesWindow(rows=5, cols=20, keys=[ord("q")])
+
+        dashboard.render(mock_win)
+        small_text = " ".join(c[2] for c in mock_win.addstr_calls)
+        assert "too small" in small_text.lower()
+
+
+class TestLivePipelineIntegration:
+    """Integration tests connecting real MmapRingBuffer, Consumer, Adapter, Engine, and Dashboard."""
+
+    def test_e2e_write_to_ring_buffer_drains_to_engine_and_dashboard(
+        self, temp_ring_buffer_day9
+    ):
+        engine = MatchingEngine()
+        clock = FakeClock(start=100.0)
+        ns_clock = FakeNsClock(start_ns=1_000_000_000)
+        dashboard = TerminalDashboard(clock=clock, ns_clock=ns_clock, use_sample_data=False)
+        adapter = OrderAdapter(ring_buffer=temp_ring_buffer_day9, engine=engine)
+        bridge = LiveFeedBridge(
+            ring_buffer=temp_ring_buffer_day9,
+            engine=engine,
+            adapter=adapter,
+            dashboard=dashboard,
+            clock=clock,
+        )
+
+        # 1. Write BUY order into ring buffer
+        written = temp_ring_buffer_day9.write(
+            order_id=7001,
+            timestamp_ns=1_000_000_000,
+            price=150.0,
+            quantity=100,
+            symbol_id=SYMBOLS["AAPL"],
+            side=int(Side.BUY),
+            order_type=int(OrderType.LIMIT),
+        )
+        assert written is True
+        assert temp_ring_buffer_day9.available_to_read() == 1
+
+        # 2. Advance clocks and poll once
+        clock.advance(1.0)
+        ns_clock.advance_us(50.0)
+        drained = bridge.poll_once()
+        assert drained == 1
+
+        # 3. Check dashboard metrics
+        assert dashboard.orders_processed == 1
+        lines = dashboard.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+        assert "150.00" in text  # Best Bid
+        assert "100" in text     # Bid Qty
+        assert "Total Orders Processed" in text
+
+        # 4. Write SELL order into ring buffer (non-crossing)
+        written = temp_ring_buffer_day9.write(
+            order_id=7002,
+            timestamp_ns=1_000_001_000,
+            price=152.0,
+            quantity=50,
+            symbol_id=SYMBOLS["AAPL"],
+            side=int(Side.SELL),
+            order_type=int(OrderType.LIMIT),
+        )
+        assert written is True
+        clock.advance(1.0)
+        ns_clock.advance_us(100.0)
+        drained = bridge.poll_once()
+        assert drained == 1
+        assert dashboard.orders_processed == 2
+
+        lines = dashboard.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+        assert "152.00" in text  # Best Ask
+        assert "50" in text      # Ask Qty
+        assert "2.00" in text    # Spread (152.0 - 150.0)
+
+    def test_e2e_crossing_orders_match_and_update_book_and_metrics(
+        self, temp_ring_buffer_day9
+    ):
+        engine = MatchingEngine()
+        dashboard = TerminalDashboard(use_sample_data=False)
+        adapter = OrderAdapter(ring_buffer=temp_ring_buffer_day9, engine=engine)
+        bridge = LiveFeedBridge(
+            ring_buffer=temp_ring_buffer_day9,
+            engine=engine,
+            adapter=adapter,
+            dashboard=dashboard,
+        )
+
+        # 1. Resting BUY order
+        temp_ring_buffer_day9.write(
+            order_id=8001,
+            timestamp_ns=1_000_000,
+            price=100.0,
+            quantity=100,
+            symbol_id=SYMBOLS["AAPL"],
+            side=int(Side.BUY),
+            order_type=int(OrderType.LIMIT),
+        )
+        bridge.poll_once()
+        assert dashboard.orders_processed == 1
+
+        # 2. Crossing SELL order for 40 shares
+        temp_ring_buffer_day9.write(
+            order_id=8002,
+            timestamp_ns=2_000_000,
+            price=100.0,
+            quantity=40,
+            symbol_id=SYMBOLS["AAPL"],
+            side=int(Side.SELL),
+            order_type=int(OrderType.LIMIT),
+        )
+        bridge.poll_once()
+        assert dashboard.orders_processed == 2
+
+        # 3. Verify match and remaining book depth
+        assert adapter.stats.total_trades_generated == 1
+        assert adapter.stats.total_volume_matched == 40
+
+        lines = dashboard.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+        # Resting BUY order has 60 shares left
+        assert "60" in text
+        assert "N/A" in text  # Best Ask is N/A since SELL order was fully filled
+
+    def test_e2e_empty_buffer_polling_stays_responsive(self, temp_ring_buffer_day9):
+        dashboard = TerminalDashboard(use_sample_data=False)
+        bridge = LiveFeedBridge(ring_buffer=temp_ring_buffer_day9, dashboard=dashboard)
+        drained = bridge.poll_once()
+        assert drained == 0
+        assert dashboard.orders_processed == 0
+
+    def test_e2e_clean_shutdown_and_close(self, temp_ring_buffer_day9):
+        dashboard = TerminalDashboard(use_sample_data=False)
+        bridge = LiveFeedBridge(ring_buffer=temp_ring_buffer_day9, dashboard=dashboard)
+        bridge.start()
+        assert bridge.is_running is True
+        dashboard.close()
+        assert bridge.is_running is False
+        assert dashboard.is_running is False
+
