@@ -446,3 +446,60 @@ class TestScenarioImmutability:
         assert engine1.ask_count() == engine2.ask_count() == 1
         assert engine1.get_best_buy_order().order_id == engine2.get_best_buy_order().order_id == 701
         assert engine1.has_crossing_prices() is engine2.has_crossing_prices() is True
+
+
+# ==============================================================================
+# 8. Day 10 Dynamic Scenario Execution and Adapter Matching Tests
+# ==============================================================================
+
+class TestTradingScenariosDynamicExecution:
+    """Verifies that all 10 deterministic trading scenarios execute accurately through
+    MatchingEngine.match_order and the OrderAdapter in match mode."""
+
+    @pytest.mark.parametrize("scenario", ALL_SCENARIOS, ids=lambda s: s.name)
+    def test_all_scenarios_dynamic_execution_through_match_order(self, scenario: TradingScenario):
+        """Verify each scenario produces exact expected trades and book state via engine.match_order."""
+        engine = MatchingEngine()
+        all_trades = []
+        for o in scenario.orders:
+            trades = engine.match_order(
+                order_id=o.order_id,
+                side=o.side,
+                price=o.price,
+                quantity=o.quantity,
+                timestamp_ns=o.timestamp_ns,
+            )
+            all_trades.extend(trades)
+
+        # 1. Total matched volume
+        total_matched = sum(t.executed_quantity for t in all_trades)
+        assert total_matched == scenario.expected.total_matched_quantity
+
+        # 2. Trade count and trade fields
+        assert len(all_trades) == len(scenario.expected.trades)
+        for actual, expected in zip(all_trades, scenario.expected.trades):
+            assert actual.buy_order_id == expected.buy_order_id
+            assert actual.sell_order_id == expected.sell_order_id
+            assert actual.executed_quantity == expected.trade_quantity
+            assert actual.execution_price == expected.execution_price
+
+        # 3. Post-execution order book remaining quantities
+        bids = {o.order_id: o.remaining_quantity for o in engine.get_prioritized_bids()}
+        asks = {o.order_id: o.remaining_quantity for o in engine.get_prioritized_asks()}
+        book = {**bids, **asks}
+        for order_id, expected_rem in scenario.expected.remaining_quantities.items():
+            assert book.get(order_id, 0) == expected_rem
+
+    @pytest.mark.parametrize("scenario", ALL_SCENARIOS, ids=lambda s: s.name)
+    def test_all_scenarios_adapter_pipeline_match_dispatch(self, scenario: TradingScenario):
+        """Verify each scenario executes accurately when dispatched through OrderAdapter in match mode."""
+        from chronos.adapter import OrderAdapter
+
+        engine = MatchingEngine()
+        adapter = OrderAdapter(engine=engine, dispatch_mode="match")
+        for o in scenario.orders:
+            adapter.dispatch_raw_order(o.to_protocol_order())
+
+        assert adapter.stats.total_volume_matched == scenario.expected.total_matched_quantity
+        assert len(adapter.trades) == len(scenario.expected.trades)
+

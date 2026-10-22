@@ -981,12 +981,19 @@ cdef class MatchingEngine:
             timestamp_ns = kwargs.get("timestamp_ns", 0)
         elif len(args) >= 3:
             # Handle possible positional (order_id, side, price, quantity[, ts])
-            if len(args) >= 4 and args[1] == _SIDE_BUY:
+            if len(args) == 5:
+                if args[1] != _SIDE_BUY:
+                    raise ValueError(f"Invalid side {args[1]}: expected BUY ({_SIDE_BUY})")
                 order_id = args[0]
                 price = args[2]
                 quantity = args[3]
-                if len(args) >= 5:
-                    timestamp_ns = args[4]
+                timestamp_ns = args[4]
+            elif len(args) == 4 and type(args[1]) is int and args[1] in (_SIDE_BUY, _SIDE_SELL):
+                if args[1] != _SIDE_BUY:
+                    raise ValueError(f"Invalid side {args[1]}: expected BUY ({_SIDE_BUY})")
+                order_id = args[0]
+                price = args[2]
+                quantity = args[3]
             else:
                 order_id = args[0]
                 price = args[1]
@@ -1037,12 +1044,19 @@ cdef class MatchingEngine:
             timestamp_ns = kwargs.get("timestamp_ns", 0)
         elif len(args) >= 3:
             # Handle possible positional (order_id, side, price, quantity[, ts])
-            if len(args) >= 4 and args[1] == _SIDE_SELL:
+            if len(args) == 5:
+                if args[1] != _SIDE_SELL:
+                    raise ValueError(f"Invalid side {args[1]}: expected SELL ({_SIDE_SELL})")
                 order_id = args[0]
                 price = args[2]
                 quantity = args[3]
-                if len(args) >= 5:
-                    timestamp_ns = args[4]
+                timestamp_ns = args[4]
+            elif len(args) == 4 and type(args[1]) is int and args[1] in (_SIDE_BUY, _SIDE_SELL):
+                if args[1] != _SIDE_SELL:
+                    raise ValueError(f"Invalid side {args[1]}: expected SELL ({_SIDE_SELL})")
+                order_id = args[0]
+                price = args[2]
+                quantity = args[3]
             else:
                 order_id = args[0]
                 price = args[1]

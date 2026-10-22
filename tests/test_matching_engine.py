@@ -3988,3 +3988,141 @@ class TestDay9DiscoveredBugsRegression:
         assert o.timestamp_ns == 6000
 
 
+# ---------------------------------------------------------------------------
+# 69. Day 10 — Positional Side Argument Dispatch, Deep Residual Books & Multi-Tier Cascades
+# ---------------------------------------------------------------------------
+class TestDay10PositionalSideArgumentDispatchAndCascadingResiduals:
+    """Verifies Day 10 order ingestion signatures, cascading partial fills, and residual book priority."""
+
+    def test_add_buy_order_four_args_positional_explicit_side(self):
+        """Verify add_buy_order(order_id, side, price, quantity) accepts valid BUY side."""
+        from chronos.matching_engine import MatchingEngine
+        engine = MatchingEngine()
+
+        o = engine.add_buy_order(1001, 1, 155.50, 45)
+        assert o.order_id == 1001
+        assert o.side == 1
+        assert o.price == 155.50
+        assert o.quantity == 45
+        assert o.remaining_quantity == 45
+        assert engine.bid_count() == 1
+        assert engine.get_best_bid_price() == 155.50
+
+    def test_add_sell_order_four_args_positional_explicit_side(self):
+        """Verify add_sell_order(order_id, side, price, quantity) accepts valid SELL side."""
+        from chronos.matching_engine import MatchingEngine
+        engine = MatchingEngine()
+
+        o = engine.add_sell_order(2001, 2, 165.75, 55)
+        assert o.order_id == 2001
+        assert o.side == 2
+        assert o.price == 165.75
+        assert o.quantity == 55
+        assert o.remaining_quantity == 55
+        assert engine.ask_count() == 1
+        assert engine.get_best_ask_price() == 165.75
+
+    def test_add_buy_order_four_args_int_price_explicit_side(self):
+        """Verify add_buy_order(order_id, side, price, quantity) works when price is integer."""
+        from chronos.matching_engine import MatchingEngine
+        engine = MatchingEngine()
+
+        o = engine.add_buy_order(1002, 1, 150, 25)
+        assert o.order_id == 1002
+        assert o.side == 1
+        assert o.price == 150.0
+        assert o.quantity == 25
+        assert o.remaining_quantity == 25
+
+    def test_add_sell_order_four_args_int_price_explicit_side(self):
+        """Verify add_sell_order(order_id, side, price, quantity) works when price is integer."""
+        from chronos.matching_engine import MatchingEngine
+        engine = MatchingEngine()
+
+        o = engine.add_sell_order(2002, 2, 170, 35)
+        assert o.order_id == 2002
+        assert o.side == 2
+        assert o.price == 170.0
+        assert o.quantity == 35
+        assert o.remaining_quantity == 35
+
+    def test_multi_level_partial_fill_cascade_maker_pricing_and_residual_placement(self):
+        """Incoming BUY order sweeps across 3 SELL price levels and leaves residual quantity in bids."""
+        from chronos.matching_engine import MatchingEngine
+        engine = MatchingEngine()
+
+        # 3 resting SELL orders at increasing prices
+        engine.submit_order(1, 2, 100.0, 10, 1000)
+        engine.submit_order(2, 2, 101.0, 20, 2000)
+        engine.submit_order(3, 2, 102.0, 30, 3000)
+
+        # Incoming BUY order for 75 @ 103.0 (ts 4000)
+        trades = engine.match_order(100, 1, 103.0, 75, 4000)
+
+        # 3 fills: 10 @ 100.0, 20 @ 101.0, 30 @ 102.0 = 60 total executed
+        assert len(trades) == 3
+        assert [t.sell_order_id for t in trades] == [1, 2, 3]
+        assert [t.executed_quantity for t in trades] == [10, 20, 30]
+        assert [t.execution_price for t in trades] == [100.0, 101.0, 102.0]
+        assert trades[-1].buy_remaining_quantity == 15
+
+        # Resting asks completely consumed
+        assert engine.ask_count() == 0
+
+        # Residual 15 shares of incoming BUY rested in bids at 103.0
+        assert engine.bid_count() == 1
+        best_bid = engine.get_best_bid()
+        assert best_bid.order_id == 100
+        assert best_bid.remaining_quantity == 15
+        assert best_bid.price == 103.0
+        assert best_bid.timestamp_ns == 4000
+
+        # Subsequent incoming SELL for 15 @ 103.0 matches residual completely
+        second_trades = engine.match_order(200, 2, 103.0, 15, 5000)
+        assert len(second_trades) == 1
+        assert second_trades[0].buy_order_id == 100
+        assert second_trades[0].sell_order_id == 200
+        assert second_trades[0].executed_quantity == 15
+        assert second_trades[0].execution_price == 103.0  # Maker price (resting BUY 100)
+
+        # Order book now completely empty
+        assert engine.bid_count() == 0
+        assert engine.ask_count() == 0
+
+    def test_residual_order_retains_fifo_priority_over_subsequent_orders_at_same_price(self):
+        """A residual order from a partially filled sweep retains FIFO priority over newer orders at same price."""
+        from chronos.matching_engine import MatchingEngine
+        engine = MatchingEngine()
+
+        # Step 1: Resting SELL for 20 @ 50.0
+        engine.submit_order(1, 2, 50.0, 20, 1000)
+
+        # Step 2: Incoming BUY for 50 @ 50.0 (ts 2000)
+        # Fills 20, leaves 30 remaining as resting bid at 50.0
+        trades = engine.match_order(10, 1, 50.0, 50, 2000)
+        assert len(trades) == 1
+        assert engine.bid_count() == 1
+        assert engine.get_best_bid().order_id == 10
+        assert engine.get_best_bid().remaining_quantity == 30
+
+        # Step 3: A subsequent BUY order arrives at the same price 50.0 (ts 3000)
+        engine.submit_order(20, 1, 50.0, 30, 3000)
+        assert engine.bid_count() == 2
+        assert engine.get_best_bid_quantity(aggregate=True) == 60
+
+        # Step 4: Incoming SELL for 40 @ 50.0 (ts 4000)
+        # Priority must fill residual order 10 (30 shares) first, then order 20 (10 shares)
+        sweep_trades = engine.match_order(99, 2, 50.0, 40, 4000)
+        assert len(sweep_trades) == 2
+        assert sweep_trades[0].buy_order_id == 10
+        assert sweep_trades[0].executed_quantity == 30
+        assert sweep_trades[1].buy_order_id == 20
+        assert sweep_trades[1].executed_quantity == 10
+
+        # Order 10 fully filled; Order 20 has 20 shares left
+        assert engine.bid_count() == 1
+        assert engine.get_best_bid().order_id == 20
+        assert engine.get_best_bid().remaining_quantity == 20
+
+
+
