@@ -553,13 +553,13 @@ def test_best_bid_price_and_quantity_formatting():
 
 
 def test_dashboard_renders_best_bid_with_sample_data():
-    """Verify dashboard displays Best Bid 510.00 and Bid Qty 150 with demonstration sample data."""
+    """Verify dashboard displays Best Bid 500.00 and Bid Qty 100 with demonstration sample data."""
     dashboard = TerminalDashboard()
     lines = dashboard.get_display_lines(rows=40, cols=100)
     text = "\n".join(lines)
 
-    assert "510.00" in text
-    assert "150" in text
+    assert "500.00" in text
+    assert "100" in text
     assert LABEL_BEST_BID in text
     assert LABEL_BID_QTY in text
     assert "Sample Data" in text
@@ -569,8 +569,8 @@ def test_dashboard_renders_best_bid_with_sample_data():
     dashboard.render(win)
     rendered_text = " ".join([call[2] for call in win.addstr_calls])
 
-    assert "510.00" in rendered_text
-    assert "150" in rendered_text
+    assert "500.00" in rendered_text
+    assert "100" in rendered_text
     assert LABEL_BEST_BID in rendered_text
     assert LABEL_BID_QTY in rendered_text
 
@@ -846,7 +846,7 @@ def test_correct_price_and_spread_formatting():
 
 
 def test_dashboard_renders_best_ask_and_spread_sample_data():
-    """10a. Verify dashboard displays Best Ask 505.00, Ask Qty 40, Spread -5.00 with sample data."""
+    """10a. Verify dashboard displays Best Bid 500.00, Best Ask 505.00, Spread 5.00 with sample data."""
     dashboard = TerminalDashboard()
     lines = dashboard.get_display_lines(rows=40, cols=100)
     text = "\n".join(lines)
@@ -858,12 +858,12 @@ def test_dashboard_renders_best_ask_and_spread_sample_data():
     assert LABEL_ASK_QTY in text
     assert LABEL_SPREAD in text
 
-    # Values for sample data (BUY: 510.00 qty 150, SELL: 505.00 qty 40, Spread: -5.00)
-    assert "510.00" in text
-    assert "150" in text
+    # Values for corrected sample data (BUY: 500.00 qty 100, SELL: 505.00 qty 40, Spread: 5.00)
+    assert "500.00" in text
+    assert "100" in text
     assert "505.00" in text
     assert "40" in text
-    assert "-5.00" in text
+    assert "5.00" in text
 
     # Mock curses render test
     win = MockCursesWindow(rows=40, cols=100)
@@ -875,7 +875,7 @@ def test_dashboard_renders_best_ask_and_spread_sample_data():
     assert LABEL_SPREAD in rendered_text
     assert "505.00" in rendered_text
     assert "40" in rendered_text
-    assert "-5.00" in rendered_text
+    assert "5.00" in rendered_text
 
 
 def test_dashboard_renders_spec_example_values():
@@ -1143,14 +1143,14 @@ def test_correct_order_book_rendering_with_depth():
     assert SECTION_BUY_ORDERS in full_output
     assert SECTION_SELL_ORDERS in full_output
 
-    # Check top 5 demonstration BUY levels are rendered
-    assert "510.00" in full_output
-    assert "505.00" in full_output
+    # Check top 5 demonstration BUY levels are rendered (prices: 500, 495, 490, 485, 480)
     assert "500.00" in full_output
     assert "495.00" in full_output
     assert "490.00" in full_output
+    assert "485.00" in full_output
+    assert "480.00" in full_output
 
-    # Check top 5 demonstration SELL levels are rendered
+    # Check top 5 demonstration SELL levels are rendered (prices: 505, 510, 515, 520, 525)
     assert "505.00" in full_output
     assert "510.00" in full_output
     assert "515.00" in full_output
@@ -1162,8 +1162,8 @@ def test_correct_order_book_rendering_with_depth():
     dashboard.render(win)
     rendered_text = " ".join([call[2] for call in win.addstr_calls])
 
-    assert "510.00" in rendered_text
-    assert "490.00" in rendered_text
+    assert "500.00" in rendered_text
+    assert "480.00" in rendered_text
     assert "525.00" in rendered_text
 
 
@@ -1221,11 +1221,11 @@ def test_preservation_of_all_existing_dashboard_behavior():
     assert LABEL_BEST_ASK in text
     assert LABEL_ASK_QTY in text
     assert LABEL_SPREAD in text
-    assert "510.00" in text
-    assert "150" in text
-    assert "505.00" in text
-    assert "40" in text
-    assert "-5.00" in text
+    assert "500.00" in text   # Best Bid (corrected sample data)
+    assert "100" in text      # Bid Qty
+    assert "505.00" in text   # Best Ask
+    assert "40" in text       # Ask Qty
+    assert "5.00" in text     # Spread (positive, corrected)
 
     # Performance
     assert SECTION_PERFORMANCE in text
@@ -1431,12 +1431,12 @@ def test_orders_processed_existing_market_summary_still_renders():
     assert LABEL_ASK_QTY in display
     assert LABEL_SPREAD in display
 
-    # Values for sample data
-    assert "510.00" in display  # Best Bid
-    assert "150" in display     # Bid Qty
+    # Values for corrected sample data (bid < ask, positive spread)
+    assert "500.00" in display  # Best Bid
+    assert "100" in display     # Bid Qty
     assert "505.00" in display  # Best Ask
     assert "40" in display      # Ask Qty
-    assert "-5.00" in display   # Spread
+    assert "5.00" in display    # Spread (positive)
 
 
 def test_orders_processed_best_bid_ask_and_depth_still_function():
@@ -1448,14 +1448,14 @@ def test_orders_processed_best_bid_ask_and_depth_still_function():
     assert SECTION_BUY_ORDERS in display
     assert SECTION_SELL_ORDERS in display
 
-    # Top 5 BUY depth levels
-    assert "510.00" in display
-    assert "505.00" in display
+    # Top 5 BUY depth levels (corrected sample: 500, 495, 490, 485, 480)
     assert "500.00" in display
     assert "495.00" in display
     assert "490.00" in display
+    assert "485.00" in display
+    assert "480.00" in display
 
-    # Top 5 SELL depth levels
+    # Top 5 SELL depth levels (505, 510, 515, 520, 525)
     assert "515.00" in display
     assert "520.00" in display
     assert "525.00" in display
@@ -1768,20 +1768,20 @@ def test_throughput_existing_bid_ask_spread_and_depth_still_render():
 
     display = "\n".join(dashboard.get_display_lines(rows=40, cols=100))
 
-    # Market summary preserved
+    # Market summary preserved (corrected sample data: bid 500 < ask 505)
     assert SECTION_MARKET_SUMMARY in display
     assert LABEL_BEST_BID in display
-    assert "510.00" in display
+    assert "500.00" in display
     assert LABEL_BEST_ASK in display
     assert "505.00" in display
     assert LABEL_SPREAD in display
-    assert "-5.00" in display
+    assert "5.00" in display
 
     # Order book depth preserved
     assert SECTION_ORDER_BOOK in display
     assert SECTION_BUY_ORDERS in display
     assert SECTION_SELL_ORDERS in display
-    assert "490.00" in display
+    assert "480.00" in display
     assert "525.00" in display
 
 
