@@ -116,11 +116,10 @@ class PriceLevel(NamedTuple):
 # Clearly labeled demonstration BUY orders (fixed sample data for testing & demo mode)
 SAMPLE_BUY_ORDERS: List[Dict[str, Any]] = [
     {"order_id": 101, "side": 1, "price": 500.0, "quantity": 100, "source": "DEMO_SAMPLE_DATA"},
-    {"order_id": 102, "side": 1, "price": 505.0, "quantity": 80, "source": "DEMO_SAMPLE_DATA"},
-    {"order_id": 103, "side": 1, "price": 510.0, "quantity": 100, "source": "DEMO_SAMPLE_DATA"},
-    {"order_id": 104, "side": 1, "price": 510.0, "quantity": 50, "source": "DEMO_SAMPLE_DATA"},
-    {"order_id": 105, "side": 1, "price": 495.0, "quantity": 120, "source": "DEMO_SAMPLE_DATA"},
-    {"order_id": 106, "side": 1, "price": 490.0, "quantity": 150, "source": "DEMO_SAMPLE_DATA"},
+    {"order_id": 102, "side": 1, "price": 495.0, "quantity": 80, "source": "DEMO_SAMPLE_DATA"},
+    {"order_id": 103, "side": 1, "price": 490.0, "quantity": 120, "source": "DEMO_SAMPLE_DATA"},
+    {"order_id": 104, "side": 1, "price": 485.0, "quantity": 150, "source": "DEMO_SAMPLE_DATA"},
+    {"order_id": 105, "side": 1, "price": 480.0, "quantity": 200, "source": "DEMO_SAMPLE_DATA"},
 ]
 
 # Clearly labeled demonstration SELL orders (fixed sample data for testing & demo mode)
