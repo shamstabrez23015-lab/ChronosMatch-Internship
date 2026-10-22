@@ -175,7 +175,7 @@ def _extract_order_price_qty(
             if expected_side in sell_sides and side not in sell_sides:
                 return None
 
-        qty_val = order.get("quantity", order.get("qty", 0))
+        qty_val = order.get("remaining_quantity", order.get("quantity", order.get("qty", 0)))
         try:
             qty = int(qty_val)
         except (ValueError, TypeError):
@@ -228,17 +228,22 @@ def _extract_order_price_qty(
             return None
 
     qty = None
-    if hasattr(order, "quantity"):
+    if hasattr(order, "remaining_quantity"):
+        try:
+            qty = int(getattr(order, "remaining_quantity"))
+        except (ValueError, TypeError):
+            qty = None
+    if qty is None and hasattr(order, "quantity"):
         try:
             qty = int(getattr(order, "quantity"))
         except (ValueError, TypeError):
             return None
-    elif hasattr(order, "qty"):
+    elif qty is None and hasattr(order, "qty"):
         try:
             qty = int(getattr(order, "qty"))
         except (ValueError, TypeError):
             return None
-    else:
+    elif qty is None:
         return None
 
     price = None
@@ -871,6 +876,7 @@ class TerminalDashboard:
         clock: Optional[Callable[[], float]] = None,
         ns_clock: Optional[Callable[[], int]] = None,
         throughput: Optional[Union[float, int, str]] = None,
+        live_feed: Optional[Any] = None,
     ) -> None:
         """Initialize the dashboard.
 
@@ -884,33 +890,50 @@ class TerminalDashboard:
             ns_clock: Nanosecond clock callable for latency measurement; defaults to time.perf_counter_ns.
                       Inject a deterministic clock in tests.
             throughput: Optional initial throughput override.
+            live_feed: Optional LiveFeedBridge instance for live order-flow and engine metrics.
         """
         self.config = config or DashboardConfig()
         self.is_running = False
         self.frame_count = 0
         self.use_sample_data = use_sample_data
+        self.live_feed: Optional[Any] = live_feed
+        self._status_message_override: Optional[str] = None
 
-        if buy_orders is not None:
-            self.buy_orders: List[Any] = list(buy_orders)
+        if live_feed is not None:
+            if getattr(live_feed, "dashboard", None) is None:
+                live_feed.dashboard = self
+            self.use_sample_data = False
             self.is_buy_sample_data = False
-        elif use_sample_data:
-            self.buy_orders = list(SAMPLE_BUY_ORDERS)
-            self.is_buy_sample_data = True
-        else:
-            self.buy_orders = []
-            self.is_buy_sample_data = False
-
-        if sell_orders is not None:
-            self.sell_orders: List[Any] = list(sell_orders)
             self.is_sell_sample_data = False
-        elif use_sample_data:
-            self.sell_orders = list(SAMPLE_SELL_ORDERS)
-            self.is_sell_sample_data = True
+            self.is_sample_data = False
+            self.buy_orders = list(buy_orders) if buy_orders is not None else []
+            self.sell_orders = list(sell_orders) if sell_orders is not None else []
+            try:
+                live_feed.sync_to_dashboard()
+            except Exception:
+                pass
         else:
-            self.sell_orders = []
-            self.is_sell_sample_data = False
+            if buy_orders is not None:
+                self.buy_orders: List[Any] = list(buy_orders)
+                self.is_buy_sample_data = False
+            elif use_sample_data:
+                self.buy_orders = list(SAMPLE_BUY_ORDERS)
+                self.is_buy_sample_data = True
+            else:
+                self.buy_orders = []
+                self.is_buy_sample_data = False
 
-        self.is_sample_data = self.is_buy_sample_data or self.is_sell_sample_data
+            if sell_orders is not None:
+                self.sell_orders: List[Any] = list(sell_orders)
+                self.is_sell_sample_data = False
+            elif use_sample_data:
+                self.sell_orders = list(SAMPLE_SELL_ORDERS)
+                self.is_sell_sample_data = True
+            else:
+                self.sell_orders = []
+                self.is_sell_sample_data = False
+
+            self.is_sample_data = self.is_buy_sample_data or self.is_sell_sample_data
 
         try:
             init_val = int(orders_processed)
@@ -1207,10 +1230,21 @@ class TerminalDashboard:
 
     @property
     def status_message(self) -> str:
-        """Return the status message, clearly labeling demo sample data when active."""
+        """Return the status message, reflecting override, live feed status, or demo mode."""
+        if self._status_message_override is not None:
+            return self._status_message_override
+        if self.live_feed is not None:
+            if getattr(self.live_feed, "is_connected", False):
+                return "Live: Connected"
+            return "Live: Disconnected"
         if self.is_sample_data:
             return f"{STATUS_MESSAGE} (Demo: Sample Data)"
         return STATUS_MESSAGE
+
+    @status_message.setter
+    def status_message(self, value: Optional[str]) -> None:
+        """Explicitly override the status message."""
+        self._status_message_override = value
 
     def set_buy_orders(self, orders: List[Any], is_sample: bool = False) -> None:
         """Update the buy orders collection and data source flag."""
@@ -1284,6 +1318,12 @@ class TerminalDashboard:
                 f"Current: {cols}x{rows}",
                 QUIT_MESSAGE,
             ]
+
+        if self.live_feed is not None and buy_orders is None and sell_orders is None:
+            try:
+                self.live_feed.sync_to_dashboard()
+            except Exception:
+                pass
 
         b_orders = self.buy_orders if buy_orders is None else buy_orders
         s_orders = self.sell_orders if sell_orders is None else sell_orders
@@ -1360,7 +1400,7 @@ class TerminalDashboard:
         attr: int = 0,
     ) -> None:
         """Safely write a string to the curses window, preventing edge crashes."""
-        if curses is None:
+        if curses is None and not hasattr(stdscr, "addstr"):
             return
         try:
             max_y, max_x = stdscr.getmaxyx()
@@ -1486,6 +1526,12 @@ class TerminalDashboard:
             except Exception:
                 pass
             return
+
+        if self.live_feed is not None and buy_orders is None and sell_orders is None:
+            try:
+                self.live_feed.sync_to_dashboard()
+            except Exception:
+                pass
 
         b_orders = self.buy_orders if buy_orders is None else buy_orders
         s_orders = self.sell_orders if sell_orders is None else sell_orders
@@ -1628,23 +1674,49 @@ class TerminalDashboard:
         if hasattr(stdscr, "timeout"):
             stdscr.timeout(self.config.refresh_interval_ms)
 
+        if self.live_feed is not None and not getattr(self.live_feed, "is_running", False):
+            self.live_feed.start()
+
         self.is_running = True
         self.frame_count = 0
 
-        while self.is_running:
-            self.render(stdscr)
-            self.frame_count += 1
+        try:
+            while self.is_running:
+                self.render(stdscr)
+                self.frame_count += 1
 
-            if max_iterations is not None and self.frame_count >= max_iterations:
-                break
+                if max_iterations is not None and self.frame_count >= max_iterations:
+                    break
 
+                try:
+                    key = stdscr.getch() if hasattr(stdscr, "getch") else -1
+                except Exception:
+                    key = -1
+
+                if key != -1:
+                    self.handle_input(key)
+        finally:
+            if self.live_feed is not None:
+                try:
+                    self.live_feed.stop()
+                except Exception:
+                    pass
+            self.is_running = False
+
+    def close(self) -> None:
+        """Shut down the dashboard and stop attached live feed."""
+        self.is_running = False
+        if self.live_feed is not None:
             try:
-                key = stdscr.getch() if hasattr(stdscr, "getch") else -1
+                self.live_feed.stop()
             except Exception:
-                key = -1
+                pass
 
-            if key != -1:
-                self.handle_input(key)
+    def __enter__(self) -> TerminalDashboard:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
 
     def run(self, max_iterations: Optional[int] = None) -> None:
         """Launch the dashboard with automatic curses terminal lifecycle management."""
