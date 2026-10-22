@@ -11,31 +11,35 @@ The project is designed to demonstrate how orders can move through a multi-stage
 - **Market-data firehose:** Synthetic order generation for testing and benchmarking.
 - **Order consumer and adapter:** Reads orders from the ring buffer and translates them for the matching engine.
 - **Cython matching engine:** Limit Order Book implementation designed around price-time priority.
+- **Live feed integration:** Real-time bridge connecting IPC buffer order streams, matching engine state, and the terminal dashboard.
 - **Terminal dashboard:** Curses-based market summary, order-book display, and performance monitoring interface.
 - **Pipeline benchmarking:** Configurable benchmarks for individual stages and the complete order-processing pipeline.
-- **Automated tests:** Protocol, ring-buffer, matching-engine, dashboard, and integration coverage.
+- **Automated tests:** Protocol, ring-buffer, matching-engine, dashboard, integration, and end-to-end smoke coverage.
 
 ## Architecture
 
 The intended order-processing flow is:
 
 ```text
-Synthetic Market Feed
+Synthetic Market Feed (Firehose)
         |
         v
-   Binary Protocol
+   Binary Protocol (<QQdIHBB, 32 bytes)
         |
         v
- Memory-Mapped Ring Buffer
+ Zero-Copy Mmap Ring Buffer (SPSC, Cache-Aligned)
         |
         v
- Consumer / Order Adapter
+ ZeroCopyConsumer / OrderAdapter
         |
-        v
- Cython Matching Engine
-        |
-        v
- Order Processing Results
+        +-----------------------+
+        |                       |
+        v                       v
+ Cython Matching Engine     LiveFeedBridge
+ (Price-Time Priority)          |
+        |                       v
+        +-------------> Terminal Dashboard
+                        (Live Curses UI / Telemetry)
 ```
 
 The benchmark runner can measure different portions of this pipeline.
@@ -50,6 +54,7 @@ The benchmark runner can measure different portions of this pipeline.
 | `chronos/consumer.py` | Order consumption and processing |
 | `chronos/adapter.py` | Translation between incoming orders and the matching engine |
 | `chronos/matching_engine.pyx` | Cython-based matching engine |
+| `chronos/live_feed.py` | Real-time bridge connecting ring buffer, engine metrics, and terminal dashboard |
 | `chronos/benchmark.py` | Benchmark configuration, execution, and reporting |
 | `chronos/dashboard.py` | Terminal dashboard and display logic |
 
@@ -149,7 +154,7 @@ python scripts/run_dashboard.py --refresh-ms 100
 
 The refresh interval is specified in milliseconds.
 
-**Dashboard note:** The dashboard includes demonstration order-book data and placeholder/sample fields. Its event-interval latency metrics measure the spacing between dashboard processing-recording events; they should not be interpreted as full end-to-end order-processing latency.
+**Dashboard note:** The dashboard supports both demonstration sample data mode and live-feed integration via `LiveFeedBridge`. When connected to a live engine and ring buffer, it displays real-time order-book depth, Best Bid, Best Ask, dynamic spread, and processed order counters. Its event-interval latency metrics measure the spacing between dashboard processing-recording events; they should not be interpreted as full end-to-end order-processing latency.
 
 ## Pipeline Benchmarking
 
@@ -201,12 +206,18 @@ For a concise summary:
 python -m pytest -q
 ```
 
+To run the end-to-end system smoke tests:
+
+```powershell
+python -m pytest tests/test_smoke.py -v
+```
+
 ### Latest verified test result
 
 The latest recorded run in the development environment reported:
 
 ```text
-645 passed in 1.68s
+723 passed in 1.66s
 ```
 
 This is a snapshot of that test run, not a guarantee that every future environment or code revision will produce the same result.
@@ -223,6 +234,7 @@ ChronosMatch-Internship/
 │   ├── consumer.py
 │   ├── dashboard.py
 │   ├── firehose.py
+│   ├── live_feed.py
 │   ├── matching_engine.pyx
 │   ├── protocol.py
 │   └── ring_buffer.py
@@ -233,6 +245,23 @@ ChronosMatch-Internship/
 │   ├── run_dashboard.py
 │   └── run_firehose.py
 ├── tests/
+│   ├── test_adapter.py
+│   ├── test_benchmark_pipeline.py
+│   ├── test_config.py
+│   ├── test_dashboard.py
+│   ├── test_end_to_end_order_flow.py
+│   ├── test_firehose.py
+│   ├── test_matching_engine.py
+│   ├── test_pipeline_integration.py
+│   ├── test_protocol.py
+│   ├── test_ring_buffer.py
+│   ├── test_ring_buffer_engine_integration.py
+│   ├── test_smoke.py
+│   ├── test_trading_scenarios.py
+│   └── trading_scenarios.py
+├── docs/
+│   ├── trading-scenarios.md
+│   └── week2-integration.md
 ├── requirements.txt
 ├── setup.py
 └── README.md
