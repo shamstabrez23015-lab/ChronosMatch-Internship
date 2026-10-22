@@ -744,3 +744,248 @@ class TestInvalidInputsAndBoundaryHandling:
         # Book remains clean
         assert engine.bid_count() == 0
         assert engine.ask_count() == 0
+
+
+# ==============================================================================
+# 8. Day 9 Focused Real Consumer-to-Engine Integration
+# ==============================================================================
+
+class TestDay9RealConsumerToEngineIntegration:
+    """Verifies end-to-end matching correctness, multi-order sweeps, and book consistency
+    flowing through the real MmapRingBuffer and ZeroCopyConsumer into the Cython MatchingEngine."""
+
+    def test_real_consumer_multi_order_sweep_maker_pricing(
+        self, temp_ring_buffer: MmapRingBuffer, engine: MatchingEngine
+    ):
+        """Incoming BUY sweeps across multiple resting SELL orders through the real consumer."""
+        adapter = OrderAdapter(ring_buffer=temp_ring_buffer, engine=engine, dispatch_mode="match")
+        consumer = ZeroCopyConsumer(
+            ring_buffer=temp_ring_buffer,
+            batch_size=10,
+            order_handler=adapter.dispatch_raw_order,
+        )
+
+        # 1. Producer writes 3 resting SELL orders
+        temp_ring_buffer.write(1, 1000, 100.0, 10, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT))
+        temp_ring_buffer.write(2, 2000, 101.0, 20, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT))
+        temp_ring_buffer.write(3, 3000, 102.0, 30, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT))
+
+        # Consumer drains the 3 resting orders
+        consumer.run(exit_when_empty=True)
+        assert engine.ask_count() == 3
+        assert engine.bid_count() == 0
+        assert len(adapter.trades) == 0
+
+        # 2. Producer writes 1 incoming BUY order for 45 @ 102.0
+        temp_ring_buffer.write(100, 4000, 102.0, 45, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT))
+
+        # Consumer drains the incoming order
+        consumer.run(exit_when_empty=True)
+
+        # 3. Verify trade results in adapter and engine
+        assert len(adapter.trades) == 3
+        trades = adapter.trades
+        assert [t.sell_order_id for t in trades] == [1, 2, 3]
+        assert [t.executed_quantity for t in trades] == [10, 20, 15]
+        assert [t.execution_price for t in trades] == [100.0, 101.0, 102.0]
+
+        # Order 1 and 2 consumed; Order 3 has 15 shares remaining in engine
+        assert engine.ask_count() == 1
+        assert engine.bid_count() == 0
+        best_ask = engine.get_best_ask()
+        assert best_ask.order_id == 3
+        assert best_ask.remaining_quantity == 15
+        assert best_ask.price == 102.0
+
+    def test_real_consumer_price_time_fifo_execution(
+        self, temp_ring_buffer: MmapRingBuffer, engine: MatchingEngine
+    ):
+        """Verifies strict FIFO ordering when identical-priced orders flow through ring buffer and consumer."""
+        adapter = OrderAdapter(ring_buffer=temp_ring_buffer, engine=engine, dispatch_mode="match")
+        consumer = ZeroCopyConsumer(
+            ring_buffer=temp_ring_buffer,
+            batch_size=10,
+            order_handler=adapter.dispatch_raw_order,
+        )
+
+        # 3 BUY orders at identical price 150.00
+        temp_ring_buffer.write(10, 1000, 150.0, 20, SYMBOLS["MSFT"], int(Side.BUY), int(OrderType.LIMIT))
+        temp_ring_buffer.write(20, 2000, 150.0, 20, SYMBOLS["MSFT"], int(Side.BUY), int(OrderType.LIMIT))
+        temp_ring_buffer.write(30, 3000, 150.0, 20, SYMBOLS["MSFT"], int(Side.BUY), int(OrderType.LIMIT))
+        consumer.run(exit_when_empty=True)
+        assert engine.bid_count() == 3
+
+        # Incoming SELL for 45 @ 150.00
+        temp_ring_buffer.write(99, 4000, 150.0, 45, SYMBOLS["MSFT"], int(Side.SELL), int(OrderType.LIMIT))
+        consumer.run(exit_when_empty=True)
+
+        # FIFO match order: 10 (20), 20 (20), 30 (5)
+        assert len(adapter.trades) == 3
+        assert [t.buy_order_id for t in adapter.trades] == [10, 20, 30]
+        assert [t.executed_quantity for t in adapter.trades] == [20, 20, 5]
+
+        # Order 30 has 15 remaining in engine
+        assert engine.bid_count() == 1
+        assert engine.get_best_bid().order_id == 30
+        assert engine.get_best_bid().remaining_quantity == 15
+
+    def test_real_consumer_top_of_book_and_spread_telemetry(
+        self, temp_ring_buffer: MmapRingBuffer, engine: MatchingEngine
+    ):
+        """Verifies top-of-book and spread tracking as orders stream through real consumer."""
+        adapter = OrderAdapter(ring_buffer=temp_ring_buffer, engine=engine, dispatch_mode="match")
+        consumer = ZeroCopyConsumer(
+            ring_buffer=temp_ring_buffer,
+            batch_size=10,
+            order_handler=adapter.dispatch_raw_order,
+        )
+
+        # Step 1: Write non-crossing orders
+        temp_ring_buffer.write(1, 1000, 95.0, 50, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT))
+        temp_ring_buffer.write(2, 2000, 105.0, 50, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT))
+        consumer.run(exit_when_empty=True)
+
+        tob = engine.get_top_of_book()
+        assert tob["best_bid_price"] == 95.0
+        assert tob["best_ask_price"] == 105.0
+        assert tob["spread"] == 10.0
+
+        # Step 2: Write better bid
+        temp_ring_buffer.write(3, 3000, 100.0, 30, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT))
+        consumer.run(exit_when_empty=True)
+
+        tob2 = engine.get_top_of_book()
+        assert tob2["best_bid_price"] == 100.0
+        assert tob2["best_ask_price"] == 105.0
+        assert tob2["spread"] == 5.0
+
+    def test_real_consumer_duplicate_order_ids_flow_correctly(
+        self, temp_ring_buffer: MmapRingBuffer, engine: MatchingEngine
+    ):
+        """Verifies that orders sharing duplicate order_ids are processed correctly through consumer and engine."""
+        adapter = OrderAdapter(ring_buffer=temp_ring_buffer, engine=engine, dispatch_mode="match")
+        consumer = ZeroCopyConsumer(
+            ring_buffer=temp_ring_buffer,
+            batch_size=10,
+            order_handler=adapter.dispatch_raw_order,
+        )
+
+        # Two orders with identical order_id=777
+        temp_ring_buffer.write(777, 1000, 50.0, 20, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT))
+        temp_ring_buffer.write(777, 2000, 50.0, 30, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT))
+        consumer.run(exit_when_empty=True)
+
+        assert engine.bid_count() == 2
+        assert engine.get_best_bid_quantity(aggregate=True) == 50
+
+        # Incoming SELL matches first duplicate fully (20), second duplicate partially (10)
+        temp_ring_buffer.write(888, 3000, 50.0, 30, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT))
+        consumer.run(exit_when_empty=True)
+
+        assert len(adapter.trades) == 2
+        assert adapter.trades[0].buy_order_id == 777
+        assert adapter.trades[0].executed_quantity == 20
+        assert adapter.trades[1].buy_order_id == 777
+        assert adapter.trades[1].executed_quantity == 10
+
+        assert engine.bid_count() == 1
+        assert engine.get_best_bid().remaining_quantity == 20
+
+
+# ==============================================================================
+# 9. Day 10 Focused End-to-End Multi-Level Cascade & Aggregate Depth Integration
+# ==============================================================================
+
+class TestDay10EndToEndAdapterAndCascadeIntegration:
+    """Verifies multi-level sweeps, residual order preservation, and live telemetry
+    flowing through MmapRingBuffer, ZeroCopyConsumer, OrderAdapter, and MatchingEngine."""
+
+    def test_real_consumer_multi_level_cascade_with_residual_resting_in_bids(
+        self, temp_ring_buffer: MmapRingBuffer, engine: MatchingEngine
+    ):
+        """Verifies multi-tier ask sweep leaving a resting residual bid, which is subsequently matched."""
+        adapter = OrderAdapter(ring_buffer=temp_ring_buffer, engine=engine, dispatch_mode="match")
+        consumer = ZeroCopyConsumer(
+            ring_buffer=temp_ring_buffer,
+            batch_size=10,
+            order_handler=adapter.dispatch_raw_order,
+        )
+
+        # Batch 1: Producer writes 3 resting SELL orders at increasing prices
+        temp_ring_buffer.write(1, 1000, 100.0, 10, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT))
+        temp_ring_buffer.write(2, 2000, 101.0, 20, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT))
+        temp_ring_buffer.write(3, 3000, 102.0, 30, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT))
+        consumer.run(exit_when_empty=True)
+        assert engine.ask_count() == 3
+        assert engine.bid_count() == 0
+
+        # Batch 2: Aggressive BUY sweeps asks and has 15 shares residual
+        temp_ring_buffer.write(100, 4000, 103.0, 75, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT))
+        consumer.run(exit_when_empty=True)
+
+        assert len(adapter.trades) == 3
+        assert adapter.stats.total_volume_matched == 60
+        assert engine.ask_count() == 0
+        assert engine.bid_count() == 1
+        best_bid = engine.get_best_bid()
+        assert best_bid.order_id == 100
+        assert best_bid.remaining_quantity == 15
+        assert best_bid.price == 103.0
+
+        # Batch 3: Counter SELL arrives matching the residual exactly
+        temp_ring_buffer.write(200, 5000, 103.0, 15, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT))
+        consumer.run(exit_when_empty=True)
+
+        assert len(adapter.trades) == 4
+        assert adapter.stats.total_volume_matched == 75
+        assert adapter.trades[-1].buy_order_id == 100
+        assert adapter.trades[-1].sell_order_id == 200
+        assert adapter.trades[-1].execution_price == 103.0
+        assert adapter.trades[-1].executed_quantity == 15
+
+        # All active order books cleared
+        assert engine.bid_count() == 0
+        assert engine.ask_count() == 0
+        assert engine.get_best_bid() is None
+        assert engine.get_best_ask() is None
+        assert engine.get_spread() is None
+        assert engine.order_count() == 4  # 3 resting sells + 1 resting residual buy accepted into book
+
+    def test_real_consumer_adapter_live_telemetry_and_depth_aggregate(
+        self, temp_ring_buffer: MmapRingBuffer, engine: MatchingEngine
+    ):
+        """Verifies aggregate depth calculation and live queries across multiple streamed orders."""
+        adapter = OrderAdapter(ring_buffer=temp_ring_buffer, engine=engine, dispatch_mode="match")
+        consumer = ZeroCopyConsumer(
+            ring_buffer=temp_ring_buffer,
+            batch_size=10,
+            order_handler=adapter.dispatch_raw_order,
+        )
+
+        # 3 Bids at 100.0 (total 100 shares), 2 Asks at 105.0 (total 70 shares)
+        temp_ring_buffer.write(1, 1000, 100.0, 30, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT))
+        temp_ring_buffer.write(2, 2000, 100.0, 30, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT))
+        temp_ring_buffer.write(3, 3000, 100.0, 40, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT))
+        temp_ring_buffer.write(4, 4000, 105.0, 20, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT))
+        temp_ring_buffer.write(5, 5000, 105.0, 50, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT))
+
+        consumer.run(exit_when_empty=True)
+
+        assert engine.bid_count() == 3
+        assert engine.ask_count() == 2
+        assert engine.order_count() == 5
+        assert engine.get_best_bid_price() == 100.0
+        assert engine.get_best_bid_quantity(aggregate=True) == 100
+        assert engine.get_best_bid_quantity(aggregate=False) == 30  # top order only
+        assert engine.get_best_ask_price() == 105.0
+        assert engine.get_best_ask_quantity(aggregate=True) == 70
+        assert engine.get_best_ask_quantity(aggregate=False) == 20  # top order only
+        assert engine.get_spread() == 5.0
+
+        # Prioritized sequence inspection
+        bids = engine.get_prioritized_bids()
+        asks = engine.get_prioritized_asks()
+        assert [b.order_id for b in bids] == [1, 2, 3]
+        assert [a.order_id for a in asks] == [4, 5]
+
+
