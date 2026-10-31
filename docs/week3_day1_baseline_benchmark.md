@@ -261,4 +261,78 @@ The table below records the official **pre-optimisation baseline** for Week 3:
 
 ---
 
+## 10. How to Reproduce the Benchmark
+
+Follow the steps below to replicate the baseline performance benchmark in a local environment.
+
+### 10.1 Required Project Setup and Dependencies
+
+1. **Python Environment:** Ensure Python 3.10+ (tested with Python 3.13) and a C compiler (e.g., Microsoft Visual C++ Build Tools on Windows or GCC/Clang on Unix) are installed.
+2. **Virtual Environment & Dependencies:**
+   ```bash
+   # Create and activate virtual environment (Windows PowerShell / CMD)
+   python -m venv .venv
+   .venv\Scripts\activate
+
+   # On Linux / macOS:
+   # source .venv/bin/activate
+
+   # Install required dependencies
+   pip install -r requirements.txt
+   ```
+3. **Compile the Cython Extension:**
+   The matching engine extension must be compiled in-place before running the benchmark:
+   ```bash
+   python setup.py build_ext --inplace
+   ```
+
+### 10.2 Benchmark Execution
+
+The baseline benchmark is executed via `scripts/benchmark_pipeline.py`.
+
+- **Primary Baseline Command (Full Pipeline):**
+  Runs the end-to-end pipeline with 10,000 orders across 3 timed repetitions and 1 warmup run:
+  ```bash
+  python scripts/benchmark_pipeline.py --scope full --orders 10000 --repeats 3
+  ```
+
+- **Subsystem Isolation Scopes:**
+  To profile individual pipeline stages independently:
+  ```bash
+  # Scope: Adapter + Engine (bypasses ring buffer)
+  python scripts/benchmark_pipeline.py --scope adapter-engine --orders 10000 --repeats 3
+
+  # Scope: Matching Engine Only (direct match_order calls)
+  python scripts/benchmark_pipeline.py --scope engine-only --orders 10000 --repeats 3
+
+  # Scope: Zero-Copy IPC Only (shared memory ring buffer without matching)
+  python scripts/benchmark_pipeline.py --scope ipc --orders 10000 --repeats 3
+  ```
+
+### 10.3 Metrics to Observe
+
+During benchmark execution, observe and verify the following key performance indicators reported in the terminal output:
+
+- **Throughput (`Throughput (ord/s)`):** The processing speed expressed in orders per second. Look at mean, median, min, and max throughput across repetitions.
+- **Execution Latency (`Elapsed (s)`):** The total elapsed wall-clock time per repetition and mean elapsed time for processing the batch.
+- **Order Accounting (`Attempted`, `Processed`, `Dropped`, `Non-LIMIT`):** Confirm that all attempted orders are accounted for without packet drops (`Dropped = 0`). Non-LIMIT orders intercepted by the adapter are tracked under unhandled orders.
+- **Trades & Matched Volume (`Trades`, `Volume`):** The total number of trade matches generated and aggregate share volume filled by the limit order book.
+- **Stability & Jitter (`Std Deviation`):** The variance across runs, indicating OS scheduling latency and background thread interference.
+
+### 10.4 Recording Results for Future Comparison
+
+To capture structured baseline data for comparison against future optimizations (e.g., Week 3 Cython enhancements), generate machine-readable JSON output:
+
+```bash
+# Save full pipeline benchmark output to JSON
+python scripts/benchmark_pipeline.py --scope full --orders 10000 --repeats 3 --json > docs/baseline_results.json
+```
+
+This output can be committed or compared against subsequent runs using automated diffing tools.
+
+> [!NOTE]
+> **Hardware & System Variability:** Benchmark metrics are influenced by CPU architecture, clock speeds, cache hierarchy, thermal throttling, and OS scheduling jitter (especially on Windows). Absolute numbers may vary across machines; compare results captured under consistent hardware and system conditions.
+
+---
+
 *Generated: 2026-10-31 | ChronosMatch Internship Week 3 Day 1*
