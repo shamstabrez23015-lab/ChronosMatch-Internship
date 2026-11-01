@@ -38,6 +38,8 @@ SECTION_ORDER_BOOK = "ORDER BOOK"
 SECTION_BUY_ORDERS = "BUY ORDERS (BIDS)"
 SECTION_SELL_ORDERS = "SELL ORDERS (ASKS)"
 SECTION_PERFORMANCE = "PERFORMANCE METRICS"
+SECTION_TRADE_EXECUTION = "TRADE EXECUTION METRICS"
+SECTION_TRADE_METRICS = SECTION_TRADE_EXECUTION
 
 # Market summary field labels
 LABEL_BEST_BID = "Best Bid"
@@ -54,6 +56,16 @@ LABEL_TOTAL_ORDERS = "Total Orders Processed"
 LABEL_ORDERS_PROCESSED = LABEL_TOTAL_ORDERS
 LABEL_THROUGHPUT = "Throughput (orders/sec)"
 LABEL_LATENCY = "Latency (microseconds)"
+
+# Trade execution field labels
+LABEL_TRADES_PROCESSED = "Processed Trades"
+LABEL_TOTAL_TRADES = LABEL_TRADES_PROCESSED
+LABEL_TRADE_LATENCY = "Last Execution Latency (us)"
+LABEL_TRADE_LATENCY_LAST = LABEL_TRADE_LATENCY
+LABEL_TRADE_LATENCY_AVG = "Avg Execution Latency (us)"
+LABEL_TRADE_LATENCY_MIN = "Min Execution Latency (us)"
+LABEL_TRADE_LATENCY_MAX = "Max Execution Latency (us)"
+DEFAULT_TRADE_LATENCY_UNIT = "us"
 
 # Latency label detail: measures inter-event elapsed time between consecutive
 # record_order_processed() calls recorded by the dashboard. This reflects the
@@ -695,6 +707,99 @@ def format_latency(
     return f"{val:.{decimals}f}"
 
 
+def calculate_trade_latency_stats(
+    samples: Optional[List[Union[float, int]]],
+) -> Optional[Dict[str, float]]:
+    """Calculate trade execution latency statistics from recorded samples.
+
+    Args:
+        samples: List of non-negative latency measurements.
+
+    Returns:
+        Dict with keys 'last', 'avg', 'min', 'max' (and 'p95' when >= 20 samples),
+        or None if samples is empty, None, or contains no valid values.
+    """
+    if not samples:
+        return None
+    try:
+        valid = [
+            float(s)
+            for s in samples
+            if s is not None
+            and not math.isnan(float(s))
+            and not math.isinf(float(s))
+            and float(s) >= 0
+        ]
+    except (ValueError, TypeError):
+        return None
+    if not valid:
+        return None
+
+    result: Dict[str, float] = {
+        "last": valid[-1],
+        "avg": sum(valid) / len(valid),
+        "min": min(valid),
+        "max": max(valid),
+    }
+    if len(valid) >= _LATENCY_MIN_SAMPLES_FOR_P95:
+        sorted_vals = sorted(valid)
+        p95_idx = max(0, int(math.ceil(len(sorted_vals) * 0.95)) - 1)
+        result["p95"] = sorted_vals[p95_idx]
+    return result
+
+
+def format_trade_latency(
+    value: Optional[Union[float, int]],
+    unit: str = "us",
+    decimals: int = 1,
+) -> str:
+    """Format a trade execution latency value for display.
+
+    Args:
+        value: Latency in microseconds or nanoseconds (float, int), or None.
+        unit: Unit string ('us' or 'ns', default 'us').
+        decimals: Decimal places for microsecond formatting (default: 1).
+
+    Returns:
+        Formatted string (e.g., '123.4', '450', '1,200') or 'N/A' if None or invalid.
+    """
+    if value is None:
+        return NO_SAMPLE_LATENCY
+    try:
+        val = float(value)
+    except (ValueError, TypeError):
+        return NO_SAMPLE_LATENCY
+    if math.isnan(val) or math.isinf(val) or val < 0:
+        return NO_SAMPLE_LATENCY
+
+    if unit.lower() == "ns":
+        return f"{int(round(val)):,}"
+    return f"{val:.{decimals}f}"
+
+
+def format_trades_processed(count: Optional[Union[int, str]]) -> str:
+    """Format processed trades counter with thousands separators, or 'N/A' if None.
+
+    Args:
+        count: Non-negative integer count, integer-convertible string, or None.
+
+    Returns:
+        Formatted string (e.g., '0', '125', '12,500') or 'N/A' if None.
+
+    Raises:
+        ValueError: If count is negative.
+    """
+    if count is None:
+        return NO_SAMPLE_LATENCY
+    try:
+        val = int(count)
+    except (ValueError, TypeError):
+        return NO_SAMPLE_LATENCY
+    if val < 0:
+        raise ValueError(f"Trades processed count cannot be negative: {val}")
+    return f"{val:,}"
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -707,6 +812,7 @@ class DashboardConfig:
     refresh_interval_ms: int = DEFAULT_REFRESH_INTERVAL_MS
     min_rows: int = MIN_TERMINAL_ROWS
     min_cols: int = MIN_TERMINAL_COLS
+    trade_latency_unit: str = DEFAULT_TRADE_LATENCY_UNIT
 
 
 # ---------------------------------------------------------------------------
@@ -849,6 +955,73 @@ def build_performance_lines(
     ]
 
 
+def build_trade_execution_lines(
+    width: int,
+    trades_processed: Optional[Union[str, int]] = 0,
+    latency: Optional[Union[str, float, int]] = None,
+    latency_avg: Optional[Union[str, float, int]] = None,
+    latency_min: Optional[Union[str, float, int]] = None,
+    latency_max: Optional[Union[str, float, int]] = None,
+    unit: str = DEFAULT_TRADE_LATENCY_UNIT,
+) -> List[str]:
+    """Return Trade Execution Metrics section lines.
+
+    Displays trade execution times, processed trade counts, and summary statistics.
+    When metrics are not available (None), displays NO_SAMPLE_LATENCY ('N/A').
+
+    Args:
+        width: Available content width in characters.
+        trades_processed: Total processed trades (integer, formatted string, or None).
+        latency: Last trade execution latency (number, formatted string, or None).
+        latency_avg: Average trade execution latency (number, formatted string, or None).
+        latency_min: Minimum trade execution latency (number, formatted string, or None).
+        latency_max: Maximum trade execution latency (number, formatted string, or None).
+        unit: Latency measurement unit ('us' for microseconds, 'ns' for nanoseconds).
+    """
+    if isinstance(trades_processed, int):
+        trades_str = format_trades_processed(trades_processed)
+    elif trades_processed is None:
+        trades_str = NO_SAMPLE_LATENCY
+    else:
+        trades_str = str(trades_processed)
+
+    def _fmt(val: Optional[Union[str, float, int]]) -> str:
+        if val is None:
+            return NO_SAMPLE_LATENCY
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return format_trade_latency(val, unit=unit)
+        return str(val)
+
+    last_str = _fmt(latency)
+    avg_str = _fmt(latency_avg)
+    min_str = _fmt(latency_min)
+    max_str = _fmt(latency_max)
+
+    if unit.lower() == "us":
+        lbl_last = LABEL_TRADE_LATENCY
+        lbl_avg = LABEL_TRADE_LATENCY_AVG
+        lbl_min = LABEL_TRADE_LATENCY_MIN
+        lbl_max = LABEL_TRADE_LATENCY_MAX
+    else:
+        lbl_last = f"Last Execution Latency ({unit})"
+        lbl_avg = f"Avg Execution Latency ({unit})"
+        lbl_min = f"Min Execution Latency ({unit})"
+        lbl_max = f"Max Execution Latency ({unit})"
+
+    divider = "-" * width
+    col_w = max(width - 4, 10)
+    return [
+        f"  {SECTION_TRADE_EXECUTION}",
+        divider,
+        f"  {LABEL_TRADES_PROCESSED:<{col_w - 10}} {trades_str:>8}",
+        f"  {lbl_last:<{col_w - 10}} {last_str:>8}",
+        f"  {lbl_avg:<{col_w - 10}} {avg_str:>8}",
+        f"  {lbl_min:<{col_w - 10}} {min_str:>8}",
+        f"  {lbl_max:<{col_w - 10}} {max_str:>8}",
+        divider,
+    ]
+
+
 def build_footer_lines(width: int) -> List[str]:
     """Return footer lines."""
     return [
@@ -876,6 +1049,8 @@ class TerminalDashboard:
         ns_clock: Optional[Callable[[], int]] = None,
         throughput: Optional[Union[float, int, str]] = None,
         live_feed: Optional[Any] = None,
+        trades_processed: Optional[int] = None,
+        trade_latency_unit: Optional[str] = None,
     ) -> None:
         """Initialize the dashboard.
 
@@ -972,6 +1147,21 @@ class TerminalDashboard:
         self._latency_samples: List[float] = []        # rolling sample buffer (microseconds)
         _MAX_LATENCY_SAMPLES = 1000
         self._max_latency_samples: int = _MAX_LATENCY_SAMPLES
+
+        # Trade execution metrics tracking state
+        self._trade_latency_unit: str = (
+            trade_latency_unit
+            if trade_latency_unit is not None
+            else getattr(self.config, "trade_latency_unit", DEFAULT_TRADE_LATENCY_UNIT)
+        )
+        self._trades_processed: int = 0
+        if trades_processed is not None:
+            self.trades_processed = trades_processed
+
+        self._trade_latency_last_us: Optional[float] = None
+        self._trade_latency_samples: List[float] = []
+        _MAX_TRADE_LATENCY_SAMPLES = 1000
+        self._max_trade_latency_samples: int = _MAX_TRADE_LATENCY_SAMPLES
 
     @property
     def orders_processed(self) -> int:
@@ -1123,6 +1313,165 @@ class TerminalDashboard:
         self._processed_order_ids.clear()
         self.reset_throughput()
         self.reset_latency()
+        self.reset_trade_metrics()
+
+    # ------------------------------------------------------------------
+    # Trade execution metrics management
+    # ------------------------------------------------------------------
+
+    @property
+    def trades_processed(self) -> int:
+        """Return the current number of processed trades."""
+        return self._trades_processed
+
+    @trades_processed.setter
+    def trades_processed(self, value: int) -> None:
+        """Set the processed trades counter, rejecting negative values."""
+        try:
+            int_val = int(value)
+        except (ValueError, TypeError) as err:
+            raise ValueError(
+                f"Trades processed count must be an integer, got: {value}"
+            ) from err
+        if int_val < 0:
+            raise ValueError(f"Trades processed count cannot be negative: {value}")
+        self._trades_processed = int_val
+
+    def set_trades_processed(self, count: int) -> None:
+        """Explicitly set the processed trades count.
+
+        Args:
+            count: Non-negative integer count.
+
+        Raises:
+            ValueError: If count is negative.
+        """
+        self.trades_processed = count
+
+    def update_trades_processed(self, count: int) -> None:
+        """Update processed trades count from live engine/adapter snapshot."""
+        self.set_trades_processed(count)
+
+    def increment_trades_processed(self, delta: int = 1) -> int:
+        """Increment the processed trades counter by delta.
+
+        Args:
+            delta: Non-negative integer to increment by (default: 1).
+
+        Returns:
+            The updated counter value.
+
+        Raises:
+            ValueError: If delta is negative.
+        """
+        try:
+            int_delta = int(delta)
+        except (ValueError, TypeError) as err:
+            raise ValueError(f"Increment delta must be an integer, got: {delta}") from err
+        if int_delta < 0:
+            raise ValueError(f"Increment delta cannot be negative: {delta}")
+        self.trades_processed += int_delta
+        return self.trades_processed
+
+    def record_trade_execution(
+        self,
+        latency_us: Optional[Union[float, int]] = None,
+        latency_ns: Optional[Union[float, int]] = None,
+        count: int = 1,
+    ) -> int:
+        """Record a trade execution event and optional execution latency sample.
+
+        Args:
+            latency_us: Measured trade execution latency in microseconds.
+            latency_ns: Measured trade execution latency in nanoseconds.
+            count: Number of executed trades (default: 1).
+
+        Returns:
+            The updated trades_processed count.
+        """
+        self.increment_trades_processed(count)
+
+        sample_us: Optional[float] = None
+        if latency_us is not None:
+            try:
+                sample_us = float(latency_us)
+            except (ValueError, TypeError):
+                sample_us = None
+        elif latency_ns is not None:
+            try:
+                sample_us = float(latency_ns) / 1000.0
+            except (ValueError, TypeError):
+                sample_us = None
+
+        if sample_us is not None and sample_us >= 0 and not (math.isnan(sample_us) or math.isinf(sample_us)):
+            self._trade_latency_last_us = sample_us
+            if len(self._trade_latency_samples) >= self._max_trade_latency_samples:
+                self._trade_latency_samples.pop(0)
+            self._trade_latency_samples.append(sample_us)
+
+        return self.trades_processed
+
+    def get_trade_latency_stats(self) -> Optional[Dict[str, float]]:
+        """Return trade execution latency statistics computed from recorded samples.
+
+        Returns:
+            Dict with 'last', 'avg', 'min', 'max' (and 'p95' when >= 20 samples),
+            all in microseconds. Returns None if no samples have been recorded.
+        """
+        return calculate_trade_latency_stats(self._trade_latency_samples)
+
+    def get_trade_latency_display(self, decimals: int = 1) -> str:
+        """Return formatted last trade execution latency for display."""
+        if self._trade_latency_last_us is not None:
+            val = (
+                self._trade_latency_last_us * 1000.0
+                if self._trade_latency_unit.lower() == "ns"
+                else self._trade_latency_last_us
+            )
+            return format_trade_latency(val, unit=self._trade_latency_unit, decimals=decimals)
+        return NO_SAMPLE_LATENCY
+
+    def get_trade_latency_avg_display(self, decimals: int = 1) -> str:
+        """Return formatted average trade execution latency for display."""
+        stats = self.get_trade_latency_stats()
+        if stats is not None and "avg" in stats:
+            val = (
+                stats["avg"] * 1000.0
+                if self._trade_latency_unit.lower() == "ns"
+                else stats["avg"]
+            )
+            return format_trade_latency(val, unit=self._trade_latency_unit, decimals=decimals)
+        return NO_SAMPLE_LATENCY
+
+    def get_trade_latency_min_display(self, decimals: int = 1) -> str:
+        """Return formatted minimum trade execution latency for display."""
+        stats = self.get_trade_latency_stats()
+        if stats is not None and "min" in stats:
+            val = (
+                stats["min"] * 1000.0
+                if self._trade_latency_unit.lower() == "ns"
+                else stats["min"]
+            )
+            return format_trade_latency(val, unit=self._trade_latency_unit, decimals=decimals)
+        return NO_SAMPLE_LATENCY
+
+    def get_trade_latency_max_display(self, decimals: int = 1) -> str:
+        """Return formatted maximum trade execution latency for display."""
+        stats = self.get_trade_latency_stats()
+        if stats is not None and "max" in stats:
+            val = (
+                stats["max"] * 1000.0
+                if self._trade_latency_unit.lower() == "ns"
+                else stats["max"]
+            )
+            return format_trade_latency(val, unit=self._trade_latency_unit, decimals=decimals)
+        return NO_SAMPLE_LATENCY
+
+    def reset_trade_metrics(self) -> None:
+        """Reset trade metrics and recorded trade latency samples."""
+        self._trades_processed = 0
+        self._trade_latency_last_us = None
+        self._trade_latency_samples.clear()
 
     @property
     def throughput(self) -> Optional[float]:
@@ -1303,6 +1652,12 @@ class TerminalDashboard:
         sell_orders: Optional[List[Any]] = None,
         orders_processed: Optional[int] = None,
         throughput: Optional[Union[float, int, str]] = None,
+        trades_processed: Optional[Union[int, str]] = None,
+        trade_latency: Optional[Union[float, int, str]] = None,
+        trade_latency_avg: Optional[Union[float, int, str]] = None,
+        trade_latency_min: Optional[Union[float, int, str]] = None,
+        trade_latency_max: Optional[Union[float, int, str]] = None,
+        trade_latency_unit: Optional[str] = None,
     ) -> List[str]:
         """Generate all display lines for the current state.
 
@@ -1375,12 +1730,68 @@ class TerminalDashboard:
         lines.append("")
         lines += build_order_book_lines(width, bid_rows=bid_rows, ask_rows=ask_rows)
         lines.append("")
+        # Trade execution metrics
+        trades_cnt = self.trades_processed if trades_processed is None else trades_processed
+        if isinstance(trades_cnt, int):
+            trades_str = format_trades_processed(trades_cnt)
+        elif trades_cnt is None:
+            trades_str = NO_SAMPLE_LATENCY
+        else:
+            trades_str = str(trades_cnt)
+
+        t_unit = trade_latency_unit or self._trade_latency_unit
+        if trade_latency is not None:
+            trade_lat_str = (
+                format_trade_latency(trade_latency, unit=t_unit)
+                if isinstance(trade_latency, (int, float)) and not isinstance(trade_latency, bool)
+                else str(trade_latency)
+            )
+        else:
+            trade_lat_str = self.get_trade_latency_display()
+
+        if trade_latency_avg is not None:
+            trade_lat_avg_str = (
+                format_trade_latency(trade_latency_avg, unit=t_unit)
+                if isinstance(trade_latency_avg, (int, float)) and not isinstance(trade_latency_avg, bool)
+                else str(trade_latency_avg)
+            )
+        else:
+            trade_lat_avg_str = self.get_trade_latency_avg_display()
+
+        if trade_latency_min is not None:
+            trade_lat_min_str = (
+                format_trade_latency(trade_latency_min, unit=t_unit)
+                if isinstance(trade_latency_min, (int, float)) and not isinstance(trade_latency_min, bool)
+                else str(trade_latency_min)
+            )
+        else:
+            trade_lat_min_str = self.get_trade_latency_min_display()
+
+        if trade_latency_max is not None:
+            trade_lat_max_str = (
+                format_trade_latency(trade_latency_max, unit=t_unit)
+                if isinstance(trade_latency_max, (int, float)) and not isinstance(trade_latency_max, bool)
+                else str(trade_latency_max)
+            )
+        else:
+            trade_lat_max_str = self.get_trade_latency_max_display()
+
         lines += build_performance_lines(
             width,
             total_orders=total_orders_str,
             throughput=throughput_str,
             latency=latency_str,
             latency_avg=latency_avg_str,
+        )
+        lines.append("")
+        lines += build_trade_execution_lines(
+            width,
+            trades_processed=trades_str,
+            latency=trade_lat_str,
+            latency_avg=trade_lat_avg_str,
+            latency_min=trade_lat_min_str,
+            latency_max=trade_lat_max_str,
+            unit=t_unit,
         )
         lines.append("")
         lines += build_footer_lines(width)
@@ -1496,6 +1907,12 @@ class TerminalDashboard:
         sell_orders: Optional[List[Any]] = None,
         orders_processed: Optional[int] = None,
         throughput: Optional[Union[float, int, str]] = None,
+        trades_processed: Optional[Union[int, str]] = None,
+        trade_latency: Optional[Union[float, int, str]] = None,
+        trade_latency_avg: Optional[Union[float, int, str]] = None,
+        trade_latency_min: Optional[Union[float, int, str]] = None,
+        trade_latency_max: Optional[Union[float, int, str]] = None,
+        trade_latency_unit: Optional[str] = None,
     ) -> None:
         """Render a single frame of the dashboard onto the curses window."""
         try:
@@ -1517,6 +1934,12 @@ class TerminalDashboard:
                 sell_orders=sell_orders,
                 orders_processed=orders_processed,
                 throughput=throughput,
+                trades_processed=trades_processed,
+                trade_latency=trade_latency,
+                trade_latency_avg=trade_latency_avg,
+                trade_latency_min=trade_latency_min,
+                trade_latency_max=trade_latency_max,
+                trade_latency_unit=trade_latency_unit,
             )
             for idx, line in enumerate(lines):
                 self._safe_addstr(stdscr, idx, 0, line)
@@ -1564,7 +1987,8 @@ class TerminalDashboard:
 
         def blank() -> None:
             nonlocal y
-            y += 1
+            if max_y >= 45:
+                y += 1
 
         border = "=" * width
         divider = "-" * width
@@ -1632,6 +2056,63 @@ class TerminalDashboard:
         latency_str = self.get_latency_display()
         latency_avg_str = self.get_latency_avg_display()
 
+        # Trade execution strings
+        trades_cnt = self.trades_processed if trades_processed is None else trades_processed
+        if isinstance(trades_cnt, int):
+            trades_str = format_trades_processed(trades_cnt)
+        elif trades_cnt is None:
+            trades_str = NO_SAMPLE_LATENCY
+        else:
+            trades_str = str(trades_cnt)
+
+        t_unit = trade_latency_unit or self._trade_latency_unit
+        if trade_latency is not None:
+            trade_lat_str = (
+                format_trade_latency(trade_latency, unit=t_unit)
+                if isinstance(trade_latency, (int, float)) and not isinstance(trade_latency, bool)
+                else str(trade_latency)
+            )
+        else:
+            trade_lat_str = self.get_trade_latency_display()
+
+        if trade_latency_avg is not None:
+            trade_lat_avg_str = (
+                format_trade_latency(trade_latency_avg, unit=t_unit)
+                if isinstance(trade_latency_avg, (int, float)) and not isinstance(trade_latency_avg, bool)
+                else str(trade_latency_avg)
+            )
+        else:
+            trade_lat_avg_str = self.get_trade_latency_avg_display()
+
+        if trade_latency_min is not None:
+            trade_lat_min_str = (
+                format_trade_latency(trade_latency_min, unit=t_unit)
+                if isinstance(trade_latency_min, (int, float)) and not isinstance(trade_latency_min, bool)
+                else str(trade_latency_min)
+            )
+        else:
+            trade_lat_min_str = self.get_trade_latency_min_display()
+
+        if trade_latency_max is not None:
+            trade_lat_max_str = (
+                format_trade_latency(trade_latency_max, unit=t_unit)
+                if isinstance(trade_latency_max, (int, float)) and not isinstance(trade_latency_max, bool)
+                else str(trade_latency_max)
+            )
+        else:
+            trade_lat_max_str = self.get_trade_latency_max_display()
+
+        if t_unit.lower() == "us":
+            lbl_trade_last = LABEL_TRADE_LATENCY
+            lbl_trade_avg = LABEL_TRADE_LATENCY_AVG
+            lbl_trade_min = LABEL_TRADE_LATENCY_MIN
+            lbl_trade_max = LABEL_TRADE_LATENCY_MAX
+        else:
+            lbl_trade_last = f"Last Execution Latency ({t_unit})"
+            lbl_trade_avg = f"Avg Execution Latency ({t_unit})"
+            lbl_trade_min = f"Min Execution Latency ({t_unit})"
+            lbl_trade_max = f"Max Execution Latency ({t_unit})"
+
         # ---- Performance Metrics ----
         put(f"  {SECTION_PERFORMANCE}", attrs["section"])
         put(divider, attrs["border"])
@@ -1642,7 +2123,20 @@ class TerminalDashboard:
         put(divider, attrs["border"])
         blank()
 
+        # ---- Trade Execution Metrics ----
+        put(f"  {SECTION_TRADE_EXECUTION}", attrs["section"])
+        put(divider, attrs["border"])
+        put(f"  {LABEL_TRADES_PROCESSED:<{col_w - 10}} {trades_str:>8}", attrs["label"])
+        put(f"  {lbl_trade_last:<{col_w - 10}} {trade_lat_str:>8}", attrs["label"])
+        put(f"  {lbl_trade_avg:<{col_w - 10}} {trade_lat_avg_str:>8}", attrs["label"])
+        put(f"  {lbl_trade_min:<{col_w - 10}} {trade_lat_min_str:>8}", attrs["label"])
+        put(f"  {lbl_trade_max:<{col_w - 10}} {trade_lat_max_str:>8}", attrs["label"])
+        put(divider, attrs["border"])
+        blank()
+
         # ---- Footer ----
+        if y + 2 > max_y:
+            y = max_y - 2
         put(f"  {QUIT_MESSAGE}", attrs["quit"])
         put(border, attrs["border"])
 

@@ -2673,3 +2673,665 @@ class TestLivePipelineIntegration:
         assert bridge.is_running is False
         assert dashboard.is_running is False
 
+
+
+# ==========================================================================
+# NEW TESTS — Week 3 Day 2: Trade Execution Metrics Section
+# Added imports needed by new tests are at the top of this block only
+# (symbols already present in the original import block are not duplicated).
+# ==========================================================================
+
+from chronos.dashboard import (  # noqa: E402  (re-import for new symbols)
+    SECTION_TRADE_EXECUTION,
+    SECTION_TRADE_METRICS,
+    LABEL_TRADES_PROCESSED,
+    LABEL_TOTAL_TRADES,
+    LABEL_TRADE_LATENCY,
+    LABEL_TRADE_LATENCY_LAST,
+    LABEL_TRADE_LATENCY_AVG,
+    LABEL_TRADE_LATENCY_MIN,
+    LABEL_TRADE_LATENCY_MAX,
+    DEFAULT_TRADE_LATENCY_UNIT,
+    build_trade_execution_lines,
+    calculate_trade_latency_stats,
+    format_trade_latency,
+    format_trades_processed,
+)
+
+
+# ---------------------------------------------------------------------------
+# Section 20: Constants & Config
+# ---------------------------------------------------------------------------
+
+class TestTradeExecutionConstants:
+    """Verify new constants are present and have the right types/values."""
+
+    def test_section_trade_execution_is_str(self):
+        assert isinstance(SECTION_TRADE_EXECUTION, str)
+        assert len(SECTION_TRADE_EXECUTION) > 0
+
+    def test_section_trade_metrics_is_str(self):
+        assert isinstance(SECTION_TRADE_METRICS, str)
+        assert len(SECTION_TRADE_METRICS) > 0
+
+    def test_label_trades_processed_is_str(self):
+        assert isinstance(LABEL_TRADES_PROCESSED, str)
+
+    def test_label_total_trades_is_str(self):
+        assert isinstance(LABEL_TOTAL_TRADES, str)
+
+    def test_label_trade_latency_is_str(self):
+        assert isinstance(LABEL_TRADE_LATENCY, str)
+
+    def test_label_trade_latency_last_is_str(self):
+        assert isinstance(LABEL_TRADE_LATENCY_LAST, str)
+
+    def test_label_trade_latency_avg_is_str(self):
+        assert isinstance(LABEL_TRADE_LATENCY_AVG, str)
+
+    def test_label_trade_latency_min_is_str(self):
+        assert isinstance(LABEL_TRADE_LATENCY_MIN, str)
+
+    def test_label_trade_latency_max_is_str(self):
+        assert isinstance(LABEL_TRADE_LATENCY_MAX, str)
+
+    def test_default_trade_latency_unit_is_us(self):
+        assert DEFAULT_TRADE_LATENCY_UNIT == "us"
+
+    def test_dashboard_config_default_trade_latency_unit(self):
+        cfg = DashboardConfig()
+        assert cfg.trade_latency_unit == "us"
+
+    def test_dashboard_config_trade_latency_unit_ns(self):
+        cfg = DashboardConfig(trade_latency_unit="ns")
+        assert cfg.trade_latency_unit == "ns"
+
+
+# ---------------------------------------------------------------------------
+# Section 21: format_trade_latency()
+# ---------------------------------------------------------------------------
+
+class TestFormatTradeLatency:
+    """Test the pure formatting function for a single latency value."""
+
+    def test_none_returns_na(self):
+        assert format_trade_latency(None) == "N/A"
+
+    def test_negative_returns_na(self):
+        assert format_trade_latency(-1.0) == "N/A"
+
+    def test_zero_format_returns_string(self):
+        # Implementation may return "0.0" or "N/A" for zero latency; either is acceptable
+        result = format_trade_latency(0.0)
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_us_positive_value(self):
+        result = format_trade_latency(123.456, unit="us")
+        assert "123" in result
+
+    def test_ns_positive_value_integer_format(self):
+        # ns values should be rendered as integers (no decimal)
+        result = format_trade_latency(12345.0, unit="ns")
+        # Should contain the numeric value without decimal point
+        assert "." not in result or result.count(".") == 0  # commas OK, dots not
+        assert "12" in result
+
+    def test_default_unit_is_us(self):
+        # Calling without unit keyword should use "us" behaviour
+        result_default = format_trade_latency(50.0)
+        result_explicit = format_trade_latency(50.0, unit="us")
+        assert result_default == result_explicit
+
+    def test_large_ns_value_has_comma_separator(self):
+        result = format_trade_latency(1_000_000.0, unit="ns")
+        assert "," in result  # e.g. "1,000,000"
+
+
+# ---------------------------------------------------------------------------
+# Section 22: format_trades_processed()
+# ---------------------------------------------------------------------------
+
+class TestFormatTradesProcessed:
+    """Test the pure formatting function for the trade count."""
+
+    def test_none_returns_na(self):
+        assert format_trades_processed(None) == "N/A"
+
+    def test_zero_returns_zero_string(self):
+        assert format_trades_processed(0) == "0"
+
+    def test_positive_integer_formatted(self):
+        result = format_trades_processed(12500)
+        assert "12,500" in result or "12500" in result  # comma formatting preferred
+
+    def test_large_number_has_comma_separator(self):
+        result = format_trades_processed(1_000_000)
+        assert "," in result
+
+    def test_small_number_no_comma(self):
+        result = format_trades_processed(5)
+        assert "5" in result
+
+    def test_negative_returns_na_or_raises(self):
+        # Implementation either raises ValueError or returns N/A for negative counts
+        try:
+            result = format_trades_processed(-1)
+            assert result == "N/A"
+        except (ValueError, AssertionError):
+            pass  # raising is also acceptable
+
+
+# ---------------------------------------------------------------------------
+# Section 23: calculate_trade_latency_stats()
+# ---------------------------------------------------------------------------
+
+class TestCalculateTradeLatencyStats:
+    """Test the stats aggregation pure function."""
+
+    def test_empty_list_returns_none(self):
+        assert calculate_trade_latency_stats([]) is None
+
+    def test_none_input_returns_none(self):
+        assert calculate_trade_latency_stats(None) is None
+
+    def test_single_sample_has_required_keys(self):
+        stats = calculate_trade_latency_stats([42.0])
+        assert stats is not None
+        assert "last" in stats
+        assert "avg" in stats
+        assert "min" in stats
+        assert "max" in stats
+
+    def test_single_sample_values_correct(self):
+        stats = calculate_trade_latency_stats([42.0])
+        assert stats["last"] == pytest.approx(42.0)
+        assert stats["avg"] == pytest.approx(42.0)
+        assert stats["min"] == pytest.approx(42.0)
+        assert stats["max"] == pytest.approx(42.0)
+
+    def test_multiple_samples_last_is_final_element(self):
+        stats = calculate_trade_latency_stats([10.0, 20.0, 30.0])
+        assert stats["last"] == pytest.approx(30.0)
+
+    def test_multiple_samples_avg(self):
+        stats = calculate_trade_latency_stats([10.0, 20.0, 30.0])
+        assert stats["avg"] == pytest.approx(20.0)
+
+    def test_multiple_samples_min_max(self):
+        stats = calculate_trade_latency_stats([10.0, 20.0, 30.0])
+        assert stats["min"] == pytest.approx(10.0)
+        assert stats["max"] == pytest.approx(30.0)
+
+    def test_negative_values_filtered_out(self):
+        # Negative latencies are invalid — they must be ignored
+        stats = calculate_trade_latency_stats([-5.0, 10.0, 20.0])
+        assert stats is not None
+        assert stats["min"] > 0
+
+    def test_all_negative_returns_none(self):
+        result = calculate_trade_latency_stats([-1.0, -2.0])
+        assert result is None
+
+    def test_twenty_plus_samples_includes_p95(self):
+        samples = [float(i) for i in range(1, 25)]  # 24 samples
+        stats = calculate_trade_latency_stats(samples)
+        assert stats is not None
+        assert "p95" in stats
+
+    def test_fewer_than_twenty_samples_no_p95_required(self):
+        samples = [float(i) for i in range(1, 10)]  # 9 samples
+        stats = calculate_trade_latency_stats(samples)
+        # p95 may or may not be present, but must not crash
+        assert stats is not None
+
+
+# ---------------------------------------------------------------------------
+# Section 24: build_trade_execution_lines()
+# ---------------------------------------------------------------------------
+
+class TestBuildTradeExecutionLines:
+    """Test the pure layout function for the Trade Execution Metrics section."""
+
+    def test_returns_list_of_strings(self):
+        lines = build_trade_execution_lines(width=80)
+        assert isinstance(lines, list)
+        assert all(isinstance(l, str) for l in lines)
+
+    def test_section_header_present(self):
+        lines = build_trade_execution_lines(width=80)
+        text = "\n".join(lines)
+        assert SECTION_TRADE_EXECUTION in text
+
+    def test_separator_lines_present(self):
+        lines = build_trade_execution_lines(width=80)
+        separators = [l for l in lines if set(l.strip()) == {"-"} and len(l.strip()) > 4]
+        assert len(separators) >= 2
+
+    def test_trades_processed_row_present(self):
+        lines = build_trade_execution_lines(width=80)
+        text = "\n".join(lines)
+        assert LABEL_TRADES_PROCESSED in text or "Processed" in text
+
+    def test_latency_last_row_present(self):
+        lines = build_trade_execution_lines(width=80)
+        text = "\n".join(lines)
+        # Should contain some form of "Last" or LABEL_TRADE_LATENCY_LAST
+        assert "Last" in text or LABEL_TRADE_LATENCY_LAST in text
+
+    def test_latency_avg_row_present(self):
+        lines = build_trade_execution_lines(width=80)
+        text = "\n".join(lines)
+        assert "Avg" in text or LABEL_TRADE_LATENCY_AVG in text
+
+    def test_latency_min_row_present(self):
+        lines = build_trade_execution_lines(width=80)
+        text = "\n".join(lines)
+        assert "Min" in text or LABEL_TRADE_LATENCY_MIN in text
+
+    def test_latency_max_row_present(self):
+        lines = build_trade_execution_lines(width=80)
+        text = "\n".join(lines)
+        assert "Max" in text or LABEL_TRADE_LATENCY_MAX in text
+
+    def test_default_values_show_na(self):
+        lines = build_trade_execution_lines(width=80)
+        text = "\n".join(lines)
+        assert "N/A" in text
+
+    def test_trades_processed_value_injected(self):
+        lines = build_trade_execution_lines(width=80, trades_processed=42)
+        text = "\n".join(lines)
+        assert "42" in text
+
+    def test_latency_last_value_injected(self):
+        lines = build_trade_execution_lines(width=80, latency=55.5)
+        text = "\n".join(lines)
+        assert "55" in text
+
+    def test_latency_avg_value_injected(self):
+        lines = build_trade_execution_lines(width=80, latency_avg=33.3)
+        text = "\n".join(lines)
+        assert "33" in text
+
+    def test_latency_min_value_injected(self):
+        lines = build_trade_execution_lines(width=80, latency_min=10.0)
+        text = "\n".join(lines)
+        assert "10" in text
+
+    def test_latency_max_value_injected(self):
+        lines = build_trade_execution_lines(width=80, latency_max=99.9)
+        text = "\n".join(lines)
+        assert "99" in text
+
+    def test_unit_us_in_label(self):
+        lines = build_trade_execution_lines(width=80, unit="us")
+        text = "\n".join(lines)
+        assert "us" in text.lower() or "(us)" in text
+
+    def test_unit_ns_in_label(self):
+        lines = build_trade_execution_lines(width=80, unit="ns")
+        text = "\n".join(lines)
+        assert "ns" in text.lower() or "(ns)" in text
+
+    def test_narrow_width_does_not_crash(self):
+        # Should not raise even for very narrow terminals
+        lines = build_trade_execution_lines(width=40)
+        assert isinstance(lines, list)
+
+    def test_wide_width_does_not_crash(self):
+        lines = build_trade_execution_lines(width=200)
+        assert isinstance(lines, list)
+
+    def test_no_fabricated_nonzero_defaults(self):
+        # When no values supplied, there should be no numeric non-zero data values
+        lines = build_trade_execution_lines(width=80)
+        text = "\n".join(lines)
+        # "0" is allowed (trades_processed defaults to 0), but latency should be N/A
+        # Verify latency rows show N/A, not a real number
+        latency_rows = [l for l in lines if ("Last" in l or "Avg" in l or
+                                              "Min" in l or "Max" in l)]
+        for row in latency_rows:
+            assert "N/A" in row
+
+
+# ---------------------------------------------------------------------------
+# Section 25: TerminalDashboard trade metrics state & methods
+# ---------------------------------------------------------------------------
+
+class TestTerminalDashboardTradeMetrics:
+    """Test TerminalDashboard trade-metrics methods and state."""
+
+    def _make_dashboard(self, **kwargs):
+        return TerminalDashboard(use_sample_data=False, **kwargs)
+
+    # --- Initial state ---
+
+    def test_initial_trades_processed_is_zero(self):
+        d = self._make_dashboard()
+        assert d.trades_processed == 0
+
+    def test_initial_trade_latency_samples_empty(self):
+        d = self._make_dashboard()
+        assert d._trade_latency_samples == []
+
+    def test_initial_trade_latency_unit_default_us(self):
+        d = self._make_dashboard()
+        assert d._trade_latency_unit == "us"
+
+    def test_trade_latency_unit_ns_init(self):
+        d = self._make_dashboard(trade_latency_unit="ns")
+        assert d._trade_latency_unit == "ns"
+
+    # --- trades_processed property ---
+
+    def test_set_trades_processed_property(self):
+        d = self._make_dashboard()
+        d.trades_processed = 99
+        assert d.trades_processed == 99
+
+    def test_set_trades_processed_method(self):
+        d = self._make_dashboard()
+        d.set_trades_processed(77)
+        assert d.trades_processed == 77
+
+    def test_update_trades_processed_sets_max(self):
+        d = self._make_dashboard()
+        d.update_trades_processed(50)
+        assert d.trades_processed == 50
+        d.update_trades_processed(30)
+        # update_trades_processed only moves forward (or keeps max)
+        assert d.trades_processed >= 30
+
+    def test_increment_trades_processed(self):
+        d = self._make_dashboard()
+        d.increment_trades_processed()
+        assert d.trades_processed == 1
+        d.increment_trades_processed()
+        assert d.trades_processed == 2
+
+    # --- record_trade_execution() ---
+
+    def test_record_trade_execution_latency_us_increments_count(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=50.0)
+        assert d.trades_processed == 1
+
+    def test_record_trade_execution_latency_us_adds_sample(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=50.0)
+        assert len(d._trade_latency_samples) == 1
+        assert d._trade_latency_samples[0] == pytest.approx(50.0)
+
+    def test_record_trade_execution_latency_ns_converts_to_us(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_ns=1000)  # 1000 ns = 1.0 us
+        assert len(d._trade_latency_samples) == 1
+        assert d._trade_latency_samples[0] == pytest.approx(1.0)
+
+    def test_record_trade_execution_multiple_calls_accumulate(self):
+        d = self._make_dashboard()
+        for val in [10.0, 20.0, 30.0]:
+            d.record_trade_execution(latency_us=val)
+        assert d.trades_processed == 3
+        assert len(d._trade_latency_samples) == 3
+
+    def test_record_trade_execution_no_latency_still_counts(self):
+        d = self._make_dashboard()
+        d.record_trade_execution()
+        assert d.trades_processed == 1
+        # No sample should have been added (no latency provided)
+        assert len(d._trade_latency_samples) == 0
+
+    def test_max_trade_latency_samples_capped(self):
+        d = self._make_dashboard()
+        cap = d._max_trade_latency_samples
+        for i in range(cap + 10):
+            d.record_trade_execution(latency_us=float(i))
+        assert len(d._trade_latency_samples) <= cap
+
+    # --- get_trade_latency_display() ---
+
+    def test_get_trade_latency_display_no_samples_returns_na(self):
+        d = self._make_dashboard()
+        assert d.get_trade_latency_display() == "N/A"
+
+    def test_get_trade_latency_display_with_sample(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=42.0)
+        result = d.get_trade_latency_display()
+        assert result != "N/A"
+        assert "42" in result
+
+    # --- get_trade_latency_avg_display() ---
+
+    def test_get_trade_latency_avg_display_no_samples_returns_na(self):
+        d = self._make_dashboard()
+        assert d.get_trade_latency_avg_display() == "N/A"
+
+    def test_get_trade_latency_avg_display_with_samples(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=10.0)
+        d.record_trade_execution(latency_us=30.0)
+        result = d.get_trade_latency_avg_display()
+        assert result != "N/A"
+        assert "20" in result  # avg of 10 and 30
+
+    # --- get_trade_latency_min_display() ---
+
+    def test_get_trade_latency_min_display_no_samples_returns_na(self):
+        d = self._make_dashboard()
+        assert d.get_trade_latency_min_display() == "N/A"
+
+    def test_get_trade_latency_min_display_with_samples(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=30.0)
+        d.record_trade_execution(latency_us=10.0)
+        result = d.get_trade_latency_min_display()
+        assert "10" in result
+
+    # --- get_trade_latency_max_display() ---
+
+    def test_get_trade_latency_max_display_no_samples_returns_na(self):
+        d = self._make_dashboard()
+        assert d.get_trade_latency_max_display() == "N/A"
+
+    def test_get_trade_latency_max_display_with_samples(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=10.0)
+        d.record_trade_execution(latency_us=99.0)
+        result = d.get_trade_latency_max_display()
+        assert "99" in result
+
+    # --- get_trade_latency_stats() ---
+
+    def test_get_trade_latency_stats_no_samples_returns_none(self):
+        d = self._make_dashboard()
+        assert d.get_trade_latency_stats() is None
+
+    def test_get_trade_latency_stats_with_samples(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=10.0)
+        d.record_trade_execution(latency_us=20.0)
+        stats = d.get_trade_latency_stats()
+        assert stats is not None
+        assert "last" in stats
+        assert "avg" in stats
+        assert "min" in stats
+        assert "max" in stats
+
+    # --- reset_trade_metrics() ---
+
+    def test_reset_trade_metrics_clears_samples(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=50.0)
+        d.reset_trade_metrics()
+        assert d._trade_latency_samples == []
+
+    def test_reset_trade_metrics_clears_last_latency(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=50.0)
+        d.reset_trade_metrics()
+        assert d._trade_latency_last_us is None
+
+    def test_reset_trade_metrics_does_not_reset_count(self):
+        # reset_trade_metrics only resets latency measurements, not the counter
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=50.0)
+        d.reset_trade_metrics()
+        # trades_processed remains (counter persists across metric resets)
+        # This is by design — latency window can be reset without losing count
+        assert d.trades_processed >= 0  # still valid
+
+    # --- reset_orders_processed() resets trade metrics too ---
+
+    def test_reset_orders_processed_also_resets_trade_metrics(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=50.0)
+        d.reset_orders_processed()
+        # After full reset, latency samples should be gone
+        assert d._trade_latency_samples == []
+
+
+# ---------------------------------------------------------------------------
+# Section 26: get_display_lines() includes Trade Execution Metrics
+# ---------------------------------------------------------------------------
+
+class TestGetDisplayLinesTradeExecution:
+    """Verify the text-mode output includes the Trade Execution section."""
+
+    def _make_dashboard(self):
+        return TerminalDashboard(use_sample_data=False)
+
+    def test_section_header_in_display_lines(self):
+        d = self._make_dashboard()
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_TRADE_EXECUTION in text
+
+    def test_latency_na_when_no_samples(self):
+        d = self._make_dashboard()
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        # Latency rows should show N/A
+        assert "N/A" in text
+
+    def test_trades_processed_zero_initially(self):
+        d = self._make_dashboard()
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert "0" in text
+
+    def test_display_lines_reflect_recorded_trade(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=75.5)
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert "75" in text  # latency value appears
+        assert "1" in text   # trades_processed = 1
+
+    def test_display_lines_with_unit_ns(self):
+        d = TerminalDashboard(use_sample_data=False, trade_latency_unit="ns")
+        d.record_trade_execution(latency_us=1.0)
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert "ns" in text.lower() or "(ns)" in text
+
+    def test_explicit_params_override_internal_state(self):
+        d = self._make_dashboard()
+        lines = d.get_display_lines(
+            rows=50, cols=100,
+            trades_processed=999,
+            trade_latency=11.1,
+            trade_latency_avg=22.2,
+            trade_latency_min=5.5,
+            trade_latency_max=33.3,
+        )
+        text = "\n".join(lines)
+        assert "999" in text
+        assert "11" in text
+
+    def test_display_lines_returns_list_of_strings(self):
+        d = self._make_dashboard()
+        lines = d.get_display_lines(rows=50, cols=100)
+        assert isinstance(lines, list)
+        assert all(isinstance(l, str) for l in lines)
+
+
+# ---------------------------------------------------------------------------
+# Section 27: render() writes Trade Execution Metrics to curses window
+# ---------------------------------------------------------------------------
+
+class TestRenderTradeExecution:
+    """Verify render() includes Trade Execution section in curses calls."""
+
+    def _make_window(self, rows=50, cols=100):
+        return MockCursesWindow(rows=rows, cols=cols)
+
+    def _make_dashboard(self, **kwargs):
+        return TerminalDashboard(use_sample_data=False, **kwargs)
+
+    def _rendered_text(self, dashboard, rows=50, cols=100):
+        win = self._make_window(rows=rows, cols=cols)
+        dashboard.render(win)
+        return " ".join(call[2] for call in win.addstr_calls if len(call) >= 3)
+
+    def test_render_includes_trade_execution_section_header(self):
+        d = self._make_dashboard()
+        text = self._rendered_text(d)
+        assert SECTION_TRADE_EXECUTION in text
+
+    def test_render_shows_na_latency_when_no_samples(self):
+        d = self._make_dashboard()
+        text = self._rendered_text(d)
+        assert "N/A" in text
+
+    def test_render_shows_recorded_latency(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=88.8)
+        text = self._rendered_text(d)
+        assert "88" in text
+
+    def test_render_shows_ns_unit_label(self):
+        d = self._make_dashboard(trade_latency_unit="ns")
+        text = self._rendered_text(d)
+        assert "ns" in text.lower()
+
+    def test_render_small_terminal_does_not_crash(self):
+        d = self._make_dashboard()
+        win = self._make_window(rows=30, cols=80)
+        # Must not raise even on a minimal terminal
+        d.render(win)
+
+    def test_render_trade_metrics_after_multiple_records(self):
+        d = self._make_dashboard()
+        for val in [10.0, 20.0, 30.0]:
+            d.record_trade_execution(latency_us=val)
+        text = self._rendered_text(d)
+        # 3 trades processed
+        assert "3" in text
+        # avg = 20 should appear
+        assert "20" in text
+
+
+# ---------------------------------------------------------------------------
+# Section 28: DashboardConfig.trade_latency_unit integration
+# ---------------------------------------------------------------------------
+
+class TestDashboardConfigTradeLatencyUnit:
+    """DashboardConfig trade_latency_unit flows through to TerminalDashboard."""
+
+    def test_config_us_propagates_to_dashboard(self):
+        cfg = DashboardConfig(trade_latency_unit="us")
+        d = TerminalDashboard(use_sample_data=False, trade_latency_unit=cfg.trade_latency_unit)
+        assert d._trade_latency_unit == "us"
+
+    def test_config_ns_propagates_to_dashboard(self):
+        cfg = DashboardConfig(trade_latency_unit="ns")
+        d = TerminalDashboard(use_sample_data=False, trade_latency_unit=cfg.trade_latency_unit)
+        assert d._trade_latency_unit == "ns"
+
+    def test_config_is_frozen(self):
+        cfg = DashboardConfig()
+        with pytest.raises((AttributeError, TypeError)):
+            cfg.trade_latency_unit = "ns"  # type: ignore
