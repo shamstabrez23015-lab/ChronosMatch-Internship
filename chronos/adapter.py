@@ -12,12 +12,35 @@ Provides an integration adapter that:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from chronos.matching_engine import MatchingEngine, TradeResult, price_to_cents
 from chronos.protocol import Order, OrderType, Side, SYMBOLS, SYMBOL_ID_TO_TICKER
 from chronos.ring_buffer import MmapRingBuffer
 from chronos.consumer import ZeroCopyConsumer
+
+
+@dataclass
+class TradeExecutionEvent:
+    """Nanosecond-level record of an order execution event."""
+
+    order_id: int
+    symbol_id: int
+    side: int
+    price: float
+    quantity: int
+    entry_timestamp_ns: int
+    exit_timestamp_ns: int
+    latency_ns: int
+    trades: List[TradeResult] = field(default_factory=list)
+    matched: bool = False
+    volume_matched: int = 0
+
+    @property
+    def latency_us(self) -> float:
+        """Return execution latency in microseconds."""
+        return self.latency_ns / 1_000.0
 
 
 @dataclass
@@ -32,6 +55,56 @@ class AdapterStats:
     unhandled_order_types: int = 0
     unrouted_symbols: int = 0
 
+    # Nanosecond latency metrics
+    total_execution_latency_ns: int = 0
+    min_execution_latency_ns: int = 0
+    max_execution_latency_ns: int = 0
+    last_execution_latency_ns: int = 0
+    execution_latencies_ns: List[int] = field(default_factory=list)
+
+    def record_latency(self, latency_ns: int) -> None:
+        """Record an execution latency sample in nanoseconds."""
+        self.total_execution_latency_ns += latency_ns
+        self.last_execution_latency_ns = latency_ns
+        if self.min_execution_latency_ns == 0 or latency_ns < self.min_execution_latency_ns:
+            self.min_execution_latency_ns = latency_ns
+        if latency_ns > self.max_execution_latency_ns:
+            self.max_execution_latency_ns = latency_ns
+        if len(self.execution_latencies_ns) < 100_000:
+            self.execution_latencies_ns.append(latency_ns)
+
+    @property
+    def avg_execution_latency_ns(self) -> float:
+        """Return average execution latency in nanoseconds."""
+        if self.total_orders_dispatched <= 0:
+            return 0.0
+        return self.total_execution_latency_ns / self.total_orders_dispatched
+
+    @property
+    def avg_execution_latency_us(self) -> float:
+        """Return average execution latency in microseconds."""
+        return self.avg_execution_latency_ns / 1_000.0
+
+    def percentile_latency_ns(self, pct: float) -> float:
+        """Return the given percentile execution latency in nanoseconds (e.g. 50.0, 99.0)."""
+        if not self.execution_latencies_ns:
+            return 0.0
+        s = sorted(self.execution_latencies_ns)
+        idx = int(len(s) * (pct / 100.0))
+        return float(s[min(idx, len(s) - 1)])
+
+    @property
+    def p50_execution_latency_ns(self) -> float:
+        return self.percentile_latency_ns(50.0)
+
+    @property
+    def p90_execution_latency_ns(self) -> float:
+        return self.percentile_latency_ns(90.0)
+
+    @property
+    def p99_execution_latency_ns(self) -> float:
+        return self.percentile_latency_ns(99.0)
+
     def reset(self) -> None:
         """Reset all metrics to zero."""
         self.total_orders_read = 0
@@ -41,6 +114,11 @@ class AdapterStats:
         self.non_crossing_orders = 0
         self.unhandled_order_types = 0
         self.unrouted_symbols = 0
+        self.total_execution_latency_ns = 0
+        self.min_execution_latency_ns = 0
+        self.max_execution_latency_ns = 0
+        self.last_execution_latency_ns = 0
+        self.execution_latencies_ns.clear()
 
 
 class OrderAdapter:
@@ -82,6 +160,7 @@ class OrderAdapter:
 
         self.stats = AdapterStats()
         self.trades: List[TradeResult] = []
+        self.execution_events: List[TradeExecutionEvent] = []
         self.unhandled_orders: List[Tuple[Any, str]] = []
         self.unrouted_orders: List[Any] = []
 
@@ -131,6 +210,7 @@ class OrderAdapter:
         # Check order type compatibility
         if order_type == int(OrderType.LIMIT):
             if self.dispatch_mode == "match":
+                t_entry = time.perf_counter_ns()
                 trades = target_engine.match_order(
                     order_id=order_id,
                     side=side,
@@ -138,14 +218,40 @@ class OrderAdapter:
                     quantity=quantity,
                     timestamp_ns=timestamp_ns,
                 )
+                t_exit = time.perf_counter_ns()
+                latency_ns = max(0, t_exit - t_entry)
+
+                # Ensure trades carry nanosecond entry/exit timestamps
+                for trade in trades:
+                    if getattr(trade, "entry_timestamp_ns", 0) == 0:
+                        trade.set_timestamps(t_entry, t_exit)
+
                 self.trades.extend(trades)
                 self.stats.total_orders_dispatched += 1
                 self.stats.total_trades_generated += len(trades)
-                self.stats.total_volume_matched += sum(t.executed_quantity for t in trades)
+                matched_vol = sum(t.executed_quantity for t in trades)
+                self.stats.total_volume_matched += matched_vol
                 if len(trades) == 0:
                     self.stats.non_crossing_orders += 1
+
+                self.stats.record_latency(latency_ns)
+                event = TradeExecutionEvent(
+                    order_id=order_id,
+                    symbol_id=symbol_id,
+                    side=side,
+                    price=price,
+                    quantity=quantity,
+                    entry_timestamp_ns=t_entry,
+                    exit_timestamp_ns=t_exit,
+                    latency_ns=latency_ns,
+                    trades=list(trades),
+                    matched=len(trades) > 0,
+                    volume_matched=matched_vol,
+                )
+                self.execution_events.append(event)
                 return trades
             else:
+                t_entry = time.perf_counter_ns()
                 target_engine.submit_order(
                     order_id=order_id,
                     side=side,
@@ -153,8 +259,26 @@ class OrderAdapter:
                     quantity=quantity,
                     timestamp_ns=timestamp_ns,
                 )
+                t_exit = time.perf_counter_ns()
+                latency_ns = max(0, t_exit - t_entry)
+
                 self.stats.total_orders_dispatched += 1
                 self.stats.non_crossing_orders += 1
+                self.stats.record_latency(latency_ns)
+                event = TradeExecutionEvent(
+                    order_id=order_id,
+                    symbol_id=symbol_id,
+                    side=side,
+                    price=price,
+                    quantity=quantity,
+                    entry_timestamp_ns=t_entry,
+                    exit_timestamp_ns=t_exit,
+                    latency_ns=latency_ns,
+                    trades=[],
+                    matched=False,
+                    volume_matched=0,
+                )
+                self.execution_events.append(event)
                 return []
         else:
             # Non-LIMIT order types (e.g. CANCEL, MARKET)
@@ -245,6 +369,7 @@ class OrderAdapter:
         """Reset adapter statistics and trade history."""
         self.stats.reset()
         self.trades.clear()
+        self.execution_events.clear()
         self.unhandled_orders.clear()
         self.unrouted_orders.clear()
 

@@ -14,7 +14,7 @@ from chronos.protocol import (
 )
 from chronos.ring_buffer import MmapRingBuffer, RingBufferFullError
 from chronos.dashboard import DashboardConfig, TerminalDashboard
-from chronos.adapter import AdapterStats, OrderAdapter
+from chronos.adapter import AdapterStats, OrderAdapter, TradeExecutionEvent
 from chronos.config import (
     ChronosConfig,
     SystemConfig,
@@ -51,6 +51,7 @@ __all__ = [
     "TerminalDashboard",
     "OrderAdapter",
     "AdapterStats",
+    "TradeExecutionEvent",
     "ChronosConfig",
     "SystemConfig",
     "DEFAULT_BUFFER_CAPACITY",

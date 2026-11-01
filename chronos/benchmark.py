@@ -198,6 +198,12 @@ class RepetitionMetrics:
     throughput: float
     scope: str
     is_warmup: bool = False
+    avg_latency_ns: float = 0.0
+    min_latency_ns: int = 0
+    max_latency_ns: int = 0
+    p50_latency_ns: float = 0.0
+    p90_latency_ns: float = 0.0
+    p99_latency_ns: float = 0.0
 
 
 @dataclass
@@ -230,6 +236,12 @@ class BenchmarkSummary:
     total_volume_matched: int
     stage_connectivity: Dict[str, bool]
     limitations: List[str]
+    mean_latency_ns: float = 0.0
+    median_latency_ns: float = 0.0
+    min_latency_ns: int = 0
+    max_latency_ns: int = 0
+    p90_latency_ns: float = 0.0
+    p99_latency_ns: float = 0.0
 
 
 # ==============================================================================
@@ -392,6 +404,12 @@ class PipelineBenchmarkRunner:
                 throughput=throughput,
                 scope=SCOPE_FULL,
                 is_warmup=is_warmup,
+                avg_latency_ns=adapter.stats.avg_execution_latency_ns,
+                min_latency_ns=adapter.stats.min_execution_latency_ns,
+                max_latency_ns=adapter.stats.max_execution_latency_ns,
+                p50_latency_ns=adapter.stats.p50_execution_latency_ns,
+                p90_latency_ns=adapter.stats.p90_execution_latency_ns,
+                p99_latency_ns=adapter.stats.p99_execution_latency_ns,
             )
 
         finally:
@@ -457,6 +475,12 @@ class PipelineBenchmarkRunner:
             throughput=throughput,
             scope=SCOPE_ADAPTER_ENGINE,
             is_warmup=is_warmup,
+            avg_latency_ns=adapter.stats.avg_execution_latency_ns,
+            min_latency_ns=adapter.stats.min_execution_latency_ns,
+            max_latency_ns=adapter.stats.max_execution_latency_ns,
+            p50_latency_ns=adapter.stats.p50_execution_latency_ns,
+            p90_latency_ns=adapter.stats.p90_execution_latency_ns,
+            p99_latency_ns=adapter.stats.p99_execution_latency_ns,
         )
 
     def _run_engine_only(
@@ -482,6 +506,7 @@ class PipelineBenchmarkRunner:
 
         trades_count = 0
         volume_count = 0
+        eng_latencies: List[int] = []
 
         t_start = time.perf_counter_ns()
         for ord_tup in all_orders:
@@ -502,12 +527,22 @@ class PipelineBenchmarkRunner:
                 )
                 trades_count += len(trades)
                 volume_count += sum(t.executed_quantity for t in trades)
+                if eng.last_latency_ns > 0:
+                    eng_latencies.append(eng.last_latency_ns)
         t_end = time.perf_counter_ns()
 
         elapsed_ns = max(0, t_end - t_start)
         elapsed_sec = elapsed_ns / 1_000_000_000.0
         orders_processed = len(all_orders)
         throughput = calculate_throughput(orders_processed, elapsed_ns)
+
+        avg_lat = statistics.mean(eng_latencies) if eng_latencies else 0.0
+        min_lat = min((l for l in eng_latencies if l > 0), default=0)
+        max_lat = max(eng_latencies, default=0)
+        s_lat = sorted(eng_latencies) if eng_latencies else []
+        p50_lat = float(s_lat[int(len(s_lat) * 0.50)]) if s_lat else 0.0
+        p90_lat = float(s_lat[int(len(s_lat) * 0.90)]) if s_lat else 0.0
+        p99_lat = float(s_lat[int(len(s_lat) * 0.99)]) if s_lat else 0.0
 
         return RepetitionMetrics(
             repetition_index=repetition_index,
@@ -523,6 +558,12 @@ class PipelineBenchmarkRunner:
             throughput=throughput,
             scope=SCOPE_ENGINE_ONLY,
             is_warmup=is_warmup,
+            avg_latency_ns=avg_lat,
+            min_latency_ns=min_lat,
+            max_latency_ns=max_lat,
+            p50_latency_ns=p50_lat,
+            p90_latency_ns=p90_lat,
+            p99_latency_ns=p99_lat,
         )
 
     def _run_ipc_only(
@@ -659,6 +700,14 @@ class PipelineBenchmarkRunner:
         total_trades = sum(r.trades_generated for r in repetitions)
         total_volume = sum(r.volume_matched for r in repetitions)
 
+        valid_lat_reps = [r for r in repetitions if r.avg_latency_ns > 0]
+        mean_lat = statistics.mean([r.avg_latency_ns for r in valid_lat_reps]) if valid_lat_reps else 0.0
+        median_lat = statistics.median([r.p50_latency_ns for r in valid_lat_reps]) if valid_lat_reps else 0.0
+        min_lat = min((r.min_latency_ns for r in valid_lat_reps if r.min_latency_ns > 0), default=0)
+        max_lat = max((r.max_latency_ns for r in valid_lat_reps), default=0)
+        p90_lat = statistics.mean([r.p90_latency_ns for r in valid_lat_reps]) if valid_lat_reps else 0.0
+        p99_lat = statistics.mean([r.p99_latency_ns for r in valid_lat_reps]) if valid_lat_reps else 0.0
+
         return BenchmarkSummary(
             scope=self.config.scope,
             scope_description=SCOPE_DESCRIPTIONS.get(self.config.scope, self.config.scope),
@@ -686,6 +735,12 @@ class PipelineBenchmarkRunner:
             total_volume_matched=total_volume,
             stage_connectivity=STAGE_CONNECTIVITY.get(self.config.scope, {}),
             limitations=PIPELINE_LIMITATIONS,
+            mean_latency_ns=mean_lat,
+            median_latency_ns=median_lat,
+            min_latency_ns=min_lat,
+            max_latency_ns=max_lat,
+            p90_latency_ns=p90_lat,
+            p99_latency_ns=p99_lat,
         )
 
 
@@ -754,6 +809,11 @@ def format_benchmark_report(summary: BenchmarkSummary, use_color: bool = True) -
     lines.append(f"  Max Throughput    : {summary.max_throughput:,.0f} orders/sec")
     lines.append(f"  Std Deviation     : {summary.std_throughput:,.0f} orders/sec")
     lines.append(f"  Mean Elapsed Time : {summary.mean_elapsed_sec:.4f} seconds")
+    if summary.mean_latency_ns > 0:
+        lines.append(f"  Mean Exec Latency : {c_yellow}{summary.mean_latency_ns:,.1f} ns{c_reset} ({summary.mean_latency_ns / 1_000.0:,.2f} µs)")
+        lines.append(f"  Median (P50) Lat  : {c_yellow}{summary.median_latency_ns:,.1f} ns{c_reset} ({summary.median_latency_ns / 1_000.0:,.2f} µs)")
+        lines.append(f"  Min / Max Latency : {summary.min_latency_ns:,} ns / {summary.max_latency_ns:,} ns")
+        lines.append(f"  P90 / P99 Latency : {summary.p90_latency_ns:,.1f} ns / {summary.p99_latency_ns:,.1f} ns")
     lines.append(f"  Total Processed   : {c_white}{summary.total_orders_processed:,} orders{c_reset}")
     lines.append(f"  Total Trades Fills: {c_magenta}{summary.total_trades_generated:,} trades{c_reset}")
     lines.append(f"  Total Volume      : {c_magenta}{summary.total_volume_matched:,} shares{c_reset}")
