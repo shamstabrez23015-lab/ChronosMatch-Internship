@@ -33,6 +33,7 @@ from chronos.benchmark import (
     RepetitionMetrics,
     calculate_throughput,
 )
+from chronos.trade_latency import TradeLatencySnapshot, TradeLatencyTracker
 
 __all__ = [
     "ORDER_SIZE",
@@ -66,5 +67,7 @@ __all__ = [
     "PipelineBenchmarkRunner",
     "RepetitionMetrics",
     "calculate_throughput",
+    "TradeLatencySnapshot",
+    "TradeLatencyTracker",
 ]
 

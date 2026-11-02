@@ -973,6 +973,13 @@ class TerminalDashboard:
         _MAX_LATENCY_SAMPLES = 1000
         self._max_latency_samples: int = _MAX_LATENCY_SAMPLES
 
+        # Trade latency metrics snapshot state (Week 3 Day 3)
+        self._trade_count: int = 0
+        self._trade_avg_latency_ns: float = 0.0
+        self._trade_min_latency_ns: int = 0
+        self._trade_max_latency_ns: int = 0
+        self._trade_latency_snapshot: Optional[Any] = None
+
     @property
     def orders_processed(self) -> int:
         """Return the current number of processed orders."""
@@ -1116,6 +1123,62 @@ class TerminalDashboard:
         self._latency_last_ns = None
         self._latency_last_us = None
         self._latency_samples.clear()
+        self._trade_count = 0
+        self._trade_avg_latency_ns = 0.0
+        self._trade_min_latency_ns = 0
+        self._trade_max_latency_ns = 0
+        self._trade_latency_snapshot = None
+
+    def update_trade_latency(
+        self, snapshot: Optional[Union[Dict[str, Any], Any]]
+    ) -> None:
+        """Consume a trade latency metrics snapshot implementing the agreed interface.
+
+        Agreed interface:
+          - trade_count (int)
+          - avg_latency_ns (float)
+          - min_latency_ns (int)
+          - max_latency_ns (int)
+        """
+        if snapshot is None:
+            return
+
+        if isinstance(snapshot, dict):
+            self._trade_count = int(snapshot.get("trade_count", 0))
+            self._trade_avg_latency_ns = float(snapshot.get("avg_latency_ns", 0.0))
+            self._trade_min_latency_ns = int(snapshot.get("min_latency_ns", 0))
+            self._trade_max_latency_ns = int(snapshot.get("max_latency_ns", 0))
+        else:
+            self._trade_count = int(getattr(snapshot, "trade_count", 0))
+            self._trade_avg_latency_ns = float(getattr(snapshot, "avg_latency_ns", 0.0))
+            self._trade_min_latency_ns = int(getattr(snapshot, "min_latency_ns", 0))
+            self._trade_max_latency_ns = int(getattr(snapshot, "max_latency_ns", 0))
+
+        self._trade_latency_snapshot = snapshot
+
+    @property
+    def trade_count(self) -> int:
+        """Return the trade count from consumed trade latency metrics."""
+        return self._trade_count
+
+    @property
+    def trade_avg_latency_ns(self) -> float:
+        """Return the average trade latency in nanoseconds."""
+        return self._trade_avg_latency_ns
+
+    @property
+    def trade_min_latency_ns(self) -> int:
+        """Return the minimum trade latency in nanoseconds."""
+        return self._trade_min_latency_ns
+
+    @property
+    def trade_max_latency_ns(self) -> int:
+        """Return the maximum trade latency in nanoseconds."""
+        return self._trade_max_latency_ns
+
+    def get_trade_latency_snapshot(self) -> Optional[Any]:
+        """Return the latest trade latency snapshot consumed by the dashboard."""
+        return self._trade_latency_snapshot
 
     def reset_orders_processed(self) -> None:
         """Reset the processed orders counter, seen order IDs, and latency state."""

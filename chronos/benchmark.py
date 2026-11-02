@@ -54,6 +54,7 @@ from chronos.protocol import (
     SYMBOL_ID_TO_TICKER,
 )
 from chronos.ring_buffer import MmapRingBuffer
+from chronos.trade_latency import TradeLatencySnapshot
 
 # ==============================================================================
 # Pipeline Scope Constants
@@ -205,6 +206,23 @@ class RepetitionMetrics:
     p90_latency_ns: float = 0.0
     p99_latency_ns: float = 0.0
 
+    @property
+    def trade_count(self) -> int:
+        """Trade count (alias for trades_generated to conform to agreed metrics interface)."""
+        return self.trades_generated
+
+    def get_trade_latency_snapshot(self) -> TradeLatencySnapshot:
+        """Return metrics snapshot implementing the agreed interface."""
+        return TradeLatencySnapshot(
+            trade_count=self.trades_generated,
+            avg_latency_ns=self.avg_latency_ns,
+            min_latency_ns=self.min_latency_ns,
+            max_latency_ns=self.max_latency_ns,
+            p50_latency_ns=self.p50_latency_ns,
+            p90_latency_ns=self.p90_latency_ns,
+            p99_latency_ns=self.p99_latency_ns,
+        )
+
 
 @dataclass
 class BenchmarkSummary:
@@ -242,6 +260,28 @@ class BenchmarkSummary:
     max_latency_ns: int = 0
     p90_latency_ns: float = 0.0
     p99_latency_ns: float = 0.0
+
+    @property
+    def trade_count(self) -> int:
+        """Trade count (alias for total_trades_generated to conform to agreed metrics interface)."""
+        return self.total_trades_generated
+
+    @property
+    def avg_latency_ns(self) -> float:
+        """Average latency in nanoseconds (alias for mean_latency_ns)."""
+        return self.mean_latency_ns
+
+    def get_trade_latency_snapshot(self) -> TradeLatencySnapshot:
+        """Return metrics snapshot implementing the agreed interface."""
+        return TradeLatencySnapshot(
+            trade_count=self.total_trades_generated,
+            avg_latency_ns=self.mean_latency_ns,
+            min_latency_ns=self.min_latency_ns,
+            max_latency_ns=self.max_latency_ns,
+            p50_latency_ns=self.median_latency_ns,
+            p90_latency_ns=self.p90_latency_ns,
+            p99_latency_ns=self.p99_latency_ns,
+        )
 
 
 # ==============================================================================
