@@ -40,6 +40,8 @@ SECTION_SELL_ORDERS = "SELL ORDERS (ASKS)"
 SECTION_PERFORMANCE = "PERFORMANCE METRICS"
 SECTION_TRADE_EXECUTION = "TRADE EXECUTION METRICS"
 SECTION_TRADE_METRICS = SECTION_TRADE_EXECUTION
+SECTION_TRADE_LATENCY = "TRADE EXECUTION LATENCY"
+SECTION_TRADE_EXECUTION_LATENCY = "TRADE EXECUTION LATENCY"
 
 # Market summary field labels
 LABEL_BEST_BID = "Best Bid"
@@ -60,12 +62,22 @@ LABEL_LATENCY = "Latency (microseconds)"
 # Trade execution field labels
 LABEL_TRADES_PROCESSED = "Processed Trades"
 LABEL_TOTAL_TRADES = LABEL_TRADES_PROCESSED
+LABEL_TRADE_COUNT = "Trade Count"
 LABEL_TRADE_LATENCY = "Last Execution Latency (us)"
 LABEL_TRADE_LATENCY_LAST = LABEL_TRADE_LATENCY
 LABEL_TRADE_LATENCY_AVG = "Avg Execution Latency (us)"
 LABEL_TRADE_LATENCY_MIN = "Min Execution Latency (us)"
 LABEL_TRADE_LATENCY_MAX = "Max Execution Latency (us)"
+LABEL_AVG_LATENCY = "Average Latency"
+LABEL_MIN_LATENCY = "Minimum Latency"
+LABEL_MAX_LATENCY = "Maximum Latency"
 DEFAULT_TRADE_LATENCY_UNIT = "us"
+
+# Agreed metric field names for latency tracking interface
+METRIC_FIELD_TRADE_COUNT = "trade_count"
+METRIC_FIELD_AVG_LATENCY_NS = "avg_latency_ns"
+METRIC_FIELD_MIN_LATENCY_NS = "min_latency_ns"
+METRIC_FIELD_MAX_LATENCY_NS = "max_latency_ns"
 
 # Latency label detail: measures inter-event elapsed time between consecutive
 # record_order_processed() calls recorded by the dashboard. This reflects the
@@ -798,6 +810,159 @@ def format_trades_processed(count: Optional[Union[int, str]]) -> str:
     if val < 0:
         raise ValueError(f"Trades processed count cannot be negative: {val}")
     return f"{val:,}"
+
+
+@dataclass
+class TradeLatencyMetrics:
+    """Container representing agreed trade execution latency metrics.
+
+    Fields:
+      trade_count: Total count of executed trades.
+      avg_latency_ns: Mean execution latency in nanoseconds.
+      min_latency_ns: Minimum execution latency in nanoseconds.
+      max_latency_ns: Maximum execution latency in nanoseconds.
+      last_latency_ns: Last execution latency in nanoseconds.
+    """
+
+    trade_count: int = 0
+    avg_latency_ns: Optional[float] = None
+    min_latency_ns: Optional[float] = None
+    max_latency_ns: Optional[float] = None
+    last_latency_ns: Optional[float] = None
+
+
+def extract_trade_latency_metrics(tracker: Any) -> Optional[Dict[str, Any]]:
+    """Extract agreed trade latency metric fields from a latency tracking interface.
+
+    Accepts:
+      - Objects with trade_count, avg_latency_ns, min_latency_ns, max_latency_ns
+      - Objects with get_metrics() or get_stats() methods
+      - Dictionaries with agreed keys
+      - Callables returning metrics objects or dicts
+
+    Agreed fields:
+      trade_count (int)
+      avg_latency_ns (float / int)
+      min_latency_ns (float / int)
+      max_latency_ns (float / int)
+
+    Returns:
+      Dict with 'trade_count', 'avg_latency_ns', 'min_latency_ns', 'max_latency_ns',
+      'last_latency_ns', or None if tracker is None or unavailable.
+    """
+    if tracker is None:
+        return None
+
+    obj = tracker
+    if callable(obj) and not hasattr(obj, "trade_count") and not hasattr(obj, "avg_latency_ns"):
+        try:
+            obj = obj()
+        except Exception:
+            return None
+
+    if obj is None:
+        return None
+
+    if hasattr(obj, "get_metrics") and callable(getattr(obj, "get_metrics")):
+        try:
+            obj = obj.get_metrics()
+        except Exception:
+            return None
+    elif hasattr(obj, "get_stats") and callable(getattr(obj, "get_stats")):
+        try:
+            obj = obj.get_stats()
+        except Exception:
+            return None
+
+    if obj is None:
+        return None
+
+    def _get_val(source: Any, *keys: str) -> Any:
+        if isinstance(source, dict):
+            for k in keys:
+                if k in source and source[k] is not None:
+                    return source[k]
+        else:
+            for k in keys:
+                if hasattr(source, k):
+                    val = getattr(source, k)
+                    if val is not None:
+                        return val
+        return None
+
+    raw_count = _get_val(obj, "trade_count", "trades_processed", "total_trades")
+    raw_avg = _get_val(obj, "avg_latency_ns", "avg_execution_latency_ns", "mean_latency_ns")
+    raw_min = _get_val(obj, "min_latency_ns", "min_execution_latency_ns")
+    raw_max = _get_val(obj, "max_latency_ns", "max_execution_latency_ns")
+    raw_last = _get_val(obj, "last_latency_ns", "last_execution_latency_ns", "latency_ns")
+
+    # Fallback to microsecond equivalents if nanosecond metrics are omitted
+    if raw_avg is None:
+        avg_us = _get_val(obj, "avg_latency_us", "avg_execution_latency_us", "avg_latency")
+        if avg_us is not None:
+            try:
+                raw_avg = float(avg_us) * 1000.0
+            except (ValueError, TypeError):
+                pass
+    if raw_min is None:
+        min_us = _get_val(obj, "min_latency_us", "min_execution_latency_us", "min_latency")
+        if min_us is not None:
+            try:
+                raw_min = float(min_us) * 1000.0
+            except (ValueError, TypeError):
+                pass
+    if raw_max is None:
+        max_us = _get_val(obj, "max_latency_us", "max_execution_latency_us", "max_latency")
+        if max_us is not None:
+            try:
+                raw_max = float(max_us) * 1000.0
+            except (ValueError, TypeError):
+                pass
+    if raw_last is None:
+        last_us = _get_val(obj, "last_latency_us", "last_execution_latency_us", "latency_us", "latency")
+        if last_us is not None:
+            try:
+                raw_last = float(last_us) * 1000.0
+            except (ValueError, TypeError):
+                pass
+
+    trade_count = 0
+    if raw_count is not None:
+        try:
+            trade_count = max(0, int(raw_count))
+        except (ValueError, TypeError):
+            trade_count = 0
+
+    def _clean_lat(val: Any) -> Optional[float]:
+        if val is None:
+            return None
+        try:
+            f = float(val)
+        except (ValueError, TypeError):
+            return None
+        if math.isnan(f) or math.isinf(f) or f < 0:
+            return None
+        return f
+
+    avg_ns = _clean_lat(raw_avg)
+    min_ns = _clean_lat(raw_min)
+    max_ns = _clean_lat(raw_max)
+    last_ns = _clean_lat(raw_last)
+
+    # When no trades have been processed, latency metrics are unavailable (N/A)
+    if trade_count == 0:
+        avg_ns = None
+        min_ns = None
+        max_ns = None
+        last_ns = None
+
+    return {
+        "trade_count": trade_count,
+        "avg_latency_ns": avg_ns,
+        "min_latency_ns": min_ns,
+        "max_latency_ns": max_ns,
+        "last_latency_ns": last_ns,
+    }
 
 
 # ---------------------------------------------------------------------------
