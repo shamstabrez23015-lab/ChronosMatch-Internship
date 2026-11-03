@@ -70,7 +70,7 @@ Reuses the Week 1 ``Side`` convention:
 # ---------------------------------------------------------------------------
 # C-level and Python-level constants
 # ---------------------------------------------------------------------------
-from libc.math cimport round as c_round
+from libc.math cimport round as c_round, isnan as c_isnan, isinf as c_isinf
 from libc.stdlib cimport malloc, free
 
 DEF _SIDE_BUY  = 1
@@ -1111,7 +1111,7 @@ cdef class MatchingEngine:
                 f"Invalid side {side}: must be {_SIDE_BUY} (BUY) or {_SIDE_SELL} (SELL)"
             )
 
-        if price <= 0.0:
+        if price <= 0.0 or c_isnan(price) or c_isinf(price):
             raise ValueError(
                 f"Invalid price {price}: must be positive"
             )
@@ -1603,7 +1603,7 @@ cdef class MatchingEngine:
             raise ValueError(
                 f"Invalid side {side}: must be {_SIDE_BUY} (BUY) or {_SIDE_SELL} (SELL)"
             )
-        if price <= 0.0:
+        if price <= 0.0 or c_isnan(price) or c_isinf(price):
             raise ValueError(f"Invalid price {price}: must be positive")
         if quantity == 0:
             raise ValueError("Invalid quantity 0: must be positive")
