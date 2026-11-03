@@ -61,18 +61,25 @@ class AdapterStats:
     min_execution_latency_ns: int = 0
     max_execution_latency_ns: int = 0
     last_execution_latency_ns: int = 0
+    latency_samples_count: int = 0
     execution_latencies_ns: List[int] = field(default_factory=list)
 
     def record_latency(self, latency_ns: int) -> None:
         """Record an execution latency sample in nanoseconds."""
-        self.total_execution_latency_ns += latency_ns
-        self.last_execution_latency_ns = latency_ns
-        if self.min_execution_latency_ns == 0 or latency_ns < self.min_execution_latency_ns:
-            self.min_execution_latency_ns = latency_ns
-        if latency_ns > self.max_execution_latency_ns:
-            self.max_execution_latency_ns = latency_ns
+        lat = max(0, int(latency_ns))
+        self.total_execution_latency_ns += lat
+        self.last_execution_latency_ns = lat
+        if self.latency_samples_count == 0:
+            self.min_execution_latency_ns = lat
+            self.max_execution_latency_ns = lat
+        else:
+            if lat < self.min_execution_latency_ns:
+                self.min_execution_latency_ns = lat
+            if lat > self.max_execution_latency_ns:
+                self.max_execution_latency_ns = lat
+        self.latency_samples_count += 1
         if len(self.execution_latencies_ns) < 100_000:
-            self.execution_latencies_ns.append(latency_ns)
+            self.execution_latencies_ns.append(lat)
 
     @property
     def avg_execution_latency_ns(self) -> float:
@@ -150,6 +157,7 @@ class AdapterStats:
         self.min_execution_latency_ns = 0
         self.max_execution_latency_ns = 0
         self.last_execution_latency_ns = 0
+        self.latency_samples_count = 0
         self.execution_latencies_ns.clear()
 
 

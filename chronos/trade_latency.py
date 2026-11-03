@@ -221,7 +221,7 @@ class TradeLatencyTracker:
             self._min_latency_ns = lat
             self._max_latency_ns = lat
         else:
-            if lat < self._min_latency_ns or self._min_latency_ns == 0:
+            if lat < self._min_latency_ns:
                 self._min_latency_ns = lat
             if lat > self._max_latency_ns:
                 self._max_latency_ns = lat
