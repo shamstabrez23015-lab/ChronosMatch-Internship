@@ -14,7 +14,7 @@ from chronos.matching_engine import MatchingEngine
 from chronos.ring_buffer import MmapRingBuffer
 from chronos.adapter import OrderAdapter
 from chronos.consumer import ZeroCopyConsumer
-from chronos.dashboard import TerminalDashboard, _extract_order_id
+from chronos.dashboard import TerminalDashboard, _extract_order_id, detect_whale_order, WhaleOrderEvent
 
 
 class LiveFeedBridge:
@@ -133,6 +133,24 @@ class LiveFeedBridge:
                     if t_lat is None:
                         t_lat = lat_us
                     self.dashboard.record_trade_execution(latency_us=t_lat)
+
+        # ---- Whale order detection ----
+        if self.dashboard is not None and trades:
+            _raw_side = None
+            try:
+                if hasattr(raw_order, "side"):
+                    _raw_side = raw_order.side
+                elif isinstance(raw_order, (tuple, list)) and len(raw_order) >= 6:
+                    _raw_side = raw_order[5]
+            except Exception:
+                _raw_side = None
+            _whale = detect_whale_order(
+                order_id=order_id if order_id is not None else 0,
+                trades=trades,
+                side=_raw_side,
+            )
+            if _whale is not None and hasattr(self.dashboard, "record_whale_order"):
+                self.dashboard.record_whale_order(_whale)
 
     def sync_to_dashboard(self) -> None:
         """Synchronize engine order book state into the dashboard."""

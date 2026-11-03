@@ -3335,3 +3335,458 @@ class TestDashboardConfigTradeLatencyUnit:
         cfg = DashboardConfig()
         with pytest.raises((AttributeError, TypeError)):
             cfg.trade_latency_unit = "ns"  # type: ignore
+
+
+# ===========================================================================
+# Week 3, Day 4 -- Whale Order Detection
+# ===========================================================================
+
+from chronos.dashboard import (
+    SECTION_WHALE_ALERT,
+    LABEL_WHALE_LEVELS,
+    LABEL_WHALE_VOLUME,
+    LABEL_WHALE_ORDER_ID,
+    LABEL_WHALE_SIDE,
+    WHALE_MIN_PRICE_LEVELS,
+    WhaleOrderEvent,
+    detect_whale_order,
+    build_whale_alert_lines,
+)
+
+
+class FakeTradeResult:
+    """Minimal TradeResult stub that mimics MatchingEngine output."""
+
+    def __init__(self, price: float, qty: int) -> None:
+        self.price = price
+        self.executed_quantity = qty
+
+
+# ---------------------------------------------------------------------------
+# Section 29: detect_whale_order() -- pure function unit tests
+# ---------------------------------------------------------------------------
+
+class TestDetectWhaleOrder:
+    """Unit tests for the detect_whale_order() pure computation function."""
+
+    def test_empty_trades_returns_none(self):
+        assert detect_whale_order(order_id=1, trades=[]) is None
+
+    def test_none_trades_returns_none(self):
+        assert detect_whale_order(order_id=1, trades=None) is None
+
+    def test_single_trade_single_price_not_whale(self):
+        trades = [FakeTradeResult(100.0, 50)]
+        assert detect_whale_order(order_id=1, trades=trades) is None
+
+    def test_two_trades_same_price_not_whale(self):
+        trades = [FakeTradeResult(100.0, 50), FakeTradeResult(100.0, 30)]
+        assert detect_whale_order(order_id=1, trades=trades) is None
+
+    def test_two_trades_different_prices_is_whale(self):
+        trades = [FakeTradeResult(100.0, 50), FakeTradeResult(101.0, 30)]
+        result = detect_whale_order(order_id=1, trades=trades)
+        assert result is not None
+        assert result.price_levels_cleared == 2
+        assert result.is_whale is True
+
+    def test_three_price_levels_is_whale(self):
+        trades = [
+            FakeTradeResult(99.0, 10),
+            FakeTradeResult(100.0, 20),
+            FakeTradeResult(101.0, 30),
+        ]
+        result = detect_whale_order(order_id=42, trades=trades, side=2)
+        assert result is not None
+        assert result.price_levels_cleared == 3
+        assert result.order_id == 42
+        assert result.side == 2
+
+    def test_order_id_stored_on_event(self):
+        trades = [FakeTradeResult(10.0, 5), FakeTradeResult(11.0, 5)]
+        result = detect_whale_order(order_id=77, trades=trades)
+        assert result is not None
+        assert result.order_id == 77
+
+    def test_side_stored_on_event(self):
+        trades = [FakeTradeResult(10.0, 5), FakeTradeResult(11.0, 5)]
+        result = detect_whale_order(order_id=1, trades=trades, side=1)
+        assert result is not None
+        assert result.side == 1
+
+    def test_side_defaults_to_zero_when_omitted(self):
+        trades = [FakeTradeResult(10.0, 5), FakeTradeResult(11.0, 5)]
+        result = detect_whale_order(order_id=1, trades=trades)
+        assert result is not None
+        assert result.side == 0
+
+    def test_volume_aggregated_correctly(self):
+        trades = [FakeTradeResult(100.0, 50), FakeTradeResult(101.0, 70)]
+        result = detect_whale_order(order_id=5, trades=trades)
+        assert result is not None
+        assert result.volume_matched == 120
+        assert result.total_quantity == 120
+
+    def test_prices_list_contains_distinct_prices(self):
+        trades = [
+            FakeTradeResult(100.0, 50),
+            FakeTradeResult(100.0, 20),
+            FakeTradeResult(101.0, 30),
+        ]
+        result = detect_whale_order(order_id=1, trades=trades)
+        assert result is not None
+        assert len(result.prices) == 2
+        assert 100.0 in result.prices
+        assert 101.0 in result.prices
+
+    def test_bad_trade_attribute_skipped_gracefully(self):
+        """Trades that lack expected attributes should be skipped, not raise."""
+        bad = object()
+        good1 = FakeTradeResult(100.0, 10)
+        good2 = FakeTradeResult(101.0, 10)
+        result = detect_whale_order(order_id=1, trades=[bad, good1, good2])
+        assert result is not None
+        assert result.price_levels_cleared == 2
+
+    def test_single_price_repeated_many_times_not_whale(self):
+        trades = [FakeTradeResult(50.0, 10) for _ in range(10)]
+        assert detect_whale_order(order_id=1, trades=trades) is None
+
+
+# ---------------------------------------------------------------------------
+# Section 30: WhaleOrderEvent dataclass unit tests
+# ---------------------------------------------------------------------------
+
+class TestWhaleOrderEvent:
+    """Tests for the WhaleOrderEvent dataclass and its is_whale property."""
+
+    def test_is_whale_true_when_levels_eq_min(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=100,
+            price_levels_cleared=WHALE_MIN_PRICE_LEVELS,
+            prices=[100.0, 101.0], volume_matched=100,
+        )
+        assert w.is_whale is True
+
+    def test_is_whale_false_when_levels_lt_min(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=100,
+            price_levels_cleared=1,
+            prices=[100.0], volume_matched=100,
+        )
+        assert w.is_whale is False
+
+    def test_is_whale_true_for_three_levels(self):
+        w = WhaleOrderEvent(
+            order_id=2, side=2, total_quantity=300,
+            price_levels_cleared=3,
+            prices=[99.0, 100.0, 101.0], volume_matched=300,
+        )
+        assert w.is_whale is True
+
+    def test_timestamp_defaults_to_none(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=0, total_quantity=0,
+            price_levels_cleared=2, prices=[1.0, 2.0], volume_matched=0,
+        )
+        assert w.timestamp_ns is None
+
+    def test_timestamp_can_be_set(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=0, total_quantity=0,
+            price_levels_cleared=2, prices=[1.0, 2.0], volume_matched=0,
+            timestamp_ns=123456789,
+        )
+        assert w.timestamp_ns == 123456789
+
+
+# ---------------------------------------------------------------------------
+# Section 31: build_whale_alert_lines() layout function tests
+# ---------------------------------------------------------------------------
+
+class TestBuildWhaleAlertLines:
+    """Tests for the build_whale_alert_lines() pure layout function."""
+
+    def test_no_whale_returns_empty_list(self):
+        assert build_whale_alert_lines(width=80, whale=None) == []
+
+    def test_section_header_present(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=100,
+            price_levels_cleared=2, prices=[100.0, 101.0], volume_matched=100,
+        )
+        lines = build_whale_alert_lines(width=80, whale=w)
+        text = "\n".join(lines)
+        assert SECTION_WHALE_ALERT in text
+
+    def test_price_levels_count_in_output(self):
+        w = WhaleOrderEvent(
+            order_id=9, side=2, total_quantity=50,
+            price_levels_cleared=3, prices=[99.0, 100.0, 101.0], volume_matched=50,
+        )
+        lines = build_whale_alert_lines(width=80, whale=w)
+        text = "\n".join(lines)
+        assert "3" in text
+
+    def test_swept_prices_in_output(self):
+        w = WhaleOrderEvent(
+            order_id=7, side=1, total_quantity=200,
+            price_levels_cleared=2, prices=[150.25, 151.75], volume_matched=200,
+        )
+        lines = build_whale_alert_lines(width=80, whale=w)
+        text = "\n".join(lines)
+        assert "150.25" in text
+        assert "151.75" in text
+
+    def test_buy_side_label_in_output(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=100,
+            price_levels_cleared=2, prices=[10.0, 11.0], volume_matched=100,
+        )
+        lines = build_whale_alert_lines(width=80, whale=w)
+        text = "\n".join(lines)
+        assert "BUY" in text
+
+    def test_sell_side_label_in_output(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=2, total_quantity=100,
+            price_levels_cleared=2, prices=[10.0, 9.0], volume_matched=100,
+        )
+        lines = build_whale_alert_lines(width=80, whale=w)
+        text = "\n".join(lines)
+        assert "SELL" in text
+
+    def test_unknown_side_shows_question_mark(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=0, total_quantity=0,
+            price_levels_cleared=2, prices=[1.0, 2.0], volume_matched=0,
+        )
+        lines = build_whale_alert_lines(width=80, whale=w)
+        text = "\n".join(lines)
+        assert "?" in text
+
+    def test_more_than_five_prices_truncated(self):
+        prices = [float(i) for i in range(10)]
+        w = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=0,
+            price_levels_cleared=len(prices), prices=prices, volume_matched=0,
+        )
+        lines = build_whale_alert_lines(width=80, whale=w)
+        text = "\n".join(lines)
+        assert "..." in text
+
+    def test_returns_list_of_strings(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=0,
+            price_levels_cleared=2, prices=[1.0, 2.0], volume_matched=0,
+        )
+        lines = build_whale_alert_lines(width=80, whale=w)
+        assert isinstance(lines, list)
+        assert all(isinstance(line, str) for line in lines)
+
+    def test_width_affects_divider_length(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=0,
+            price_levels_cleared=2, prices=[1.0, 2.0], volume_matched=0,
+        )
+        lines_80 = build_whale_alert_lines(width=80, whale=w)
+        lines_60 = build_whale_alert_lines(width=60, whale=w)
+        dividers_80 = [l for l in lines_80 if l.startswith("-")]
+        dividers_60 = [l for l in lines_60 if l.startswith("-")]
+        assert len(dividers_80[0]) == 80
+        assert len(dividers_60[0]) == 60
+
+
+# ---------------------------------------------------------------------------
+# Section 32: TerminalDashboard whale state management tests
+# ---------------------------------------------------------------------------
+
+class TestTerminalDashboardWhaleState:
+    """Tests for whale state management methods in TerminalDashboard."""
+
+    def _make_dashboard(self) -> TerminalDashboard:
+        return TerminalDashboard(use_sample_data=False)
+
+    def _make_whale(self, order_id: int = 1, levels: int = 2) -> WhaleOrderEvent:
+        prices = [float(100 + i) for i in range(levels)]
+        return WhaleOrderEvent(
+            order_id=order_id, side=1, total_quantity=100,
+            price_levels_cleared=levels, prices=prices, volume_matched=100,
+        )
+
+    def test_initial_last_whale_is_none(self):
+        d = self._make_dashboard()
+        assert d.get_last_whale_event() is None
+
+    def test_record_whale_stores_event(self):
+        d = self._make_dashboard()
+        w = self._make_whale()
+        d.record_whale_order(w)
+        assert d.get_last_whale_event() is w
+
+    def test_record_whale_replaces_previous_last(self):
+        d = self._make_dashboard()
+        w1 = self._make_whale(order_id=1)
+        w2 = self._make_whale(order_id=2)
+        d.record_whale_order(w1)
+        d.record_whale_order(w2)
+        assert d.get_last_whale_event() is w2
+
+    def test_clear_whale_history_resets_last(self):
+        d = self._make_dashboard()
+        d.record_whale_order(self._make_whale())
+        d.clear_whale_history()
+        assert d.get_last_whale_event() is None
+
+    def test_clear_whale_history_empties_history_list(self):
+        d = self._make_dashboard()
+        for i in range(5):
+            d.record_whale_order(self._make_whale(order_id=i))
+        d.clear_whale_history()
+        assert len(d._whale_history) == 0
+
+    def test_whale_history_bounded_by_max(self):
+        d = self._make_dashboard()
+        max_h = d._max_whale_history
+        for i in range(max_h + 5):
+            d.record_whale_order(self._make_whale(order_id=i))
+        assert len(d._whale_history) == max_h
+
+    def test_whale_history_keeps_most_recent(self):
+        d = self._make_dashboard()
+        for i in range(15):
+            d.record_whale_order(self._make_whale(order_id=i))
+        ids = [w.order_id for w in d._whale_history]
+        assert 14 in ids
+        assert 0 not in ids
+
+
+# ---------------------------------------------------------------------------
+# Section 33: Whale alert integration with get_display_lines() and render()
+# ---------------------------------------------------------------------------
+
+class TestWhaleDisplayIntegration:
+    """Tests that whale alert appears correctly in get_display_lines() and render()."""
+
+    def _make_whale(self, order_id: int = 55) -> WhaleOrderEvent:
+        return WhaleOrderEvent(
+            order_id=order_id, side=2, total_quantity=300,
+            price_levels_cleared=3, prices=[200.0, 201.0, 202.0], volume_matched=300,
+        )
+
+    def test_whale_alert_in_get_display_lines_when_present(self):
+        d = TerminalDashboard(use_sample_data=False)
+        d.record_whale_order(self._make_whale())
+        lines = d.get_display_lines(rows=60, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_WHALE_ALERT in text
+
+    def test_no_whale_alert_in_get_display_lines_when_absent(self):
+        d = TerminalDashboard(use_sample_data=False)
+        lines = d.get_display_lines(rows=60, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_WHALE_ALERT not in text
+
+    def test_whale_cleared_removes_alert_from_display(self):
+        d = TerminalDashboard(use_sample_data=False)
+        d.record_whale_order(self._make_whale())
+        d.clear_whale_history()
+        lines = d.get_display_lines(rows=60, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_WHALE_ALERT not in text
+
+    def test_whale_alert_in_render_when_present(self):
+        d = TerminalDashboard(use_sample_data=False)
+        d.record_whale_order(self._make_whale(order_id=77))
+        win = MockCursesWindow(rows=70, cols=100)
+        d.render(win)
+        rendered = " ".join(c[2] for c in win.addstr_calls if len(c) >= 3)
+        assert SECTION_WHALE_ALERT in rendered
+
+    def test_no_whale_alert_in_render_when_absent(self):
+        d = TerminalDashboard(use_sample_data=False)
+        win = MockCursesWindow(rows=70, cols=100)
+        d.render(win)
+        rendered = " ".join(c[2] for c in win.addstr_calls if len(c) >= 3)
+        assert SECTION_WHALE_ALERT not in rendered
+
+    def test_whale_prices_in_render_output(self):
+        d = TerminalDashboard(use_sample_data=False)
+        d.record_whale_order(self._make_whale())
+        win = MockCursesWindow(rows=70, cols=100)
+        d.render(win)
+        rendered = " ".join(c[2] for c in win.addstr_calls if len(c) >= 3)
+        assert "200.00" in rendered
+        assert "201.00" in rendered
+
+    def test_normal_dashboard_sections_preserved_with_whale(self):
+        """Existing dashboard content must not be removed when a whale is shown."""
+        d = TerminalDashboard(use_sample_data=False)
+        d.record_whale_order(self._make_whale())
+        lines = d.get_display_lines(rows=60, cols=100)
+        text = "\n".join(lines)
+        from chronos.dashboard import SECTION_PERFORMANCE, SECTION_TRADE_EXECUTION
+        assert SECTION_PERFORMANCE in text
+        assert SECTION_TRADE_EXECUTION in text
+        assert SECTION_WHALE_ALERT in text
+
+
+# ---------------------------------------------------------------------------
+# Section 34: Integration with real MatchingEngine
+# ---------------------------------------------------------------------------
+
+class TestWhaleWithRealMatchingEngine:
+    """Integration tests using the real MatchingEngine to produce trade lists."""
+
+    def _get_engine(self):
+        try:
+            from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+            return MatchingEngine(), SIDE_BUY, SIDE_SELL
+        except Exception:
+            import pytest
+            pytest.skip("MatchingEngine not available")
+
+    def test_non_executing_order_no_whale(self):
+        engine, SIDE_BUY, SIDE_SELL = self._get_engine()
+        engine.submit_order(1, SIDE_BUY, 100.0, 100, 1000)
+        trades = engine.match_order(2, SIDE_SELL, 105.0, 50, 2000)
+        result = detect_whale_order(order_id=2, trades=trades or [])
+        assert result is None
+
+    def test_single_price_level_no_whale(self):
+        engine, SIDE_BUY, SIDE_SELL = self._get_engine()
+        engine.submit_order(1, SIDE_BUY, 100.0, 100, 1000)
+        engine.submit_order(2, SIDE_BUY, 100.0, 50, 1100)
+        trades = engine.match_order(3, SIDE_SELL, 100.0, 150, 2000)
+        if trades is None:
+            trades = []
+        distinct = set(t.execution_price for t in trades)
+        result = detect_whale_order(order_id=3, trades=trades)
+        if len(distinct) < 2:
+            assert result is None
+
+    def test_multi_level_sweep_is_whale(self):
+        engine, SIDE_BUY, SIDE_SELL = self._get_engine()
+        engine.submit_order(1, SIDE_BUY, 101.0, 50, 1000)
+        engine.submit_order(2, SIDE_BUY, 100.0, 50, 1100)
+        trades = engine.match_order(3, SIDE_SELL, 99.0, 100, 2000)
+        assert trades is not None and len(trades) >= 2
+        distinct = set(t.execution_price for t in trades)
+        if len(distinct) >= 2:
+            result = detect_whale_order(order_id=3, trades=trades, side=SIDE_SELL)
+            assert result is not None
+            assert result.is_whale is True
+            assert result.price_levels_cleared >= 2
+
+    def test_whale_event_has_correct_order_id(self):
+        engine, SIDE_BUY, SIDE_SELL = self._get_engine()
+        engine.submit_order(10, SIDE_BUY, 200.0, 50, 1000)
+        engine.submit_order(11, SIDE_BUY, 199.0, 50, 1100)
+        trades = engine.match_order(99, SIDE_SELL, 198.0, 100, 2000)
+        if trades is None:
+            trades = []
+        distinct = set(t.execution_price for t in trades)
+        if len(distinct) >= 2:
+            result = detect_whale_order(order_id=99, trades=trades)
+            assert result is not None
+            assert result.order_id == 99

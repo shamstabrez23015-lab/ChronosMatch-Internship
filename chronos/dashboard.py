@@ -966,6 +966,141 @@ def extract_trade_latency_metrics(tracker: Any) -> Optional[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Whale Order Detection
+# ---------------------------------------------------------------------------
+
+WHALE_MIN_PRICE_LEVELS: int = 2  # Minimum distinct price levels swept for whale classification
+
+SECTION_WHALE_ALERT: str = "\u26a1 WHALE ORDER DETECTED"
+LABEL_WHALE_LEVELS: str = "Price Levels Swept"
+LABEL_WHALE_VOLUME: str = "Volume Matched"
+LABEL_WHALE_ORDER_ID: str = "Order ID"
+LABEL_WHALE_SIDE: str = "Side"
+
+
+@dataclass
+class WhaleOrderEvent:
+    """Represents a detected whale order that swept multiple price levels.
+
+    A whale order is defined as a single aggressive order that executes
+    against two or more distinct price levels in the order book.
+    No arbitrary size threshold is used -- detection is based solely on
+    multi-level execution.
+
+    Fields:
+        order_id: ID of the aggressor order.
+        side: Aggressor side (1=BUY, 2=SELL, 0=unknown).
+        total_quantity: Sum of all executed quantities.
+        price_levels_cleared: Number of distinct price levels swept.
+        prices: Ordered list of distinct prices at which trades executed.
+        volume_matched: Total executed volume.
+        timestamp_ns: Optional nanosecond timestamp of detection.
+    """
+
+    order_id: int
+    side: int
+    total_quantity: int
+    price_levels_cleared: int
+    prices: List[float]
+    volume_matched: int
+    timestamp_ns: Optional[int] = None
+
+    @property
+    def is_whale(self) -> bool:
+        """Return True when this event meets the multi-level whale threshold."""
+        return self.price_levels_cleared >= WHALE_MIN_PRICE_LEVELS
+
+
+def detect_whale_order(
+    order_id: int,
+    trades: Optional[List[Any]],
+    side: Optional[int] = None,
+) -> Optional[WhaleOrderEvent]:
+    """Detect if an order executed across multiple price levels (whale sweep).
+
+    Detection is based exclusively on whether trades from a single order span
+    two or more distinct price levels.  No order-size threshold is applied.
+
+    Args:
+        order_id: ID of the order that was submitted.
+        trades: List of TradeResult objects from the matching engine.
+                Each item must expose a ``price`` attribute (or index 2) and
+                an ``executed_quantity`` attribute (or index 3).
+        side: Optional aggressor side (1=BUY, 2=SELL); stored for display only.
+
+    Returns:
+        A :class:`WhaleOrderEvent` if 2+ distinct price levels were swept,
+        otherwise ``None``.
+    """
+    if not trades:
+        return None
+
+    prices: List[float] = []
+    total_volume: int = 0
+    for t in trades:
+        try:
+            p = float(t.price) if hasattr(t, "price") else float(t.execution_price) if hasattr(t, "execution_price") else float(t[2])
+            q = int(t.executed_quantity) if hasattr(t, "executed_quantity") else int(t[3])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            continue
+        prices.append(p)
+        total_volume += q
+
+    # Deduplicate while preserving execution order
+    seen: dict = {}
+    for p in prices:
+        seen[p] = None
+    distinct_prices = list(seen.keys())
+
+    if len(distinct_prices) < WHALE_MIN_PRICE_LEVELS:
+        return None
+
+    return WhaleOrderEvent(
+        order_id=order_id,
+        side=side if side is not None else 0,
+        total_quantity=total_volume,
+        price_levels_cleared=len(distinct_prices),
+        prices=distinct_prices,
+        volume_matched=total_volume,
+    )
+
+
+def build_whale_alert_lines(
+    width: int,
+    whale: Optional[WhaleOrderEvent] = None,
+) -> List[str]:
+    """Return whale order alert section lines, or an empty list if no whale.
+
+    Args:
+        width: Available content width in characters.
+        whale: A detected whale order event, or None.
+
+    Returns:
+        List of formatted strings to display the alert, or [] when *whale* is None.
+    """
+    if whale is None:
+        return []
+
+    divider = "-" * width
+    col_w = max(width - 4, 10)
+    side_str = "BUY" if whale.side == 1 else "SELL" if whale.side == 2 else "?"
+    levels_str = str(whale.price_levels_cleared)
+    prices_str = " -> ".join(f"{p:.2f}" for p in whale.prices[:5])
+    if len(whale.prices) > 5:
+        prices_str += " ..."
+
+    return [
+        f"  {SECTION_WHALE_ALERT}",
+        divider,
+        f"  {LABEL_WHALE_ORDER_ID:<{col_w - 10}} {whale.order_id:>8}",
+        f"  {LABEL_WHALE_SIDE:<{col_w - 10}} {side_str:>8}",
+        f"  {LABEL_WHALE_LEVELS:<{col_w - 10}} {levels_str:>8}",
+        f"  {LABEL_WHALE_VOLUME:<{col_w - 10}} {whale.volume_matched:>8,}",
+        f"  Swept: {prices_str}",
+        divider,
+    ]
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -1328,6 +1463,11 @@ class TerminalDashboard:
         _MAX_TRADE_LATENCY_SAMPLES = 1000
         self._max_trade_latency_samples: int = _MAX_TRADE_LATENCY_SAMPLES
 
+        # Whale order detection state
+        self._last_whale_event: Optional[WhaleOrderEvent] = None
+        self._whale_history: List[WhaleOrderEvent] = []
+        self._max_whale_history: int = 10
+
     @property
     def orders_processed(self) -> int:
         """Return the current number of processed orders."""
@@ -1607,6 +1747,32 @@ class TerminalDashboard:
             )
             return format_trade_latency(val, unit=self._trade_latency_unit, decimals=decimals)
         return NO_SAMPLE_LATENCY
+
+    # ------------------------------------------------------------------
+    # Whale order detection state management
+    # ------------------------------------------------------------------
+
+    def record_whale_order(self, whale: "WhaleOrderEvent") -> None:
+        """Record a detected whale order event for dashboard display.
+
+        Keeps the most recent event plus a bounded history ring.
+
+        Args:
+            whale: The whale order event to record.
+        """
+        self._last_whale_event = whale
+        if len(self._whale_history) >= self._max_whale_history:
+            self._whale_history.pop(0)
+        self._whale_history.append(whale)
+
+    def get_last_whale_event(self) -> "Optional[WhaleOrderEvent]":
+        """Return the most recently detected whale order event, or None."""
+        return self._last_whale_event
+
+    def clear_whale_history(self) -> None:
+        """Clear the whale order tracking state (last event and full history)."""
+        self._last_whale_event = None
+        self._whale_history.clear()
 
     def get_trade_latency_min_display(self, decimals: int = 1) -> str:
         """Return formatted minimum trade execution latency for display."""
@@ -1959,6 +2125,10 @@ class TerminalDashboard:
             unit=t_unit,
         )
         lines.append("")
+        whale_lines = build_whale_alert_lines(width, whale=self._last_whale_event)
+        if whale_lines:
+            lines += whale_lines
+            lines.append("")
         lines += build_footer_lines(width)
         return lines
 
@@ -2298,6 +2468,20 @@ class TerminalDashboard:
         put(f"  {lbl_trade_max:<{col_w - 10}} {trade_lat_max_str:>8}", attrs["label"])
         put(divider, attrs["border"])
         blank()
+
+        # ---- Whale Order Alert ----
+        _whale = self._last_whale_event
+        if _whale is not None:
+            _whale_lines = build_whale_alert_lines(width, whale=_whale)
+            for _wl in _whale_lines:
+                _stripped = _wl.strip()
+                if _stripped.startswith("\u26a1"):
+                    put(_wl, attrs["quit"] | (curses.A_BOLD if curses is not None else 0))
+                elif _stripped.startswith("-") or _stripped.startswith("="):
+                    put(_wl, attrs["border"])
+                else:
+                    put(_wl, attrs["value"])
+            blank()
 
         # ---- Footer ----
         if y + 2 > max_y:
