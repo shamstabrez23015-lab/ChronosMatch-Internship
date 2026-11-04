@@ -4126,3 +4126,499 @@ class TestDay10PositionalSideArgumentDispatchAndCascadingResiduals:
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# 70. Week 3 Day 5 — Partial Order Matching, Multi-Level Fills & Book Consistency
+# ---------------------------------------------------------------------------
+class TestWeek3Day5PartialMatchingBuyAndSell:
+    """Verifies BUY and SELL partial order matching mechanics and boundary states."""
+
+    def test_partial_fill_buy_taker_larger_than_sell_maker(self):
+        """Incoming BUY taker quantity > resting SELL maker: maker filled, residual BUY rests."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        # Resting maker: SELL 40 @ 100.00
+        maker = engine.submit_order(1, SIDE_SELL, 100.00, 40, timestamp_ns=1000)
+        assert engine.ask_count() == 1
+        assert engine.bid_count() == 0
+
+        # Incoming taker: BUY 100 @ 100.00
+        trades = engine.match_order(2, SIDE_BUY, 100.00, 100, timestamp_ns=2000)
+
+        assert len(trades) == 1
+        t = trades[0]
+        assert t.buy_order_id == 2
+        assert t.sell_order_id == 1
+        assert t.executed_quantity == 40
+        assert t.execution_price == 100.00
+        assert t.execution_price_cents == 10000
+        assert t.buy_remaining_quantity == 60
+        assert t.sell_remaining_quantity == 0
+        assert not t.is_full_fill
+        assert t.is_partial_fill
+
+        # Resting SELL completely consumed and removed
+        assert engine.ask_count() == 0
+
+        # Residual 60 shares of BUY rest in bids
+        assert engine.bid_count() == 1
+        best_bid = engine.get_best_bid()
+        assert best_bid.order_id == 2
+        assert best_bid.price == 100.00
+        assert best_bid.quantity == 100
+        assert best_bid.remaining_quantity == 60
+        assert best_bid.filled_quantity == 40
+        assert not best_bid.is_filled
+        assert best_bid.is_partially_filled
+        assert best_bid.timestamp_ns == 2000
+
+    def test_partial_fill_sell_taker_larger_than_buy_maker(self):
+        """Incoming SELL taker quantity > resting BUY maker: maker filled, residual SELL rests."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        # Resting maker: BUY 30 @ 50.00
+        maker = engine.submit_order(10, SIDE_BUY, 50.00, 30, timestamp_ns=100)
+        assert engine.bid_count() == 1
+        assert engine.ask_count() == 0
+
+        # Incoming taker: SELL 80 @ 50.00
+        trades = engine.match_order(20, SIDE_SELL, 50.00, 80, timestamp_ns=200)
+
+        assert len(trades) == 1
+        t = trades[0]
+        assert t.buy_order_id == 10
+        assert t.sell_order_id == 20
+        assert t.executed_quantity == 30
+        assert t.execution_price == 50.00
+        assert t.buy_remaining_quantity == 0
+        assert t.sell_remaining_quantity == 50
+        assert not t.is_full_fill
+        assert t.is_partial_fill
+
+        # Resting BUY consumed and removed
+        assert engine.bid_count() == 0
+
+        # Residual 50 shares of SELL rest in asks
+        assert engine.ask_count() == 1
+        best_ask = engine.get_best_ask()
+        assert best_ask.order_id == 20
+        assert best_ask.price == 50.00
+        assert best_ask.quantity == 80
+        assert best_ask.remaining_quantity == 50
+        assert best_ask.filled_quantity == 30
+        assert not best_ask.is_filled
+        assert best_ask.is_partially_filled
+
+    def test_partial_fill_buy_taker_smaller_than_sell_maker(self):
+        """Incoming BUY taker quantity < resting SELL maker: taker fully filled, maker remains with reduced qty."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        # Resting maker: SELL 100 @ 200.00
+        engine.submit_order(1, SIDE_SELL, 200.00, 100, timestamp_ns=100)
+
+        # Incoming taker: BUY 30 @ 200.00
+        trades = engine.match_order(2, SIDE_BUY, 200.00, 30, timestamp_ns=200)
+
+        assert len(trades) == 1
+        t = trades[0]
+        assert t.executed_quantity == 30
+        assert t.buy_remaining_quantity == 0
+        assert t.sell_remaining_quantity == 70
+        assert not t.is_full_fill
+        assert t.is_partial_fill
+
+        # BUY taker fully filled, does not enter bids
+        assert engine.bid_count() == 0
+
+        # Maker SELL remains in asks with remaining_quantity = 70
+        assert engine.ask_count() == 1
+        maker_order = engine.get_best_ask()
+        assert maker_order.order_id == 1
+        assert maker_order.quantity == 100
+        assert maker_order.remaining_quantity == 70
+        assert maker_order.filled_quantity == 30
+        assert maker_order.is_partially_filled
+
+    def test_partial_fill_sell_taker_smaller_than_buy_maker(self):
+        """Incoming SELL taker quantity < resting BUY maker: taker fully filled, maker remains with reduced qty."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        # Resting maker: BUY 150 @ 80.00
+        engine.submit_order(1, SIDE_BUY, 80.00, 150, timestamp_ns=100)
+
+        # Incoming taker: SELL 40 @ 80.00
+        trades = engine.match_order(2, SIDE_SELL, 80.00, 40, timestamp_ns=200)
+
+        assert len(trades) == 1
+        t = trades[0]
+        assert t.executed_quantity == 40
+        assert t.buy_remaining_quantity == 110
+        assert t.sell_remaining_quantity == 0
+        assert not t.is_full_fill
+        assert t.is_partial_fill
+
+        # SELL taker fully filled, does not enter asks
+        assert engine.ask_count() == 0
+
+        # Maker BUY remains in bids with remaining_quantity = 110
+        assert engine.bid_count() == 1
+        maker_order = engine.get_best_bid()
+        assert maker_order.order_id == 1
+        assert maker_order.quantity == 150
+        assert maker_order.remaining_quantity == 110
+        assert maker_order.filled_quantity == 40
+        assert maker_order.is_partially_filled
+
+    def test_exact_quantity_full_fills_both_sides(self):
+        """Exact quantity matching fully fills both sides and leaves book clean."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        engine.submit_order(1, SIDE_SELL, 120.00, 75, timestamp_ns=100)
+        trades = engine.match_order(2, SIDE_BUY, 120.00, 75, timestamp_ns=200)
+
+        assert len(trades) == 1
+        t = trades[0]
+        assert t.executed_quantity == 75
+        assert t.buy_remaining_quantity == 0
+        assert t.sell_remaining_quantity == 0
+        assert t.is_full_fill
+        assert not t.is_partial_fill
+
+        assert engine.bid_count() == 0
+        assert engine.ask_count() == 0
+        assert engine.get_best_bid() is None
+        assert engine.get_best_ask() is None
+
+    def test_maker_pricing_in_partial_fills(self):
+        """Partial fill execution price is strictly the resting maker price."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        # Maker is SELL @ 99.50, Taker BUY @ 102.00
+        engine.submit_order(1, SIDE_SELL, 99.50, 50, timestamp_ns=100)
+        t_buy = engine.match_order(2, SIDE_BUY, 102.00, 30, timestamp_ns=200)[0]
+        assert t_buy.execution_price == 99.50
+        assert t_buy.execution_price_cents == 9950
+
+        # Clear and test opposite side: Maker is BUY @ 105.00, Taker SELL @ 101.00
+        engine.clear()
+        engine.submit_order(3, SIDE_BUY, 105.00, 50, timestamp_ns=300)
+        t_sell = engine.match_order(4, SIDE_SELL, 101.00, 30, timestamp_ns=400)[0]
+        assert t_sell.execution_price == 105.00
+        assert t_sell.execution_price_cents == 10500
+
+
+class TestWeek3Day5MultiLevelPartialMatching:
+    """Verifies partial fills across multiple price levels and book boundaries."""
+
+    def test_buy_sweeps_three_increasing_sell_levels_with_partial_fill_on_last(self):
+        """Incoming BUY sweeps across 3 increasing SELL levels with partial fill at deepest level."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        engine.submit_order(1, SIDE_SELL, 100.00, 10, 1000)
+        engine.submit_order(2, SIDE_SELL, 101.00, 20, 2000)
+        engine.submit_order(3, SIDE_SELL, 102.00, 30, 3000)
+
+        # Incoming BUY for 45 @ 102.00: sweeps 10 @ 100.00, 20 @ 101.00, and 15 @ 102.00
+        trades = engine.match_order(100, SIDE_BUY, 102.00, 45, 4000)
+
+        assert len(trades) == 3
+        assert [t.sell_order_id for t in trades] == [1, 2, 3]
+        assert [t.executed_quantity for t in trades] == [10, 20, 15]
+        assert [t.execution_price for t in trades] == [100.00, 101.00, 102.00]
+        assert trades[0].buy_remaining_quantity == 35
+        assert trades[1].buy_remaining_quantity == 15
+        assert trades[2].buy_remaining_quantity == 0
+        assert trades[2].sell_remaining_quantity == 15
+
+        # Resting book state: Order 1 & 2 fully removed; Order 3 has 15 shares left
+        assert engine.bid_count() == 0
+        assert engine.ask_count() == 1
+        best_ask = engine.get_best_ask()
+        assert best_ask.order_id == 3
+        assert best_ask.price == 102.00
+        assert best_ask.remaining_quantity == 15
+        assert best_ask.filled_quantity == 15
+
+    def test_sell_sweeps_three_decreasing_buy_levels_with_partial_fill_on_last(self):
+        """Incoming SELL sweeps across 3 decreasing BUY levels with partial fill at deepest level."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        engine.submit_order(1, SIDE_BUY, 105.00, 15, 1000)
+        engine.submit_order(2, SIDE_BUY, 103.00, 25, 2000)
+        engine.submit_order(3, SIDE_BUY, 100.00, 40, 3000)
+
+        # Incoming SELL for 65 @ 99.00: sweeps 15 @ 105.00, 25 @ 103.00, and 25 @ 100.00
+        trades = engine.match_order(200, SIDE_SELL, 99.00, 65, 4000)
+
+        assert len(trades) == 3
+        assert [t.buy_order_id for t in trades] == [1, 2, 3]
+        assert [t.executed_quantity for t in trades] == [15, 25, 25]
+        assert [t.execution_price for t in trades] == [105.00, 103.00, 100.00]
+        assert trades[-1].sell_remaining_quantity == 0
+        assert trades[-1].buy_remaining_quantity == 15
+
+        # Resting book state: Order 1 & 2 fully removed; Order 3 has 15 shares left
+        assert engine.ask_count() == 0
+        assert engine.bid_count() == 1
+        best_bid = engine.get_best_bid()
+        assert best_bid.order_id == 3
+        assert best_bid.price == 100.00
+        assert best_bid.remaining_quantity == 15
+        assert best_bid.filled_quantity == 25
+
+    def test_multi_level_sweep_exhausts_book_and_leaves_residual_resting(self):
+        """Incoming BUY exhausts all asks across levels and rests remaining quantity in bids."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        engine.submit_order(1, SIDE_SELL, 50.00, 10, 100)
+        engine.submit_order(2, SIDE_SELL, 51.00, 20, 200)
+
+        # Incoming BUY for 50 @ 55.00: fills 10 @ 50.00, 20 @ 51.00; residual 20 rests in bids @ 55.00
+        trades = engine.match_order(99, SIDE_BUY, 55.00, 50, 300)
+
+        assert len(trades) == 2
+        assert sum(t.executed_quantity for t in trades) == 30
+        assert trades[-1].buy_remaining_quantity == 20
+
+        # Asks completely empty
+        assert engine.ask_count() == 0
+        assert engine.get_best_ask() is None
+
+        # Residual rests in bids
+        assert engine.bid_count() == 1
+        best_bid = engine.get_best_bid()
+        assert best_bid.order_id == 99
+        assert best_bid.price == 55.00
+        assert best_bid.quantity == 50
+        assert best_bid.remaining_quantity == 20
+        assert best_bid.filled_quantity == 30
+
+        # Subsequent matching against residual
+        trades2 = engine.match_order(100, SIDE_SELL, 55.00, 20, 400)
+        assert len(trades2) == 1
+        assert trades2[0].executed_quantity == 20
+        assert trades2[0].execution_price == 55.00
+        assert engine.bid_count() == 0
+        assert engine.ask_count() == 0
+
+    def test_multi_level_sweep_stops_at_limit_price_and_leaves_residual_resting(self):
+        """Incoming BUY limit price stops sweep before next ask; residual rests at limit price."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        engine.submit_order(1, SIDE_SELL, 50.00, 10, 100)
+        engine.submit_order(2, SIDE_SELL, 52.00, 20, 200)
+
+        # Incoming BUY for 25 @ 51.00: matches 10 @ 50.00, cannot cross 52.00, rests 15 @ 51.00
+        trades = engine.match_order(50, SIDE_BUY, 51.00, 25, 300)
+
+        assert len(trades) == 1
+        assert trades[0].executed_quantity == 10
+        assert trades[0].execution_price == 50.00
+
+        # Book contains residual BUY and untouched SELL 2
+        assert engine.bid_count() == 1
+        assert engine.ask_count() == 1
+        assert engine.get_best_bid_price() == 51.00
+        assert engine.get_best_bid_quantity() == 15
+        assert engine.get_best_ask_price() == 52.00
+        assert engine.get_best_ask_quantity() == 20
+        assert engine.get_spread() == 1.00
+
+
+class TestWeek3Day5PriceTimePriorityAndResidualFIFO:
+    """Verifies that partial fills preserve FIFO queue order and Price-Time priority."""
+
+    def test_partially_filled_resting_order_maintains_head_of_line_fifo_priority(self):
+        """A resting maker order that is repeatedly partially filled retains its FIFO priority."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        # Three resting BUY orders at 100.00
+        engine.submit_order(1, SIDE_BUY, 100.00, 50, timestamp_ns=100)
+        engine.submit_order(2, SIDE_BUY, 100.00, 30, timestamp_ns=200)
+        engine.submit_order(3, SIDE_BUY, 100.00, 20, timestamp_ns=300)
+
+        # Taker SELL 1: 20 shares -> Order 1 filled 20, remaining 30
+        t1 = engine.match_order(10, SIDE_SELL, 100.00, 20, timestamp_ns=400)
+        assert len(t1) == 1
+        assert t1[0].buy_order_id == 1
+        assert t1[0].executed_quantity == 20
+        assert engine.get_best_bid().order_id == 1
+        assert engine.get_best_bid().remaining_quantity == 30
+
+        # Taker SELL 2: 15 shares -> Order 1 filled 15, remaining 15 (Order 1 STILL has priority!)
+        t2 = engine.match_order(11, SIDE_SELL, 100.00, 15, timestamp_ns=500)
+        assert len(t2) == 1
+        assert t2[0].buy_order_id == 1
+        assert t2[0].executed_quantity == 15
+        assert engine.get_best_bid().order_id == 1
+        assert engine.get_best_bid().remaining_quantity == 15
+
+        # Taker SELL 3: 25 shares -> Order 1 filled remaining 15 (fully filled, removed), Order 2 filled 10
+        t3 = engine.match_order(12, SIDE_SELL, 100.00, 25, timestamp_ns=600)
+        assert len(t3) == 2
+        assert t3[0].buy_order_id == 1 and t3[0].executed_quantity == 15
+        assert t3[1].buy_order_id == 2 and t3[1].executed_quantity == 10
+
+        # Order 1 removed; Order 2 has 20 left and STILL precedes Order 3!
+        assert engine.bid_count() == 2
+        assert engine.get_best_bid().order_id == 2
+        assert engine.get_best_bid().remaining_quantity == 20
+
+    def test_residual_order_preserves_priority_over_newer_orders_at_same_price(self):
+        """A residual order from a partially filled taker keeps earlier sequence and beats later orders."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        # Step 1: Resting ask 20 @ 100.00
+        engine.submit_order(1, SIDE_SELL, 100.00, 20, timestamp_ns=500)
+
+        # Step 2: Taker BUY 50 @ 100.00 (ts 1000) -> fills 20, 30 rests as residual
+        trades1 = engine.match_order(10, SIDE_BUY, 100.00, 50, timestamp_ns=1000)
+        assert len(trades1) == 1
+        assert engine.bid_count() == 1
+        assert engine.get_best_bid().order_id == 10
+        assert engine.get_best_bid().remaining_quantity == 30
+
+        # Step 3: A subsequent BUY order arrives at the same price (ts 2000)
+        engine.submit_order(20, SIDE_BUY, 100.00, 40, timestamp_ns=2000)
+        assert engine.bid_count() == 2
+        assert engine.get_best_bid_quantity(aggregate=True) == 70
+
+        # Step 4: Incoming SELL for 45 @ 100.00 -> must fill Order 10 (30 shares) first, then Order 20 (15 shares)
+        trades2 = engine.match_order(99, SIDE_SELL, 100.00, 45, timestamp_ns=3000)
+        assert len(trades2) == 2
+        assert trades2[0].buy_order_id == 10 and trades2[0].executed_quantity == 30
+        assert trades2[1].buy_order_id == 20 and trades2[1].executed_quantity == 15
+
+        # Order 10 fully consumed; Order 20 has 25 shares left
+        assert engine.bid_count() == 1
+        assert engine.get_best_bid().order_id == 20
+        assert engine.get_best_bid().remaining_quantity == 25
+
+
+class TestWeek3Day5QuantityConservationAndInvariants:
+    """Verifies conservation of shares, no ghost orders, and clean zero-quantity removals."""
+
+    def test_quantity_conservation_invariant_in_deep_multi_sweep(self):
+        """Sum of executed trade quantities + remaining book quantities equals initial submitted quantities."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        # Submit 5 resting asks
+        engine.submit_order(1, SIDE_SELL, 10.00, 20, 100)
+        engine.submit_order(2, SIDE_SELL, 10.20, 30, 200)
+        engine.submit_order(3, SIDE_SELL, 10.40, 40, 300)
+        engine.submit_order(4, SIDE_SELL, 10.60, 50, 400)
+        engine.submit_order(5, SIDE_SELL, 10.80, 60, 500)
+        total_asks_submitted = 20 + 30 + 40 + 50 + 60  # 200 shares
+
+        # Incoming BUY for 115 shares @ 10.50 (can match levels 1, 2, 3; cannot match level 4 & 5)
+        trades = engine.match_order(100, SIDE_BUY, 10.50, 115, 600)
+        # Matches: 20 @ 10.00, 30 @ 10.20, 40 @ 10.40 = 90 executed. Remaining 25 rests @ 10.50
+        assert len(trades) == 3
+        executed_qty = sum(t.executed_quantity for t in trades)
+        assert executed_qty == 90
+
+        # Remaining bids
+        remaining_bids = sum(o.remaining_quantity for o in engine.get_prioritized_bids())
+        assert remaining_bids == 25  # 115 - 90
+
+        # Remaining asks (order 4: 50, order 5: 60)
+        remaining_asks = sum(o.remaining_quantity for o in engine.get_prioritized_asks())
+        assert remaining_asks == 110
+
+        # Total initial = 200 (asks) + 115 (buy) = 315
+        # Total accounted = 90 (bought) + 90 (sold) + 25 (bid rem) + 110 (ask rem)
+        # Note: each trade accounts for 1 share from buyer and 1 share from seller.
+        # Buyer quantity: executed (90) + remaining (25) == initial (115)
+        assert executed_qty + remaining_bids == 115
+        # Seller quantity: executed (90) + remaining (110) == initial (200)
+        assert executed_qty + remaining_asks == total_asks_submitted
+
+    def test_consecutive_small_fills_deplete_large_order_to_exact_zero(self):
+        """A single 5,000 share maker order is cleanly depleted to 0 across 10 partial fills."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        engine.submit_order(1, SIDE_BUY, 150.00, 5000, 1000)
+
+        expected_rem = 5000
+        for i in range(10):
+            taker_id = 100 + i
+            trades = engine.match_order(taker_id, SIDE_SELL, 150.00, 500, 2000 + i * 100)
+            assert len(trades) == 1
+            assert trades[0].executed_quantity == 500
+            expected_rem -= 500
+            assert trades[0].buy_remaining_quantity == expected_rem
+            if expected_rem > 0:
+                assert engine.bid_count() == 1
+                assert engine.get_best_bid().remaining_quantity == expected_rem
+            else:
+                assert engine.bid_count() == 0
+                assert engine.get_best_bid() is None
+
+        assert engine.bid_count() == 0
+        assert engine.ask_count() == 0
+
+    def test_execute_partial_match_cascading_sweep_loop(self):
+        """Repeatedly calling execute_partial_match() resolves multi-level crossing books."""
+        from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        # Submit multiple bids and asks that cross
+        engine.submit_order(1, SIDE_BUY, 102.00, 20, 100)
+        engine.submit_order(2, SIDE_BUY, 101.00, 30, 200)
+        engine.submit_order(3, SIDE_SELL, 100.00, 15, 300)
+        engine.submit_order(4, SIDE_SELL, 101.00, 25, 400)
+
+        assert engine.has_crossing_prices() is True
+
+        all_trades = []
+        while True:
+            tr = engine.execute_partial_match()
+            if tr is None:
+                break
+            all_trades.append(tr)
+
+        # 1. Best BUY (102.00, 20) vs Best SELL (100.00, 15) -> 15 @ 100.00, buy rem 5, sell rem 0
+        # 2. Best BUY (102.00, 5) vs Best SELL (101.00, 25) -> 5 @ 101.00, buy rem 0, sell rem 20
+        # 3. Best BUY (101.00, 30) vs Best SELL (101.00, 20) -> 20 @ 101.00, buy rem 10, sell rem 0
+        # 4. Next: bids has 10 @ 101.00, asks is empty -> execute_partial_match() returns None
+        assert len(all_trades) == 3
+        assert [t.executed_quantity for t in all_trades] == [15, 5, 20]
+        assert [t.execution_price for t in all_trades] == [100.00, 101.00, 101.00]
+        assert engine.has_crossing_prices() is False
+        assert engine.ask_count() == 0
+        assert engine.bid_count() == 1
+        assert engine.get_best_bid().remaining_quantity == 10
+
+    def test_rejection_of_corder_with_remaining_exceeding_quantity(self):
+        """add_buy_order and add_sell_order reject COrder if remaining_quantity > quantity."""
+        import pytest
+        from chronos.matching_engine import MatchingEngine, COrder, SIDE_BUY, SIDE_SELL
+        engine = MatchingEngine()
+
+        cord_buy = COrder(1, SIDE_BUY, 10000, 10, 100)
+        cord_buy.remaining_quantity = 25  # Exceeds quantity
+        with pytest.raises(ValueError, match="cannot exceed quantity"):
+            engine.add_buy_order(cord_buy)
+
+        cord_sell = COrder(2, SIDE_SELL, 10000, 10, 100)
+        cord_sell.remaining_quantity = 25
+        with pytest.raises(ValueError, match="cannot exceed quantity"):
+            engine.add_sell_order(cord_sell)
+
+        assert engine.bid_count() == 0
+        assert engine.ask_count() == 0

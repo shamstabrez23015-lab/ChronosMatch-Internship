@@ -49,6 +49,16 @@ Week 3, Day 3:
   * Order-book state consistency guarantees: FIFO preservation, zero-remaining-quantity active order exclusion.
   * 100% non-mutating inspection leaving book state and arrival sequence intact.
 
+Week 3, Day 5:
+- Partial Order Matching Enhancements:
+  * Robust BUY and SELL partial order matching across single and multiple price levels.
+  * Preservation of remaining unfilled quantities in the order book.
+  * Deterministic removal of orders when remaining quantity reaches zero.
+  * Strict Price-Time Priority preservation for partially filled resting and residual orders.
+  * Quantity conservation and prevention of negative quantities or invalid trade volumes.
+  * Added COrder helper properties (filled_quantity, is_filled, is_partially_filled).
+  * Added TradeResult helper properties (price, trade_quantity, is_full_fill, is_partial_fill).
+
 Price Representation
 --------------------
 The Week 1 binary protocol stores prices as ``double`` (64-bit IEEE 754
@@ -166,6 +176,21 @@ cdef class COrder:
         """Return the dollar price as a float."""
         return self.price_cents / 100.0
 
+    @property
+    def filled_quantity(self):
+        """Return the number of shares already filled."""
+        return self.quantity - self.remaining_quantity
+
+    @property
+    def is_filled(self):
+        """Return True if the order has been completely filled."""
+        return self.remaining_quantity == 0
+
+    @property
+    def is_partially_filled(self):
+        """Return True if the order has been partially filled but still has remaining quantity."""
+        return 0 < self.remaining_quantity < self.quantity
+
     def __repr__(self):
         side_str = "BUY" if self.side == _SIDE_BUY else "SELL"
         return (
@@ -266,6 +291,26 @@ cdef class TradeResult:
     def execution_price(self):
         """Return the execution price as a float dollar amount."""
         return self.execution_price_cents / 100.0
+
+    @property
+    def price(self):
+        """Return the execution price as a float (alias for execution_price)."""
+        return self.execution_price_cents / 100.0
+
+    @property
+    def trade_quantity(self):
+        """Return the executed quantity (alias for executed_quantity)."""
+        return self.executed_quantity
+
+    @property
+    def is_full_fill(self):
+        """Return True if both buy and sell sides were completely filled."""
+        return self.buy_remaining_quantity == 0 and self.sell_remaining_quantity == 0
+
+    @property
+    def is_partial_fill(self):
+        """Return True if at least one side has remaining unfilled quantity."""
+        return self.buy_remaining_quantity > 0 or self.sell_remaining_quantity > 0
 
     def __repr__(self):
         return (
@@ -1164,6 +1209,11 @@ cdef class MatchingEngine:
                 raise ValueError("Invalid quantity 0: must be positive")
             if ord_obj.remaining_quantity == 0:
                 raise ValueError("Invalid remaining_quantity 0: order is already fully filled")
+            if ord_obj.remaining_quantity > ord_obj.quantity:
+                raise ValueError(
+                    f"Invalid remaining_quantity {ord_obj.remaining_quantity}: "
+                    f"cannot exceed quantity {ord_obj.quantity}"
+                )
             self._sequence_counter += 1
             ord_obj.sequence_num = self._sequence_counter
             self._bids.append(ord_obj)
@@ -1227,6 +1277,11 @@ cdef class MatchingEngine:
                 raise ValueError("Invalid quantity 0: must be positive")
             if ord_obj.remaining_quantity == 0:
                 raise ValueError("Invalid remaining_quantity 0: order is already fully filled")
+            if ord_obj.remaining_quantity > ord_obj.quantity:
+                raise ValueError(
+                    f"Invalid remaining_quantity {ord_obj.remaining_quantity}: "
+                    f"cannot exceed quantity {ord_obj.quantity}"
+                )
             self._sequence_counter += 1
             ord_obj.sequence_num = self._sequence_counter
             self._asks.append(ord_obj)
@@ -1340,6 +1395,9 @@ cdef class MatchingEngine:
             exec_qty = best_buy.remaining_quantity
         else:
             exec_qty = best_sell.remaining_quantity
+
+        if exec_qty == 0:
+            return None
 
         # Execution price: resting SELL order's price (lowest ask / maker price)
         cdef long long exec_price_cents = best_sell.price_cents
@@ -1463,6 +1521,8 @@ cdef class MatchingEngine:
                         exec_qty = incoming_remaining
                     else:
                         exec_qty = resting.remaining_quantity
+                    if exec_qty == 0:
+                        continue
                     exec_price_cents = resting.price_cents  # maker price
                     # Decrement – pure C unsigned arithmetic, no underflow
                     incoming_remaining = incoming_remaining - exec_qty
@@ -1517,6 +1577,8 @@ cdef class MatchingEngine:
                         exec_qty = incoming_remaining
                     else:
                         exec_qty = resting.remaining_quantity
+                    if exec_qty == 0:
+                        continue
                     exec_price_cents = resting.price_cents  # maker price
                     incoming_remaining = incoming_remaining - exec_qty
                     resting.remaining_quantity = resting.remaining_quantity - exec_qty
