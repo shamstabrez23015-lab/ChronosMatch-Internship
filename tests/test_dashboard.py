@@ -3790,3 +3790,474 @@ class TestWhaleWithRealMatchingEngine:
             result = detect_whale_order(order_id=99, trades=trades)
             assert result is not None
             assert result.order_id == 99
+
+
+# ===========================================================================
+# Section 35: Week 3 Day 5 - Order-Book Depth Display Comprehensive Tests
+# ===========================================================================
+
+
+class TestOrderBookDepthDisplayRequirements:
+    """Comprehensive verification for Week 3 Day 5 order-book depth display requirements."""
+
+    # -----------------------------------------------------------------------
+    # 1. Sorting Tests
+    # -----------------------------------------------------------------------
+
+    def test_buy_depth_sorting_strictly_descending(self):
+        """Top 5 BUY price levels must be sorted strictly from highest to lowest price."""
+        # Unsorted input of 6 price levels
+        orders = [
+            {"side": 1, "price": 490.50, "quantity": 10},
+            {"side": 1, "price": 510.00, "quantity": 20},
+            {"side": 1, "price": 505.25, "quantity": 30},
+            {"side": 1, "price": 498.00, "quantity": 40},
+            {"side": 1, "price": 502.75, "quantity": 50},
+            {"side": 1, "price": 485.00, "quantity": 60},
+        ]
+        depth = calculate_buy_depth(orders, max_levels=5)
+        assert len(depth) == 5
+        prices = [lvl.price for lvl in depth]
+        assert prices == [510.00, 505.25, 502.75, 498.00, 490.50]
+        # Verify strictly descending order
+        for i in range(len(prices) - 1):
+            assert prices[i] > prices[i + 1]
+
+    def test_sell_depth_sorting_strictly_ascending(self):
+        """Top 5 SELL price levels must be sorted strictly from lowest to highest price."""
+        # Unsorted input of 6 price levels
+        orders = [
+            {"side": 2, "price": 530.00, "quantity": 15},
+            {"side": 2, "price": 515.50, "quantity": 25},
+            {"side": 2, "price": 522.25, "quantity": 35},
+            {"side": 2, "price": 512.00, "quantity": 45},
+            {"side": 2, "price": 518.75, "quantity": 55},
+            {"side": 2, "price": 540.00, "quantity": 65},
+        ]
+        depth = calculate_sell_depth(orders, max_levels=5)
+        assert len(depth) == 5
+        prices = [lvl.price for lvl in depth]
+        assert prices == [512.00, 515.50, 518.75, 522.25, 530.00]
+        # Verify strictly ascending order
+        for i in range(len(prices) - 1):
+            assert prices[i] < prices[i + 1]
+
+    def test_sorting_deterministic_regardless_of_order_insertion_sequence(self):
+        """Depth sorting must be deterministic regardless of original order sequence."""
+        orders_a = [
+            {"price": 100.0, "quantity": 10},
+            {"price": 105.0, "quantity": 20},
+            {"price": 102.5, "quantity": 30},
+        ]
+        orders_b = [
+            {"price": 102.5, "quantity": 30},
+            {"price": 100.0, "quantity": 10},
+            {"price": 105.0, "quantity": 20},
+        ]
+        orders_c = [
+            {"price": 105.0, "quantity": 20},
+            {"price": 102.5, "quantity": 30},
+            {"price": 100.0, "quantity": 10},
+        ]
+        depth_a = calculate_buy_depth(orders_a)
+        depth_b = calculate_buy_depth(orders_b)
+        depth_c = calculate_buy_depth(orders_c)
+        assert depth_a == depth_b == depth_c
+        assert [lvl.price for lvl in depth_a] == [105.0, 102.5, 100.0]
+
+    def test_depth_sorting_rejects_negative_and_nan_inf_prices(self):
+        """Non-positive, NaN, and Inf prices are excluded from depth sorting."""
+        orders = [
+            {"price": 500.0, "quantity": 50},
+            {"price": -10.0, "quantity": 20},
+            {"price": 0.0, "quantity": 30},
+            {"price": float("nan"), "quantity": 40},
+            {"price": float("inf"), "quantity": 50},
+            {"price": 490.0, "quantity": 25},
+        ]
+        depth = calculate_buy_depth(orders)
+        assert len(depth) == 2
+        assert [lvl.price for lvl in depth] == [500.0, 490.0]
+        assert [lvl.quantity for lvl in depth] == [50, 25]
+
+    # -----------------------------------------------------------------------
+    # 2. Quantity Aggregation Tests
+    # -----------------------------------------------------------------------
+
+    def test_quantities_aggregated_across_many_orders_at_same_price(self):
+        """Multiple orders at the exact same price level must have quantities aggregated."""
+        orders = [
+            {"price": 500.0, "quantity": 10},
+            {"price": 500.0, "quantity": 20},
+            {"price": 500.0, "quantity": 30},
+            {"price": 500.0, "quantity": 40},
+            {"price": 490.0, "quantity": 100},
+        ]
+        depth = calculate_buy_depth(orders)
+        assert len(depth) == 2
+        assert depth[0] == PriceLevel(500.0, 100)
+        assert depth[1] == PriceLevel(490.0, 100)
+
+    def test_quantities_use_remaining_quantity_when_present(self):
+        """Partially filled orders must use remaining_quantity rather than initial quantity."""
+        orders = [
+            {"price": 500.0, "quantity": 100, "remaining_quantity": 45},
+            {"price": 500.0, "quantity": 200, "remaining_quantity": 55},
+        ]
+        depth = calculate_buy_depth(orders)
+        assert len(depth) == 1
+        assert depth[0].price == 500.0
+        assert depth[0].quantity == 100  # 45 + 55, not 100 + 200 = 300
+
+    def test_quantities_fully_filled_orders_excluded(self):
+        """Orders with remaining_quantity=0 (fully filled) are excluded from depth."""
+        orders = [
+            {"price": 500.0, "quantity": 100, "remaining_quantity": 0},
+            {"price": 490.0, "quantity": 50, "remaining_quantity": 50},
+        ]
+        depth = calculate_buy_depth(orders)
+        assert len(depth) == 1
+        assert depth[0] == PriceLevel(490.0, 50)
+
+    def test_quantities_negative_or_zero_filtered_out(self):
+        """Orders with quantity <= 0 are omitted."""
+        orders = [
+            {"price": 500.0, "quantity": 0},
+            {"price": 500.0, "quantity": -5},
+            {"price": 490.0, "quantity": 10},
+        ]
+        depth = calculate_buy_depth(orders)
+        assert len(depth) == 1
+        assert depth[0] == PriceLevel(490.0, 10)
+
+    def test_depth_supports_multiple_order_data_structures(self):
+        """Depth calculation supports dicts, tuples (4-tuple and 7-tuple), and objects."""
+        # 1. Dict with price_cents and qty
+        d1 = {"price_cents": 50000, "qty": 10, "side": 1}
+        # 2. 4-tuple: (order_id, side, price, quantity)
+        t4 = (101, 1, 495.0, 20)
+        # 3. 7-tuple: (order_id, ts, price, quantity, sym, side, type)
+        t7 = (102, 1000000, 490.0, 30, 1001, 1, 1)
+        # 4. Custom object
+        class MockOrderObj:
+            def __init__(self, price, quantity, side):
+                self.price = price
+                self.quantity = quantity
+                self.side = side
+
+        obj = MockOrderObj(price=485.0, quantity=40, side=1)
+
+        depth = calculate_buy_depth([d1, t4, t7, obj])
+        assert len(depth) == 4
+        assert [lvl.price for lvl in depth] == [500.0, 495.0, 490.0, 485.0]
+        assert [lvl.quantity for lvl in depth] == [10, 20, 30, 40]
+
+    def test_depth_with_cython_engine_prioritized_bids_and_asks(self):
+        """Verify depth directly calculates from real Cython MatchingEngine prioritized orders."""
+        try:
+            from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        except Exception:
+            pytest.skip("MatchingEngine not available")
+
+        engine = MatchingEngine()
+        # Add bids at multiple prices
+        engine.submit_order(1, SIDE_BUY, 100.0, 50, 1000)
+        engine.submit_order(2, SIDE_BUY, 100.0, 50, 1100)
+        engine.submit_order(3, SIDE_BUY, 99.5, 30, 1200)
+        engine.submit_order(4, SIDE_BUY, 101.0, 20, 1300)
+
+        # Add asks at multiple prices
+        engine.submit_order(5, SIDE_SELL, 102.0, 40, 1400)
+        engine.submit_order(6, SIDE_SELL, 103.0, 60, 1500)
+        engine.submit_order(7, SIDE_SELL, 102.0, 10, 1600)
+
+        bids = engine.get_prioritized_bids()
+        asks = engine.get_prioritized_asks()
+
+        buy_depth = calculate_buy_depth(bids)
+        sell_depth = calculate_sell_depth(asks)
+
+        assert len(buy_depth) == 3
+        assert buy_depth[0] == PriceLevel(101.0, 20)
+        assert buy_depth[1] == PriceLevel(100.0, 100)  # 50 + 50
+        assert buy_depth[2] == PriceLevel(99.5, 30)
+
+        assert len(sell_depth) == 2
+        assert sell_depth[0] == PriceLevel(102.0, 50)  # 40 + 10
+        assert sell_depth[1] == PriceLevel(103.0, 60)
+
+    # -----------------------------------------------------------------------
+    # 3. Empty Book Handling Tests
+    # -----------------------------------------------------------------------
+
+    def test_empty_buy_side_with_non_empty_sell_side_renders_cleanly(self):
+        """Dashboard renders without crashing when BUY side is empty but SELL has orders."""
+        d = TerminalDashboard(use_sample_data=False)
+        d.set_buy_orders([])
+        d.set_sell_orders([
+            {"side": 2, "price": 505.0, "quantity": 10},
+            {"side": 2, "price": 510.0, "quantity": 20},
+        ])
+
+        lines = d.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+
+        assert SECTION_ORDER_BOOK in text
+        # BUY column should show placeholders
+        assert PLACEHOLDER in text
+        # SELL column should show actual prices
+        assert "505.00" in text
+        assert "510.00" in text
+
+        # Test curses render() call directly
+        win = MockCursesWindow(rows=40, cols=100)
+        d.render(win)
+        rendered = " ".join(c[2] for c in win.addstr_calls)
+        assert "505.00" in rendered
+        assert "510.00" in rendered
+
+    def test_empty_sell_side_with_non_empty_buy_side_renders_cleanly(self):
+        """Dashboard renders without crashing when SELL side is empty but BUY has orders."""
+        d = TerminalDashboard(use_sample_data=False)
+        d.set_buy_orders([
+            {"side": 1, "price": 495.0, "quantity": 30},
+            {"side": 1, "price": 490.0, "quantity": 40},
+        ])
+        d.set_sell_orders([])
+
+        lines = d.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+
+        assert SECTION_ORDER_BOOK in text
+        assert "495.00" in text
+        assert "490.00" in text
+        assert PLACEHOLDER in text
+
+        win = MockCursesWindow(rows=40, cols=100)
+        d.render(win)
+        rendered = " ".join(c[2] for c in win.addstr_calls)
+        assert "495.00" in rendered
+        assert "490.00" in rendered
+
+    def test_both_sides_empty_renders_all_placeholders(self):
+        """Dashboard renders without crashing when both BUY and SELL books are empty."""
+        d = TerminalDashboard(use_sample_data=False)
+        d.set_buy_orders([])
+        d.set_sell_orders([])
+
+        assert d.get_buy_depth() == []
+        assert d.get_sell_depth() == []
+
+        bid_rows, ask_rows = d.get_depth_rows(max_levels=5)
+        assert len(bid_rows) == 5
+        assert len(ask_rows) == 5
+        assert all(r == (PLACEHOLDER, PLACEHOLDER) for r in bid_rows)
+        assert all(r == (PLACEHOLDER, PLACEHOLDER) for r in ask_rows)
+
+        lines = d.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_ORDER_BOOK in text
+        assert text.count(PLACEHOLDER) >= 10
+
+        win = MockCursesWindow(rows=40, cols=100)
+        d.render(win)
+        assert win.erased is True
+
+    # -----------------------------------------------------------------------
+    # 4. Fewer Than Five Price Levels Tests
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.parametrize("level_count", [1, 2, 3, 4])
+    def test_fewer_than_five_levels_padded_to_five_rows(self, level_count):
+        """Any book with fewer than 5 levels must be padded with placeholders to exactly 5 rows."""
+        buy_orders = [{"price": 500.0 - i * 5, "quantity": 10 * (i + 1)} for i in range(level_count)]
+        sell_orders = [{"side": 2, "price": 510.0 + i * 5, "quantity": 15 * (i + 1)} for i in range(level_count)]
+
+        d = TerminalDashboard(use_sample_data=False, buy_orders=buy_orders, sell_orders=sell_orders)
+
+        b_depth = d.get_buy_depth()
+        s_depth = d.get_sell_depth()
+        assert len(b_depth) == level_count
+        assert len(s_depth) == level_count
+
+        b_rows, s_rows = d.get_depth_rows(max_levels=5)
+        assert len(b_rows) == 5
+        assert len(s_rows) == 5
+
+        # Check real levels
+        for i in range(level_count):
+            assert b_rows[i][0] == f"{500.0 - i * 5:.2f}"
+            assert b_rows[i][1] == str(10 * (i + 1))
+            assert s_rows[i][0] == f"{510.0 + i * 5:.2f}"
+            assert s_rows[i][1] == str(15 * (i + 1))
+
+        # Check padded placeholder levels
+        for i in range(level_count, 5):
+            assert b_rows[i] == (PLACEHOLDER, PLACEHOLDER)
+            assert s_rows[i] == (PLACEHOLDER, PLACEHOLDER)
+
+    def test_asymmetric_depth_levels(self):
+        """BUY having 1 level and SELL having 4 levels renders both columns aligned."""
+        buy_orders = [{"price": 500.0, "quantity": 50}]
+        sell_orders = [
+            {"side": 2, "price": 505.0, "quantity": 10},
+            {"side": 2, "price": 510.0, "quantity": 20},
+            {"side": 2, "price": 515.0, "quantity": 30},
+            {"side": 2, "price": 520.0, "quantity": 40},
+        ]
+        d = TerminalDashboard(use_sample_data=False, buy_orders=buy_orders, sell_orders=sell_orders)
+        b_rows, s_rows = d.get_depth_rows(max_levels=5)
+        assert len(b_rows) == 5
+        assert len(s_rows) == 5
+
+        assert b_rows[0] == ("500.00", "50")
+        assert all(r == (PLACEHOLDER, PLACEHOLDER) for r in b_rows[1:])
+
+        assert [r[0] for r in s_rows[:4]] == ["505.00", "510.00", "515.00", "520.00"]
+        assert s_rows[4] == (PLACEHOLDER, PLACEHOLDER)
+
+        # Confirm render works without error
+        win = MockCursesWindow(rows=40, cols=100)
+        d.render(win)
+
+    # -----------------------------------------------------------------------
+    # 5. Distinguishability Between BUY and SELL
+    # -----------------------------------------------------------------------
+
+    def test_buy_and_sell_sections_clearly_distinguishable(self):
+        """BUY and SELL sides must have distinct headers and separate render attributes."""
+        d = TerminalDashboard()
+        win = MockCursesWindow(rows=40, cols=100)
+        d.render(win)
+
+        calls = win.addstr_calls
+        texts = [c[2] for c in calls]
+        full_text = " ".join(texts)
+        assert SECTION_BUY_ORDERS in full_text
+        assert SECTION_SELL_ORDERS in full_text
+
+        # Verify side filtering prevents cross-side contamination
+        mixed_orders = [
+            {"side": 1, "price": 500.0, "quantity": 100},
+            {"side": 2, "price": 505.0, "quantity": 40},
+        ]
+        buy_depth = calculate_buy_depth(mixed_orders)
+        sell_depth = calculate_sell_depth(mixed_orders)
+
+        assert len(buy_depth) == 1
+        assert buy_depth[0].price == 500.0
+        assert len(sell_depth) == 1
+        assert sell_depth[0].price == 505.0
+
+    # -----------------------------------------------------------------------
+    # 6. Dashboard Update Mechanism
+    # -----------------------------------------------------------------------
+
+    def test_depth_updates_dynamically_via_update_orders_methods(self):
+        """Updating buy/sell orders via update_* methods immediately updates depth display."""
+        d = TerminalDashboard(use_sample_data=False)
+        assert d.get_buy_depth() == []
+        assert d.get_sell_depth() == []
+
+        # Update BUY
+        new_buys = [
+            {"price": 400.0, "quantity": 10},
+            {"price": 405.0, "quantity": 20},
+            {"price": 410.0, "quantity": 30},
+        ]
+        d.update_buy_orders(new_buys)
+        assert [lvl.price for lvl in d.get_buy_depth()] == [410.0, 405.0, 400.0]
+
+        # Update SELL
+        new_sells = [
+            {"side": 2, "price": 420.0, "quantity": 50},
+            {"side": 2, "price": 415.0, "quantity": 60},
+        ]
+        d.update_sell_orders(new_sells)
+        assert [lvl.price for lvl in d.get_sell_depth()] == [415.0, 420.0]
+
+        # Lines reflect updated prices
+        lines = d.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+        assert "410.00" in text
+        assert "405.00" in text
+        assert "415.00" in text
+        assert "420.00" in text
+
+    def test_depth_updates_via_live_feed_sync(self):
+        """LiveFeedBridge sync_to_dashboard updates depth from matching engine."""
+        try:
+            from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+            from chronos.live_feed import LiveFeedBridge
+        except Exception:
+            pytest.skip("MatchingEngine or LiveFeedBridge not available")
+
+        engine = MatchingEngine()
+        d = TerminalDashboard(use_sample_data=False)
+        bridge = LiveFeedBridge(engine=engine, dashboard=d)
+
+        # Before sync, book is empty
+        assert d.get_buy_depth() == []
+        assert d.get_sell_depth() == []
+
+        # Add orders in engine
+        engine.submit_order(1, SIDE_BUY, 250.0, 100, 1000)
+        engine.submit_order(2, SIDE_SELL, 255.0, 50, 1001)
+
+        bridge.sync_to_dashboard()
+
+        b_depth = d.get_buy_depth()
+        s_depth = d.get_sell_depth()
+        assert len(b_depth) == 1
+        assert b_depth[0] == PriceLevel(250.0, 100)
+        assert len(s_depth) == 1
+        assert s_depth[0] == PriceLevel(255.0, 50)
+
+    # -----------------------------------------------------------------------
+    # 7. Preservation of Existing Dashboard Behavior and Layout
+    # -----------------------------------------------------------------------
+
+    def test_depth_preserves_latency_trade_metrics_and_layout(self):
+        """Displaying depth preserves header, market summary, metrics, and footer."""
+        d = TerminalDashboard()
+        d.record_order_processed({"order_id": 999, "side": 1, "price": 500.0, "quantity": 10})
+        d.record_trade_execution(latency_us=12.5)
+
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+
+        from chronos.dashboard import (
+            SECTION_MARKET_SUMMARY,
+            SECTION_ORDER_BOOK,
+            SECTION_PERFORMANCE,
+            SECTION_TRADE_EXECUTION,
+            QUIT_MESSAGE,
+        )
+
+        assert SECTION_MARKET_SUMMARY in text
+        assert SECTION_ORDER_BOOK in text
+        assert SECTION_PERFORMANCE in text
+        assert SECTION_TRADE_EXECUTION in text
+        assert QUIT_MESSAGE in text
+        assert "12.5" in text
+
+    # -----------------------------------------------------------------------
+    # 8. No Matching Logic in Dashboard
+    # -----------------------------------------------------------------------
+
+    def test_dashboard_does_not_execute_crossing_orders(self):
+        """Crossed buy and sell orders in dashboard are displayed, not matched or removed."""
+        # BUY price 510 > SELL price 500 (crossed book)
+        crossed_buys = [{"side": 1, "price": 510.0, "quantity": 100}]
+        crossed_sells = [{"side": 2, "price": 500.0, "quantity": 100}]
+
+        d = TerminalDashboard(use_sample_data=False, buy_orders=crossed_buys, sell_orders=crossed_sells)
+
+        b_depth = d.get_buy_depth()
+        s_depth = d.get_sell_depth()
+
+        # Both remain in the book; dashboard has not executed them
+        assert len(b_depth) == 1
+        assert b_depth[0] == PriceLevel(510.0, 100)
+        assert len(s_depth) == 1
+        assert s_depth[0] == PriceLevel(500.0, 100)

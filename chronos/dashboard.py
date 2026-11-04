@@ -231,8 +231,19 @@ def _extract_order_price_qty(
                 return (float(order[1]), int(order[2]))
             except (ValueError, TypeError):
                 return None
-        if len(order) == 4:
+        if len(order) in (4, 5, 6):
             side = order[1]
+            if expected_side in buy_sides and side not in buy_sides:
+                return None
+            if expected_side in sell_sides and side not in sell_sides:
+                return None
+            try:
+                return (float(order[2]), int(order[3]))
+            except (ValueError, TypeError):
+                return None
+        if len(order) >= 7:
+            # Layout: (order_id, timestamp_ns, price, quantity, symbol_id, side, order_type, ...)
+            side = order[5]
             if expected_side in buy_sides and side not in buy_sides:
                 return None
             if expected_side in sell_sides and side not in sell_sides:
@@ -333,7 +344,7 @@ def aggregate_orders_by_price(
         parsed = _extract_order_price_qty(order, expected_side=expected_side)
         if parsed is not None:
             p, q = parsed
-            if p > 0 and q > 0:
+            if p > 0 and q > 0 and not math.isnan(p) and not math.isinf(p):
                 norm_p = round(p, 6)
                 aggregated[norm_p] = aggregated.get(norm_p, 0) + q
 
@@ -395,7 +406,7 @@ def calculate_sell_depth(
 
 
 def format_depth_rows(
-    depth: Optional[List[PriceLevel]],
+    depth: Optional[List[Any]],
     max_levels: int = 5,
     placeholder: str = PLACEHOLDER,
 ) -> List[Tuple[str, str]]:
@@ -404,17 +415,34 @@ def format_depth_rows(
     If depth contains fewer than max_levels, remaining rows are padded with placeholder.
 
     Args:
-        depth: List of PriceLevel instances.
+        depth: List of PriceLevel instances, tuples, or dicts.
         max_levels: Target number of display rows (default: 5).
         placeholder: String to display for empty levels (default: PLACEHOLDER).
 
     Returns:
         List of (price_str, quantity_str) tuples of length max_levels.
     """
+    if max_levels <= 0:
+        return []
+
     rows: List[Tuple[str, str]] = []
     levels = depth or []
     for level in levels[:max_levels]:
-        rows.append((format_price(level.price), str(level.quantity)))
+        if hasattr(level, "price") and hasattr(level, "quantity"):
+            p = getattr(level, "price")
+            q = getattr(level, "quantity")
+        elif isinstance(level, (tuple, list)) and len(level) >= 2:
+            p = level[0]
+            q = level[1]
+        elif isinstance(level, dict):
+            p = level.get("price", level.get("price_cents", 0))
+            q = level.get("quantity", level.get("qty", 0))
+        else:
+            continue
+        try:
+            rows.append((format_price(p), str(int(q))))
+        except (ValueError, TypeError):
+            rows.append((format_price(p), str(q)))
 
     while len(rows) < max_levels:
         rows.append((placeholder, placeholder))
@@ -1944,6 +1972,23 @@ class TerminalDashboard:
     def update_sell_orders(self, orders: List[Any], is_sample: bool = False) -> None:
         """Alias for set_sell_orders, ready for live engine snapshot integration."""
         self.set_sell_orders(orders, is_sample=is_sample)
+
+    def get_buy_depth(self, max_levels: int = 5) -> List[PriceLevel]:
+        """Return the current top BUY order-book depth up to max_levels levels (highest price first)."""
+        return calculate_buy_depth(self.buy_orders, max_levels=max_levels)
+
+    def get_sell_depth(self, max_levels: int = 5) -> List[PriceLevel]:
+        """Return the current top SELL order-book depth up to max_levels levels (lowest price first)."""
+        return calculate_sell_depth(self.sell_orders, max_levels=max_levels)
+
+    def get_depth_rows(
+        self, max_levels: int = 5
+    ) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+        """Return formatted (bid_rows, ask_rows) for the top max_levels depth."""
+        return (
+            format_depth_rows(self.get_buy_depth(max_levels=max_levels), max_levels=max_levels),
+            format_depth_rows(self.get_sell_depth(max_levels=max_levels), max_levels=max_levels),
+        )
 
     # ------------------------------------------------------------------
     # Size checking
