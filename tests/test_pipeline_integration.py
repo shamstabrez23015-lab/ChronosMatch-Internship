@@ -1,4 +1,4 @@
-"""ChronosMatch Pipeline Integration Test Foundation (Working Day 6).
+"""ChronosMatch Pipeline Integration Test Foundation (Working Day 6, extended Day 6+).
 
 Builds an executable integration-test foundation linking:
 1. Binary Order Protocol (<QQdIHBB struct packing/unpacking)
@@ -8,7 +8,12 @@ Builds an executable integration-test foundation linking:
 5. Day 5 Reusable Deterministic Trading Scenarios (protocol compatibility and engine matching)
 6. Integrated Multi-Step Pipeline Flow across existing real boundaries
 
-Prepares the test foundation for Day 7 end-to-end order-flow testing.
+Day 6+ Extension Boundaries:
+7. OrderAdapter Smoke Tests (dispatch mode, stats, event emission, latency tracking)
+8. Ring Buffer Capacity & Saturation Boundaries (overwrite policy, available_to_read/write)
+9. Consumer-to-Adapter-to-Engine Coupled Pipeline (run_consumer bound to adapter)
+10. AdapterStats Accumulation Across Multiple Dispatch Calls
+11. TradeExecutionEvent Introspection (latency_ns, matched, volume_matched)
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ from typing import Generator, List, Tuple
 
 import pytest
 
+from chronos.adapter import AdapterStats, OrderAdapter, TradeExecutionEvent
 from chronos.consumer import ConsumerStats, ZeroCopyConsumer
 from chronos.matching_engine import COrder, MatchingEngine, TradeResult, price_to_cents
 from chronos.ring_buffer import MmapRingBuffer
@@ -687,3 +693,731 @@ class TestIntegratedOrderFlowPipeline:
         # 152.00 < 155.00 -> prices no longer cross
         assert matching_engine.has_crossing_prices() is False
         assert matching_engine.execute_partial_match() is None
+
+
+# ==============================================================================
+# Boundary 7: OrderAdapter Smoke Tests
+# ==============================================================================
+
+class TestOrderAdapterSmokeTests:
+    """Smoke tests for OrderAdapter dispatch modes, stats accumulation, and event emission.
+
+    Verifies the adapter's core contract without duplicating the deep coverage in
+    test_adapter.py or test_end_to_end_order_flow.py.
+    """
+
+    def test_adapter_match_mode_generates_trades_and_updates_stats(
+        self, matching_engine: MatchingEngine
+    ):
+        """In 'match' mode a crossing pair produces a TradeResult and increments stats."""
+        adapter = OrderAdapter(engine=matching_engine, dispatch_mode="match")
+
+        buy = Order(
+            order_id=9001,
+            timestamp_ns=1_000_000,
+            price=100.00,
+            quantity=50,
+            symbol_id=SYMBOLS["AAPL"],
+            side=int(Side.BUY),
+            order_type=int(OrderType.LIMIT),
+        )
+        sell = Order(
+            order_id=9002,
+            timestamp_ns=1_001_000,
+            price=100.00,
+            quantity=50,
+            symbol_id=SYMBOLS["AAPL"],
+            side=int(Side.SELL),
+            order_type=int(OrderType.LIMIT),
+        )
+
+        trades1 = adapter.dispatch_raw_order(buy)
+        assert len(trades1) == 0  # Resting BUY, no crossing yet
+        assert adapter.stats.total_orders_dispatched == 1
+        assert adapter.stats.non_crossing_orders == 1
+
+        trades2 = adapter.dispatch_raw_order(sell)
+        assert len(trades2) == 1
+        trade = trades2[0]
+        assert trade.buy_order_id == 9001
+        assert trade.sell_order_id == 9002
+        assert trade.executed_quantity == 50
+
+        assert adapter.stats.total_orders_dispatched == 2
+        assert adapter.stats.total_trades_generated == 1
+        assert adapter.stats.total_volume_matched == 50
+        assert adapter.stats.non_crossing_orders == 1  # Only the BUY was non-crossing
+
+    def test_adapter_submit_mode_stores_orders_without_matching(
+        self, matching_engine: MatchingEngine
+    ):
+        """In 'submit' mode, orders are submitted to the book without active matching."""
+        adapter = OrderAdapter(engine=matching_engine, dispatch_mode="submit")
+
+        buy = Order(
+            order_id=9101,
+            timestamp_ns=1_000_000,
+            price=200.00,
+            quantity=100,
+            symbol_id=SYMBOLS["NVDA"],
+            side=int(Side.BUY),
+            order_type=int(OrderType.LIMIT),
+        )
+        sell = Order(
+            order_id=9102,
+            timestamp_ns=1_001_000,
+            price=200.00,
+            quantity=100,
+            symbol_id=SYMBOLS["NVDA"],
+            side=int(Side.SELL),
+            order_type=int(OrderType.LIMIT),
+        )
+
+        adapter.dispatch_raw_order(buy)
+        adapter.dispatch_raw_order(sell)
+
+        # In submit mode, no active matching occurs; orders rest in both books
+        assert matching_engine.bid_count() == 1
+        assert matching_engine.ask_count() == 1
+        assert adapter.stats.total_trades_generated == 0
+        assert adapter.stats.total_volume_matched == 0
+        assert adapter.stats.total_orders_dispatched == 2
+
+    def test_adapter_cancel_order_type_does_not_crash_engine(
+        self, matching_engine: MatchingEngine
+    ):
+        """CANCEL order type is recorded as unhandled; engine and stats remain consistent."""
+        adapter = OrderAdapter(engine=matching_engine, dispatch_mode="match")
+
+        cancel_order = Order(
+            order_id=9201,
+            timestamp_ns=2_000_000,
+            price=150.00,
+            quantity=10,
+            symbol_id=SYMBOLS["AAPL"],
+            side=int(Side.BUY),
+            order_type=int(OrderType.CANCEL),
+        )
+
+        trades = adapter.dispatch_raw_order(cancel_order)
+        assert len(trades) == 0
+        assert adapter.stats.unhandled_order_types == 1
+        assert len(adapter.unhandled_orders) == 1
+        # Engine is completely untouched
+        assert matching_engine.bid_count() == 0
+        assert matching_engine.ask_count() == 0
+
+    def test_adapter_unrouted_symbol_recorded_truthfully(self):
+        """Order with unknown symbol_id and no default engine is tracked in unrouted_orders."""
+        engine_aapl = MatchingEngine()
+        adapter = OrderAdapter(
+            engine=None,
+            symbol_engines={SYMBOLS["AAPL"]: engine_aapl},
+            dispatch_mode="match",
+        )
+
+        nvda_order = Order(
+            order_id=9301,
+            timestamp_ns=3_000_000,
+            price=500.00,
+            quantity=20,
+            symbol_id=SYMBOLS["NVDA"],  # Not registered
+            side=int(Side.BUY),
+            order_type=int(OrderType.LIMIT),
+        )
+
+        trades = adapter.dispatch_raw_order(nvda_order)
+        assert len(trades) == 0
+        assert adapter.stats.unrouted_symbols == 1
+        assert len(adapter.unrouted_orders) == 1
+        # AAPL engine is completely untouched
+        assert engine_aapl.bid_count() == 0
+
+    def test_adapter_clear_resets_all_state(self, matching_engine: MatchingEngine):
+        """adapter.clear() resets stats, trades, events, and unhandled collections."""
+        adapter = OrderAdapter(engine=matching_engine, dispatch_mode="match")
+
+        # Dispatch a crossing pair to generate state
+        buy = Order(9401, 1_000, 50.00, 10, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT))
+        sell = Order(9402, 1_100, 50.00, 10, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT))
+        adapter.dispatch_raw_order(buy)
+        adapter.dispatch_raw_order(sell)
+
+        assert adapter.stats.total_trades_generated == 1
+        assert len(adapter.trades) == 1
+        assert len(adapter.execution_events) == 2
+
+        adapter.clear()
+
+        assert adapter.stats.total_trades_generated == 0
+        assert adapter.stats.total_orders_dispatched == 0
+        assert len(adapter.trades) == 0
+        assert len(adapter.execution_events) == 0
+
+    def test_adapter_context_manager_clears_on_exit(self, matching_engine: MatchingEngine):
+        """OrderAdapter context manager clears internal state on __exit__."""
+        with OrderAdapter(engine=matching_engine, dispatch_mode="match") as adapter:
+            buy = Order(9501, 1_000, 75.00, 5, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT))
+            adapter.dispatch_raw_order(buy)
+            assert adapter.stats.total_orders_dispatched == 1
+
+        # After context exit, stats should be reset
+        assert adapter.stats.total_orders_dispatched == 0
+
+
+# ==============================================================================
+# Boundary 8: TradeExecutionEvent Introspection
+# ==============================================================================
+
+class TestTradeExecutionEventBoundary:
+    """Verifies that TradeExecutionEvent instances correctly capture per-order telemetry.
+
+    Each dispatched order produces a TradeExecutionEvent stored in
+    adapter.execution_events, which records nanosecond latency and match outcomes.
+    """
+
+    def test_execution_event_emitted_per_dispatched_order(
+        self, matching_engine: MatchingEngine
+    ):
+        """Every dispatched LIMIT order produces exactly one TradeExecutionEvent."""
+        adapter = OrderAdapter(engine=matching_engine, dispatch_mode="match")
+
+        orders = [
+            Order(8001, 1_000, 100.00, 50, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT)),
+            Order(8002, 2_000, 100.00, 50, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT)),
+        ]
+        for o in orders:
+            adapter.dispatch_raw_order(o)
+
+        assert len(adapter.execution_events) == 2
+
+    def test_non_crossing_event_has_matched_false_and_zero_volume(
+        self, matching_engine: MatchingEngine
+    ):
+        """Non-crossing order dispatches emit TradeExecutionEvent with matched=False."""
+        adapter = OrderAdapter(engine=matching_engine, dispatch_mode="match")
+
+        buy = Order(8101, 1_000, 95.00, 100, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT))
+        sell = Order(8102, 2_000, 105.00, 100, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT))
+
+        adapter.dispatch_raw_order(buy)
+        adapter.dispatch_raw_order(sell)
+
+        for event in adapter.execution_events:
+            assert isinstance(event, TradeExecutionEvent)
+            assert event.matched is False
+            assert event.volume_matched == 0
+            assert event.trades == []
+
+    def test_crossing_event_has_matched_true_and_positive_volume(
+        self, matching_engine: MatchingEngine
+    ):
+        """Crossing order dispatch emits TradeExecutionEvent with matched=True and volume>0."""
+        adapter = OrderAdapter(engine=matching_engine, dispatch_mode="match")
+
+        buy = Order(8201, 1_000, 100.00, 50, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT))
+        sell = Order(8202, 2_000, 100.00, 50, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT))
+
+        adapter.dispatch_raw_order(buy)
+        adapter.dispatch_raw_order(sell)
+
+        # BUY event (non-crossing)
+        buy_event = adapter.execution_events[0]
+        assert buy_event.matched is False
+        assert buy_event.volume_matched == 0
+
+        # SELL event (crossing: matches the resting BUY)
+        sell_event = adapter.execution_events[1]
+        assert sell_event.matched is True
+        assert sell_event.volume_matched == 50
+        assert len(sell_event.trades) == 1
+
+    def test_execution_event_latency_ns_is_non_negative(
+        self, matching_engine: MatchingEngine
+    ):
+        """TradeExecutionEvent.latency_ns is always >= 0 and latency_us == latency_ns / 1000."""
+        adapter = OrderAdapter(engine=matching_engine, dispatch_mode="match")
+
+        order = Order(8301, 1_000, 50.00, 25, SYMBOLS["TSLA"], int(Side.BUY), int(OrderType.LIMIT))
+        adapter.dispatch_raw_order(order)
+
+        assert len(adapter.execution_events) == 1
+        ev = adapter.execution_events[0]
+        assert ev.latency_ns >= 0
+        assert ev.exit_timestamp_ns >= ev.entry_timestamp_ns
+        assert ev.latency_us == ev.latency_ns / 1_000.0
+
+    def test_execution_event_order_fields_match_dispatched_order(
+        self, matching_engine: MatchingEngine
+    ):
+        """TradeExecutionEvent captures order_id, symbol_id, side, price, quantity correctly."""
+        adapter = OrderAdapter(engine=matching_engine, dispatch_mode="match")
+
+        order = Order(8401, 9_999, 300.50, 75, SYMBOLS["MSFT"], int(Side.SELL), int(OrderType.LIMIT))
+        adapter.dispatch_raw_order(order)
+
+        ev = adapter.execution_events[0]
+        assert ev.order_id == 8401
+        assert ev.symbol_id == SYMBOLS["MSFT"]
+        assert ev.side == int(Side.SELL)
+        assert abs(ev.price - 300.50) < 1e-6
+        assert ev.quantity == 75
+
+
+# ==============================================================================
+# Boundary 9: Ring Buffer Capacity & Saturation Boundaries
+# ==============================================================================
+
+class TestRingBufferCapacityBoundary:
+    """Verifies ring buffer capacity limits, saturation behaviour, and metric counters."""
+
+    def test_ring_buffer_capacity_tracking(self, isolated_ring_buffer: MmapRingBuffer):
+        """available_to_read + available_to_write must always equal capacity."""
+        capacity = isolated_ring_buffer.capacity
+        assert isolated_ring_buffer.available_to_read() + isolated_ring_buffer.available_to_write() == capacity
+        assert isolated_ring_buffer.is_empty() is True
+
+        # Write a few orders and re-check
+        for i in range(5):
+            isolated_ring_buffer.write(
+                order_id=i + 1,
+                timestamp_ns=i * 1000,
+                price=100.0,
+                quantity=10,
+                symbol_id=SYMBOLS["AAPL"],
+                side=int(Side.BUY),
+                order_type=int(OrderType.LIMIT),
+            )
+
+        assert isolated_ring_buffer.available_to_read() == 5
+        assert isolated_ring_buffer.available_to_write() == capacity - 5
+        assert isolated_ring_buffer.is_empty() is False
+        assert isolated_ring_buffer.is_full() is False
+
+    def test_ring_buffer_write_returns_false_when_full(self):
+        """write() returns False when buffer is full and overwrite_on_full=False."""
+        fd, path = tempfile.mkstemp(prefix="chronos_cap_test_", suffix=".bin")
+        os.close(fd)
+        small_buf = MmapRingBuffer(filepath=path, capacity=4, slot_size=ORDER_SIZE, create=True)
+        try:
+            # Fill all 4 slots
+            for i in range(4):
+                ok = small_buf.write(
+                    order_id=i + 1,
+                    timestamp_ns=i,
+                    price=10.0,
+                    quantity=1,
+                    symbol_id=SYMBOLS["AAPL"],
+                    side=int(Side.BUY),
+                    order_type=int(OrderType.LIMIT),
+                )
+                assert ok is True
+
+            assert small_buf.is_full() is True
+
+            # Next write without overwrite must fail
+            ok = small_buf.write(
+                order_id=99,
+                timestamp_ns=9999,
+                price=10.0,
+                quantity=1,
+                symbol_id=SYMBOLS["AAPL"],
+                side=int(Side.BUY),
+                order_type=int(OrderType.LIMIT),
+                overwrite_on_full=False,
+            )
+            assert ok is False
+            assert small_buf.available_to_read() == 4  # Still 4 orders, nothing lost
+        finally:
+            small_buf.close()
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    def test_ring_buffer_overwrite_on_full_advances_read_tail(self):
+        """overwrite_on_full=True advances read_tail and increments dropped metric."""
+        fd, path = tempfile.mkstemp(prefix="chronos_overwrite_test_", suffix=".bin")
+        os.close(fd)
+        small_buf = MmapRingBuffer(filepath=path, capacity=4, slot_size=ORDER_SIZE, create=True)
+        try:
+            # Fill buffer
+            for i in range(4):
+                small_buf.write(i + 1, i, 10.0, 1, SYMBOLS["AAPL"], int(Side.BUY), 1)
+
+            assert small_buf.is_full() is True
+            dropped_before = small_buf.messages_dropped
+
+            # Overwrite oldest with new order (order_id=99)
+            ok = small_buf.write(
+                order_id=99,
+                timestamp_ns=9999,
+                price=20.0,
+                quantity=5,
+                symbol_id=SYMBOLS["AAPL"],
+                side=int(Side.SELL),
+                order_type=int(OrderType.LIMIT),
+                overwrite_on_full=True,
+            )
+            assert ok is True
+            # Buffer still has capacity orders (oldest was dropped)
+            assert small_buf.available_to_read() == 4
+            # Dropped count incremented
+            assert small_buf.messages_dropped == dropped_before + 1
+        finally:
+            small_buf.close()
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    def test_read_raw_returns_none_on_empty_buffer(self, isolated_ring_buffer: MmapRingBuffer):
+        """read_raw() returns None when the buffer has no unread slots."""
+        assert isolated_ring_buffer.is_empty() is True
+        result = isolated_ring_buffer.read_raw()
+        assert result is None
+
+    def test_batch_write_returns_zero_on_full_buffer(self):
+        """write_batch() returns 0 when the buffer is full and overwrite is disabled."""
+        fd, path = tempfile.mkstemp(prefix="chronos_batch_cap_test_", suffix=".bin")
+        os.close(fd)
+        small_buf = MmapRingBuffer(filepath=path, capacity=4, slot_size=ORDER_SIZE, create=True)
+        try:
+            fill = [(i + 1, i, 10.0, 1, SYMBOLS["AAPL"], int(Side.BUY), 1) for i in range(4)]
+            small_buf.write_batch(fill)
+            assert small_buf.is_full() is True
+
+            extra = [(99, 9999, 10.0, 1, SYMBOLS["AAPL"], int(Side.BUY), 1)]
+            written = small_buf.write_batch(extra, overwrite_on_full=False)
+            assert written == 0
+        finally:
+            small_buf.close()
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
+# ==============================================================================
+# Boundary 10: Consumer-to-Adapter-to-Engine Coupled Pipeline
+# ==============================================================================
+
+class TestConsumerAdapterEngineCoupledPipeline:
+    """Verifies that ZeroCopyConsumer, OrderAdapter, and MatchingEngine work as
+    a coupled in-process pipeline without external processes or mocks."""
+
+    def test_run_consumer_via_adapter_drains_buffer_and_produces_trades(
+        self, isolated_ring_buffer: MmapRingBuffer, matching_engine: MatchingEngine
+    ):
+        """adapter.run_consumer() drains all orders and matches crossing pairs."""
+        adapter = OrderAdapter(
+            ring_buffer=isolated_ring_buffer,
+            engine=matching_engine,
+            dispatch_mode="match",
+        )
+
+        # 3 orders: BUY @ 50.00, BUY @ 48.00, SELL @ 50.00
+        # Only the first BUY and the SELL cross; second BUY does not
+        orders = [
+            (7001, 1_000, 50.00, 20, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT)),
+            (7002, 2_000, 48.00, 20, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT)),
+            (7003, 3_000, 50.00, 20, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT)),
+        ]
+        isolated_ring_buffer.write_batch(orders)
+        assert isolated_ring_buffer.available_to_read() == 3
+
+        consumer = ZeroCopyConsumer(isolated_ring_buffer, batch_size=10)
+        final_stats = adapter.run_consumer(
+            consumer=consumer,
+            total_orders=3,
+            print_progress=False,
+        )
+
+        assert isolated_ring_buffer.is_empty() is True
+        assert final_stats.total_orders_read == 3
+        assert final_stats.total_trades_generated == 1
+        assert final_stats.total_volume_matched == 20
+
+        # Only BUY 7001 at $50.00 matched with SELL 7003
+        assert len(adapter.trades) == 1
+        trade = adapter.trades[0]
+        assert trade.buy_order_id == 7001
+        assert trade.sell_order_id == 7003
+        assert trade.executed_quantity == 20
+
+        # BUY 7002 at $48.00 rests in bids; SELL 7003 fully matched
+        assert matching_engine.bid_count() == 1
+        assert matching_engine.ask_count() == 0
+        assert matching_engine.get_best_buy_order().order_id == 7002
+
+    def test_consumer_with_adapter_exit_when_empty(
+        self, isolated_ring_buffer: MmapRingBuffer, matching_engine: MatchingEngine
+    ):
+        """Consumer with exit_when_empty=True terminates cleanly on an already-drained buffer."""
+        adapter = OrderAdapter(
+            ring_buffer=isolated_ring_buffer,
+            engine=matching_engine,
+            dispatch_mode="match",
+        )
+
+        # Write one order and consume it immediately
+        isolated_ring_buffer.write(
+            order_id=7101,
+            timestamp_ns=1_000,
+            price=100.00,
+            quantity=10,
+            symbol_id=SYMBOLS["NVDA"],
+            side=int(Side.BUY),
+            order_type=int(OrderType.LIMIT),
+        )
+
+        consumer = ZeroCopyConsumer(isolated_ring_buffer, batch_size=5)
+        final_stats = adapter.run_consumer(
+            consumer=consumer,
+            exit_when_empty=True,
+            print_progress=False,
+        )
+
+        assert final_stats.total_orders_read == 1
+        assert isolated_ring_buffer.is_empty() is True
+        assert consumer.is_running is False
+
+    def test_scenario_7_fifo_via_consumer_to_engine(
+        self, isolated_ring_buffer: MmapRingBuffer, matching_engine: MatchingEngine
+    ):
+        """FIFO priority scenario (Scenario 7) executed via run_consumer produces correct fills."""
+        adapter = OrderAdapter(
+            ring_buffer=isolated_ring_buffer,
+            engine=matching_engine,
+            dispatch_mode="match",
+        )
+        scenario = SCENARIO_7_FIFO_SAME_PRICE
+
+        # Load scenario orders into ring buffer via protocol encoding
+        for sc_order in scenario.orders:
+            isolated_ring_buffer.write_order(sc_order.to_protocol_order())
+
+        consumer = ZeroCopyConsumer(isolated_ring_buffer, batch_size=10)
+        adapter.run_consumer(consumer=consumer, total_orders=len(scenario.orders), print_progress=False)
+
+        # Verify against expected scenario outcome
+        assert len(adapter.trades) == len(scenario.expected.trades)
+        total_matched = sum(t.executed_quantity for t in adapter.trades)
+        assert total_matched == scenario.expected.total_matched_quantity
+
+        # FIFO: Order 701 must fill first (40 shares), then Order 702 partially fills (10 shares)
+        assert adapter.trades[0].buy_order_id == scenario.expected.trades[0].buy_order_id
+        assert adapter.trades[1].buy_order_id == scenario.expected.trades[1].buy_order_id
+
+
+# ==============================================================================
+# Boundary 11: AdapterStats Accumulation Across Multiple Dispatch Calls
+# ==============================================================================
+
+class TestAdapterStatsAccumulation:
+    """Verifies that AdapterStats accumulates correctly across sequential dispatch calls."""
+
+    def test_stats_accumulate_across_multiple_crossing_orders(
+        self, matching_engine: MatchingEngine
+    ):
+        """Multiple crossing pairs accumulate correctly in AdapterStats."""
+        adapter = OrderAdapter(engine=matching_engine, dispatch_mode="match")
+        sym = SYMBOLS["AAPL"]
+
+        # Submit 3 crossing pairs
+        pairs = [
+            (Order(1, 100, 10.00, 10, sym, int(Side.BUY), int(OrderType.LIMIT)),
+             Order(2, 200, 10.00, 10, sym, int(Side.SELL), int(OrderType.LIMIT))),
+            (Order(3, 300, 20.00, 25, sym, int(Side.BUY), int(OrderType.LIMIT)),
+             Order(4, 400, 20.00, 25, sym, int(Side.SELL), int(OrderType.LIMIT))),
+            (Order(5, 500, 30.00, 15, sym, int(Side.BUY), int(OrderType.LIMIT)),
+             Order(6, 600, 30.00, 15, sym, int(Side.SELL), int(OrderType.LIMIT))),
+        ]
+
+        for buy, sell in pairs:
+            adapter.dispatch_raw_order(buy)
+            adapter.dispatch_raw_order(sell)
+
+        s = adapter.stats
+        assert s.total_orders_dispatched == 6
+        assert s.total_trades_generated == 3
+        assert s.total_volume_matched == 50  # 10 + 25 + 15
+        assert s.non_crossing_orders == 3    # Each BUY was non-crossing on submission
+
+    def test_stats_latency_samples_non_negative(self, matching_engine: MatchingEngine):
+        """All recorded execution latency samples in AdapterStats are non-negative."""
+        adapter = OrderAdapter(engine=matching_engine, dispatch_mode="match")
+        sym = SYMBOLS["NVDA"]
+
+        for i in range(5):
+            order = Order(
+                order_id=100 + i,
+                timestamp_ns=i * 1_000,
+                price=50.0 + i,
+                quantity=10,
+                symbol_id=sym,
+                side=int(Side.BUY),
+                order_type=int(OrderType.LIMIT),
+            )
+            adapter.dispatch_raw_order(order)
+
+        assert adapter.stats.latency_samples_count == 5
+        for lat in adapter.stats.execution_latencies_ns:
+            assert lat >= 0
+        assert adapter.stats.min_execution_latency_ns >= 0
+        assert adapter.stats.max_execution_latency_ns >= adapter.stats.min_execution_latency_ns
+
+    def test_stats_avg_latency_property_returns_float(self, matching_engine: MatchingEngine):
+        """avg_execution_latency_ns returns 0.0 on empty stats and a float once sampled."""
+        adapter = OrderAdapter(engine=matching_engine, dispatch_mode="match")
+
+        # Empty: should return 0.0
+        assert adapter.stats.avg_execution_latency_ns == 0.0
+        assert isinstance(adapter.stats.avg_execution_latency_ns, float)
+
+        order = Order(1, 100, 50.00, 10, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT))
+        adapter.dispatch_raw_order(order)
+
+        # After dispatch: float
+        assert isinstance(adapter.stats.avg_execution_latency_ns, float)
+
+    def test_stats_percentile_returns_zero_on_empty(self):
+        """percentile_latency_ns returns 0.0 when no samples have been recorded."""
+        stats = AdapterStats()
+        assert stats.percentile_latency_ns(50.0) == 0.0
+        assert stats.percentile_latency_ns(99.0) == 0.0
+        assert stats.p50_execution_latency_ns == 0.0
+        assert stats.p99_execution_latency_ns == 0.0
+
+    def test_stats_get_trade_latency_snapshot_matches_tracker(
+        self, matching_engine: MatchingEngine
+    ):
+        """stats.get_trade_latency_snapshot() reflects the same values as the stats fields."""
+        adapter = OrderAdapter(engine=matching_engine, dispatch_mode="match")
+
+        buy = Order(1, 100, 100.00, 50, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT))
+        sell = Order(2, 200, 100.00, 50, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT))
+        adapter.dispatch_raw_order(buy)
+        adapter.dispatch_raw_order(sell)
+
+        snap = adapter.stats.get_trade_latency_snapshot()
+        assert snap.trade_count == adapter.stats.total_trades_generated
+        assert snap.min_latency_ns == adapter.stats.min_execution_latency_ns
+        assert snap.max_latency_ns == adapter.stats.max_execution_latency_ns
+
+
+# ==============================================================================
+# Boundary 12: Pipeline Component Interface Smoke Tests
+# ==============================================================================
+
+class TestPipelineComponentInterfaceSmoke:
+    """Lightweight smoke tests verifying that core pipeline component interfaces
+    are present and callable as expected. These protect against interface regressions
+    and serve as a living specification of the Day 6 integration contract.
+    """
+
+    def test_matching_engine_is_ready_and_has_expected_interface(self):
+        """MatchingEngine exposes all required integration-layer APIs."""
+        engine = MatchingEngine()
+        assert engine.is_ready() is True
+        assert engine.bid_count() == 0
+        assert engine.ask_count() == 0
+        assert engine.order_count() == 0
+        assert engine.has_crossing_prices() is False
+        assert engine.get_best_buy_order() is None
+        assert engine.get_best_sell_order() is None
+        # On an empty book get_best_bid/ask_price return None or 0.0 depending on engine version
+        bid_price = engine.get_best_bid_price()
+        ask_price = engine.get_best_ask_price()
+        assert bid_price is None or bid_price == 0.0
+        assert ask_price is None or ask_price == 0.0
+        spread = engine.get_spread()
+        assert spread is None or spread == 0.0
+        assert engine.get_prioritized_bids() == []
+        assert engine.get_prioritized_asks() == []
+        engine.clear()
+
+    def test_ring_buffer_exposes_required_read_write_interface(
+        self, isolated_ring_buffer: MmapRingBuffer
+    ):
+        """MmapRingBuffer exposes all integration-layer read/write APIs."""
+        assert hasattr(isolated_ring_buffer, "write")
+        assert hasattr(isolated_ring_buffer, "write_order")
+        assert hasattr(isolated_ring_buffer, "write_batch")
+        assert hasattr(isolated_ring_buffer, "read_raw")
+        assert hasattr(isolated_ring_buffer, "read_order")
+        assert hasattr(isolated_ring_buffer, "read_batch_raw")
+        assert hasattr(isolated_ring_buffer, "read_batch_orders")
+        assert hasattr(isolated_ring_buffer, "available_to_read")
+        assert hasattr(isolated_ring_buffer, "available_to_write")
+        assert hasattr(isolated_ring_buffer, "is_empty")
+        assert hasattr(isolated_ring_buffer, "is_full")
+        assert hasattr(isolated_ring_buffer, "close")
+        assert isolated_ring_buffer.slot_size == ORDER_SIZE
+        assert isolated_ring_buffer.capacity > 0
+
+    def test_consumer_stats_has_expected_fields(self):
+        """ConsumerStats dataclass has all required tracking fields."""
+        stats = ConsumerStats()
+        assert hasattr(stats, "total_orders_read")
+        assert hasattr(stats, "elapsed_time")
+        assert hasattr(stats, "avg_rate")
+        assert hasattr(stats, "min_latency_us")
+        assert hasattr(stats, "max_latency_us")
+        assert hasattr(stats, "avg_latency_us")
+        assert stats.total_orders_read == 0
+
+    def test_adapter_stats_has_expected_fields(self):
+        """AdapterStats dataclass has all required tracking fields."""
+        stats = AdapterStats()
+        assert hasattr(stats, "total_orders_read")
+        assert hasattr(stats, "total_orders_dispatched")
+        assert hasattr(stats, "total_trades_generated")
+        assert hasattr(stats, "total_volume_matched")
+        assert hasattr(stats, "non_crossing_orders")
+        assert hasattr(stats, "unhandled_order_types")
+        assert hasattr(stats, "unrouted_symbols")
+        assert hasattr(stats, "execution_latencies_ns")
+        assert hasattr(stats, "avg_execution_latency_ns")
+        assert hasattr(stats, "percentile_latency_ns")
+
+    def test_zero_copy_consumer_interface_contract(
+        self, isolated_ring_buffer: MmapRingBuffer
+    ):
+        """ZeroCopyConsumer exposes the minimum interface required by the pipeline."""
+        consumer = ZeroCopyConsumer(isolated_ring_buffer, batch_size=100)
+        assert hasattr(consumer, "run")
+        assert hasattr(consumer, "drain_available")
+        assert hasattr(consumer, "stop")
+        assert hasattr(consumer, "is_running")
+        assert hasattr(consumer, "stats")
+        assert consumer.is_running is False
+
+    def test_order_adapter_symbol_routing_interface(self, matching_engine: MatchingEngine):
+        """OrderAdapter.resolve_engine correctly maps symbol IDs to engines."""
+        engine_aapl = MatchingEngine()
+        engine_nvda = MatchingEngine()
+
+        adapter = OrderAdapter(
+            symbol_engines={
+                SYMBOLS["AAPL"]: engine_aapl,
+                SYMBOLS["NVDA"]: engine_nvda,
+            },
+            dispatch_mode="match",
+        )
+
+        assert adapter.resolve_engine(SYMBOLS["AAPL"]) is engine_aapl
+        assert adapter.resolve_engine(SYMBOLS["NVDA"]) is engine_nvda
+        assert adapter.resolve_engine(SYMBOLS["TSLA"]) is None
+
+    def test_price_to_cents_converts_precisely(self):
+        """price_to_cents produces correct integer cent conversions without float drift."""
+        assert price_to_cents(100.00) == 10000
+        assert price_to_cents(100.01) == 10001
+        assert price_to_cents(99.99) == 9999
+        assert price_to_cents(0.01) == 1
+        assert price_to_cents(9999.99) == 999999
+        assert price_to_cents(225.50) == 22550
