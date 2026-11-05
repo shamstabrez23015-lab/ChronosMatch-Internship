@@ -56,6 +56,7 @@ LABEL_BID_ASK_SPREAD = LABEL_SPREAD
 # Performance field labels
 LABEL_TOTAL_ORDERS = "Total Orders Processed"
 LABEL_ORDERS_PROCESSED = LABEL_TOTAL_ORDERS
+LABEL_PROCESSED_ORDERS = LABEL_TOTAL_ORDERS
 LABEL_THROUGHPUT = "Throughput (orders/sec)"
 LABEL_LATENCY = "Latency (microseconds)"
 
@@ -572,6 +573,7 @@ def format_orders_processed(count: Optional[Union[int, str]]) -> str:
 
 # Alias matching total orders label
 format_total_orders = format_orders_processed
+format_processed_orders = format_orders_processed
 
 
 def get_sample_orders_processed() -> int:
@@ -1526,6 +1528,14 @@ class TerminalDashboard:
     def update_orders_processed(self, count: int) -> None:
         """Alias for set_orders_processed, ready for live engine snapshot integration."""
         self.set_orders_processed(count)
+
+    def get_orders_processed(self) -> int:
+        """Return the current number of processed orders."""
+        return self.orders_processed
+
+    def get_orders_processed_display(self) -> str:
+        """Return the formatted processed orders count for display."""
+        return format_orders_processed(self.orders_processed)
 
     def increment_orders_processed(self, delta: int = 1) -> int:
         """Increment the processed orders counter by delta.

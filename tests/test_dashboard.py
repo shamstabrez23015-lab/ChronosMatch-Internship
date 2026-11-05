@@ -30,6 +30,7 @@ from chronos.dashboard import (
     LABEL_SPREAD,
     LABEL_TOTAL_ORDERS,
     LABEL_ORDERS_PROCESSED,
+    LABEL_PROCESSED_ORDERS,
     LABEL_THROUGHPUT,
     LABEL_LATENCY,
     DEMO_ORDERS_PROCESSED,
@@ -60,6 +61,7 @@ from chronos.dashboard import (
     format_price,
     format_spread,
     format_total_orders,
+    format_processed_orders,
     get_sample_buy_orders,
     get_sample_sell_orders,
     get_sample_orders_processed,
@@ -4261,3 +4263,405 @@ class TestOrderBookDepthDisplayRequirements:
         assert b_depth[0] == PriceLevel(510.0, 100)
         assert len(s_depth) == 1
         assert s_depth[0] == PriceLevel(500.0, 100)
+
+
+# ===========================================================================
+# Section 36: Week 3 Day 6 - Processed-Order Counter in Dashboard Tests
+# ===========================================================================
+
+
+class TestProcessedOrderCounterDay6:
+    """Comprehensive tests for Week 3 Day 6: Processed-Order Counter in Dashboard."""
+
+    # -----------------------------------------------------------------------
+    # 1. Initial Display and Demo Mechanism Tests
+    # -----------------------------------------------------------------------
+
+    def test_counter_initial_display_default_zero(self):
+        """Dashboard counter defaults to 0 and formats cleanly as '0' initially."""
+        dashboard = TerminalDashboard()
+        assert dashboard.orders_processed == 0
+        assert dashboard.get_orders_processed() == 0
+        assert dashboard.get_orders_processed_display() == "0"
+
+        lines = dashboard.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+        assert LABEL_TOTAL_ORDERS in text
+        assert LABEL_ORDERS_PROCESSED in text
+        assert LABEL_PROCESSED_ORDERS in text
+
+        # Verify performance section has 0 right-aligned
+        perf_idx = next(i for i, line in enumerate(lines) if SECTION_PERFORMANCE in line)
+        footer_idx = next(i for i, line in enumerate(lines) if QUIT_MESSAGE in line)
+        perf_lines = lines[perf_idx:footer_idx]
+        order_line = next(line for line in perf_lines if LABEL_TOTAL_ORDERS in line)
+        assert "0" in order_line
+
+    def test_counter_documented_demo_value_and_sample_data_mechanism(self):
+        """Documented demo constant exists and is clearly distinguishable from live counts."""
+        # Demo constants are defined and documented
+        assert DEMO_ORDERS_PROCESSED == 125
+        assert get_sample_orders_processed() == 125
+
+        # Creating a dashboard using sample data documents this in the status header
+        dashboard = TerminalDashboard(use_sample_data=True, orders_processed=get_sample_orders_processed())
+        assert dashboard.orders_processed == 125
+        assert dashboard.get_orders_processed_display() == "125"
+
+        lines = dashboard.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+        # Clear labeling ensures demo status is explicit to avoid false live engine presentation
+        assert "Demo: Sample Data" in text
+        assert "125" in text
+
+    def test_counter_live_mode_distinction(self):
+        """In live mode, dashboard clearly reports live connection and displays real count."""
+        bridge = MagicMock()
+        bridge.is_connected = True
+        bridge.sync_to_dashboard = MagicMock()
+
+        dashboard = TerminalDashboard(live_feed=bridge, orders_processed=42)
+        assert dashboard.status_message == "Live: Connected"
+        assert dashboard.orders_processed == 42
+        assert dashboard.get_orders_processed_display() == "42"
+
+        lines = dashboard.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+        assert "Live: Connected" in text
+        assert "Demo: Sample Data" not in text
+        assert "42" in text
+
+    # -----------------------------------------------------------------------
+    # 2. Zero Value Handling Tests
+    # -----------------------------------------------------------------------
+
+    def test_counter_zero_value_formatting_pure_functions(self):
+        """Pure formatting functions handle zero correctly."""
+        assert format_orders_processed(0) == "0"
+        assert format_orders_processed("0") == "0"
+        assert format_total_orders(0) == "0"
+        assert format_processed_orders(0) == "0"
+
+    def test_counter_zero_value_build_performance_lines(self):
+        """build_performance_lines renders zero cleanly for total_orders and orders_processed."""
+        lines_total = build_performance_lines(width=72, total_orders=0)
+        text_total = "\n".join(lines_total)
+        assert LABEL_TOTAL_ORDERS in text_total
+        assert "       0" in text_total or " 0" in text_total
+
+        lines_alias = build_performance_lines(width=72, orders_processed=0)
+        text_alias = "\n".join(lines_alias)
+        assert LABEL_TOTAL_ORDERS in text_alias
+        assert "       0" in text_alias or " 0" in text_alias
+
+    def test_counter_zero_value_in_curses_rendering(self):
+        """Curses render() writes zero value without error or blanking."""
+        dashboard = TerminalDashboard(orders_processed=0)
+        win = MockCursesWindow(rows=40, cols=100)
+        dashboard.render(win)
+
+        assert win.erased is True
+        assert win.refreshed is True
+
+        order_calls = [c[2] for c in win.addstr_calls if LABEL_TOTAL_ORDERS in c[2]]
+        assert len(order_calls) == 1
+        assert "0" in order_calls[0]
+
+    # -----------------------------------------------------------------------
+    # 3. Positive Values and Formatting Tests
+    # -----------------------------------------------------------------------
+
+    def test_counter_positive_integer_formatting(self):
+        """Positive integer values format with thousands separators."""
+        assert format_orders_processed(1) == "1"
+        assert format_orders_processed(999) == "999"
+        assert format_orders_processed(1000) == "1,000"
+        assert format_orders_processed(12500) == "12,500"
+        assert format_orders_processed(1000000) == "1,000,000"
+        assert format_orders_processed(50000000) == "50,000,000"
+
+    def test_counter_positive_string_integer_formatting(self):
+        """String representation of positive integer formats correctly."""
+        assert format_orders_processed("12500") == "12,500"
+        assert format_processed_orders("100000") == "100,000"
+
+    def test_counter_none_returns_placeholder(self):
+        """None input produces standard PLACEHOLDER without raising error."""
+        assert format_orders_processed(None) == PLACEHOLDER
+        assert format_processed_orders(None) == PLACEHOLDER
+
+    def test_counter_rejects_negative_values(self):
+        """All APIs reject negative values with ValueError."""
+        dashboard = TerminalDashboard()
+
+        with pytest.raises(ValueError, match="cannot be negative"):
+            dashboard.orders_processed = -1
+
+        with pytest.raises(ValueError, match="cannot be negative"):
+            dashboard.set_orders_processed(-10)
+
+        with pytest.raises(ValueError, match="cannot be negative"):
+            dashboard.increment_orders_processed(-5)
+
+        with pytest.raises(ValueError, match="cannot be negative"):
+            TerminalDashboard(orders_processed=-1)
+
+        with pytest.raises(ValueError, match="cannot be negative"):
+            format_orders_processed(-1)
+
+        with pytest.raises(ValueError, match="cannot be negative"):
+            format_processed_orders(-100)
+
+    def test_counter_rejects_invalid_types_on_init_and_set(self):
+        """Non-integer convertible values raise ValueError."""
+        with pytest.raises(ValueError, match="must be an integer"):
+            TerminalDashboard(orders_processed="abc")
+
+        dashboard = TerminalDashboard()
+        with pytest.raises(ValueError, match="must be an integer"):
+            dashboard.orders_processed = "invalid"
+
+        with pytest.raises(ValueError, match="must be an integer"):
+            dashboard.set_orders_processed(None)
+
+    # -----------------------------------------------------------------------
+    # 4. State Management and Event Ingestion Tests
+    # -----------------------------------------------------------------------
+
+    def test_counter_set_and_update_methods(self):
+        """Explicit set and update methods update the counter value."""
+        dashboard = TerminalDashboard()
+        assert dashboard.orders_processed == 0
+
+        dashboard.set_orders_processed(50)
+        assert dashboard.orders_processed == 50
+        assert dashboard.get_orders_processed() == 50
+
+        dashboard.update_orders_processed(150)
+        assert dashboard.orders_processed == 150
+        assert dashboard.get_orders_processed_display() == "150"
+
+    def test_counter_increment_method(self):
+        """increment_orders_processed increments by default (1) or custom delta."""
+        dashboard = TerminalDashboard()
+        assert dashboard.increment_orders_processed() == 1
+        assert dashboard.increment_orders_processed(1) == 2
+        assert dashboard.increment_orders_processed(98) == 100
+        assert dashboard.orders_processed == 100
+
+    def test_counter_record_order_processed_events(self):
+        """record_order_processed handles various order formats."""
+        dashboard = TerminalDashboard()
+
+        # 1. Dict format
+        d1 = {"order_id": 101, "side": 1, "price": 500.0, "quantity": 10}
+        assert dashboard.record_order_processed(d1) == 1
+
+        # 2. Tuple format
+        t1 = (102, 1, 501.0, 20)
+        assert dashboard.record_order_processed(t1) == 2
+
+        # 3. None format (anonymous order event)
+        assert dashboard.record_order_processed(None) == 3
+
+        assert dashboard.orders_processed == 3
+
+    def test_counter_duplicate_order_id_deduplication(self):
+        """Duplicate fills or events for the same order_id do not over-increment."""
+        dashboard = TerminalDashboard()
+
+        order_fill_1 = {"order_id": 999, "fill": 1, "quantity": 10}
+        order_fill_2 = {"order_id": 999, "fill": 2, "quantity": 20}
+        order_fill_3 = {"order_id": 999, "fill": 3, "quantity": 30}
+
+        dashboard.record_order_processed(order_fill_1)
+        assert dashboard.orders_processed == 1
+
+        # Additional fills for same order do not increment
+        dashboard.record_order_processed(order_fill_2)
+        dashboard.record_order_processed(order_fill_3)
+        assert dashboard.orders_processed == 1
+
+        # A new order_id increments
+        new_order = {"order_id": 1000, "fill": 1, "quantity": 50}
+        dashboard.record_order_processed(new_order)
+        assert dashboard.orders_processed == 2
+
+    def test_counter_reset_orders_processed(self):
+        """reset_orders_processed resets counter and cleared seen IDs."""
+        dashboard = TerminalDashboard(orders_processed=500)
+        dashboard.record_order_processed({"order_id": 77})
+        assert dashboard.orders_processed == 501
+
+        dashboard.reset_orders_processed()
+        assert dashboard.orders_processed == 0
+        assert dashboard.get_orders_processed_display() == "0"
+
+        # The previously seen order ID can now be recorded again
+        dashboard.record_order_processed({"order_id": 77})
+        assert dashboard.orders_processed == 1
+
+    # -----------------------------------------------------------------------
+    # 5. Refresh Stability Tests (No Accidental Corruption or Reset)
+    # -----------------------------------------------------------------------
+
+    def test_counter_preserved_across_multiple_render_calls(self):
+        """Calling render() repeatedly does not change or corrupt counter value."""
+        dashboard = TerminalDashboard(orders_processed=125)
+        win = MockCursesWindow(rows=40, cols=100)
+
+        # 20 consecutive render frames
+        for _ in range(20):
+            dashboard.render(win)
+
+        assert dashboard.orders_processed == 125
+        assert dashboard.get_orders_processed_display() == "125"
+
+    def test_counter_preserved_across_multiple_get_display_lines_calls(self):
+        """Calling get_display_lines() repeatedly does not change counter value."""
+        dashboard = TerminalDashboard(orders_processed=9876)
+
+        for _ in range(20):
+            lines = dashboard.get_display_lines(rows=40, cols=100)
+            assert "9,876" in "\n".join(lines)
+
+        assert dashboard.orders_processed == 9876
+
+    def test_counter_preserved_through_curses_event_loop_frames(self):
+        """Curses event loop execution over multiple frames maintains counter stability."""
+        dashboard = TerminalDashboard(orders_processed=350)
+        win = MockCursesWindow(rows=40, cols=100, keys=[-1, -1, -1, ord("q")])
+
+        dashboard.run_curses(win, max_iterations=10)
+
+        assert dashboard.is_running is False
+        assert dashboard.frame_count == 4
+        assert dashboard.orders_processed == 350
+        assert dashboard.get_orders_processed_display() == "350"
+
+    # -----------------------------------------------------------------------
+    # 6. Terminal Sizing and Screen Budget Tests
+    # -----------------------------------------------------------------------
+
+    def test_counter_renders_in_standard_window(self):
+        """Renders properly in standard 80x40 window."""
+        dashboard = TerminalDashboard(orders_processed=2500)
+        win = MockCursesWindow(rows=40, cols=80)
+        dashboard.render(win)
+
+        rendered_text = " ".join(c[2] for c in win.addstr_calls)
+        assert SECTION_PERFORMANCE in rendered_text
+        assert LABEL_TOTAL_ORDERS in rendered_text
+        assert "2,500" in rendered_text
+
+    def test_counter_renders_at_exact_minimum_window(self):
+        """Renders properly at exact minimum window size (72x30)."""
+        dashboard = TerminalDashboard(orders_processed=123)
+        win = MockCursesWindow(rows=MIN_TERMINAL_ROWS, cols=MIN_TERMINAL_COLS)
+        dashboard.render(win)
+
+        rendered_text = " ".join(c[2] for c in win.addstr_calls)
+        assert SECTION_PERFORMANCE in rendered_text
+        assert "123" in rendered_text
+
+    def test_counter_renders_in_wide_window(self):
+        """Renders properly in wide window (120x40)."""
+        dashboard = TerminalDashboard(orders_processed=500000)
+        win = MockCursesWindow(rows=40, cols=120)
+        dashboard.render(win)
+
+        rendered_text = " ".join(c[2] for c in win.addstr_calls)
+        assert SECTION_PERFORMANCE in rendered_text
+        assert "500,000" in rendered_text
+
+    def test_counter_small_terminal_fallback_does_not_crash(self):
+        """Below-minimum terminal gracefully handles small screen without crashing."""
+        dashboard = TerminalDashboard(orders_processed=500)
+        win = MockCursesWindow(rows=10, cols=30)
+        dashboard.render(win)
+
+        rendered_text = " ".join(c[2] for c in win.addstr_calls)
+        assert "too small" in rendered_text.lower()
+        assert QUIT_MESSAGE in rendered_text
+        # Counter value is not corrupted even on small window
+        assert dashboard.orders_processed == 500
+
+    # -----------------------------------------------------------------------
+    # 7. Preservation of Existing Dashboard Functionality
+    # -----------------------------------------------------------------------
+
+    def test_counter_preserves_order_book_depth_display(self):
+        """Day 5 order-book depth display remains completely intact with counter active."""
+        dashboard = TerminalDashboard(orders_processed=1000)
+
+        buy_depth = dashboard.get_buy_depth(max_levels=5)
+        sell_depth = dashboard.get_sell_depth(max_levels=5)
+
+        # 5 levels each for sample data
+        assert len(buy_depth) == 5
+        assert len(sell_depth) == 5
+
+        # Bids sorted descending
+        for i in range(len(buy_depth) - 1):
+            assert buy_depth[i].price > buy_depth[i + 1].price
+
+        # Asks sorted ascending
+        for i in range(len(sell_depth) - 1):
+            assert sell_depth[i].price < sell_depth[i + 1].price
+
+        # Verified in display output
+        lines = dashboard.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_ORDER_BOOK in text
+        assert "500.00" in text  # Best bid
+        assert "505.00" in text  # Best ask
+        assert "1,000" in text   # Processed order counter
+
+    def test_counter_preserves_market_summary_and_latency_metrics(self):
+        """Market summary and latency metrics remain functional with counter active."""
+        ns_clock = FakeNsClock(start_ns=0)
+        dashboard = TerminalDashboard(ns_clock=ns_clock, orders_processed=0, use_sample_data=False)
+
+        # Record two events to establish inter-event latency
+        dashboard.record_order_processed({"order_id": 1})
+        ns_clock.advance_us(150.0)
+        dashboard.record_order_processed({"order_id": 2})
+
+        assert dashboard.orders_processed == 2
+        assert dashboard.get_latency_display() == "150.0"
+
+        # Record trade execution
+        dashboard.record_trade_execution(latency_us=25.0)
+        assert dashboard.trades_processed == 1
+        assert "25" in dashboard.get_trade_latency_display()
+
+        lines = dashboard.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+
+        assert SECTION_MARKET_SUMMARY in text
+        assert SECTION_PERFORMANCE in text
+        assert SECTION_TRADE_EXECUTION in text
+        assert LABEL_TOTAL_ORDERS in text
+        assert "2" in text
+        assert "150.0" in text
+        assert "25" in text
+
+    def test_counter_does_not_execute_matching_logic(self):
+        """Dashboard does not cross or execute orders internally."""
+        crossed_buys = [{"side": 1, "price": 600.0, "quantity": 100}]
+        crossed_sells = [{"side": 2, "price": 500.0, "quantity": 100}]
+
+        dashboard = TerminalDashboard(
+            use_sample_data=False,
+            buy_orders=crossed_buys,
+            sell_orders=crossed_sells,
+            orders_processed=0,
+        )
+
+        # Ingesting orders does not trigger match execution in dashboard
+        b_depth = dashboard.get_buy_depth()
+        s_depth = dashboard.get_sell_depth()
+        assert len(b_depth) == 1
+        assert len(s_depth) == 1
+        # Orders processed count does not change automatically due to crossed book
+        assert dashboard.orders_processed == 0
