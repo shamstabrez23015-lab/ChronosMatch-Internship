@@ -59,6 +59,18 @@ Week 3, Day 5:
   * Added COrder helper properties (filled_quantity, is_filled, is_partially_filled).
   * Added TradeResult helper properties (price, trade_quantity, is_full_fill, is_partial_fill).
 
+Week 3, Day 6:
+- Multi-Order Matching Extensions:
+  * One incoming order executes against multiple eligible resting orders in strict price-time priority.
+  * Sweeps across same-price FIFO queue and across multiple price levels in a single pass.
+  * Correctly handles partial fills mid-sweep and complete fills across N resting orders.
+  * Updates remaining_quantity on each resting order after every individual execution step.
+  * Removes fully filled resting orders from the order book immediately after each execution.
+  * Preserves residual incoming quantity as a resting order when not fully executed.
+  * Guarantees total executed quantity never exceeds incoming or any individual resting order quantity.
+  * Guarantees no negative quantities in any TradeResult or any order remaining_quantity field.
+
+
 Price Representation
 --------------------
 The Week 1 binary protocol stores prices as ``double`` (64-bit IEEE 754
