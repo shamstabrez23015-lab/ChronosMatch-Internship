@@ -27,6 +27,7 @@ import pytest
 
 from chronos.adapter import AdapterStats, OrderAdapter, TradeExecutionEvent
 from chronos.consumer import ConsumerStats, ZeroCopyConsumer
+from chronos.firehose import FastOrderGenerator
 from chronos.matching_engine import COrder, MatchingEngine, TradeResult, price_to_cents
 from chronos.ring_buffer import MmapRingBuffer
 from chronos.protocol import (
@@ -79,6 +80,18 @@ def matching_engine() -> Generator[MatchingEngine, None, None]:
     assert engine.is_ready() is True
     yield engine
     engine.clear()
+
+
+@pytest.fixture
+def order_adapter(
+    isolated_ring_buffer: MmapRingBuffer, matching_engine: MatchingEngine
+) -> OrderAdapter:
+    """Provide an OrderAdapter connecting isolated ring buffer to matching engine."""
+    return OrderAdapter(
+        ring_buffer=isolated_ring_buffer,
+        engine=matching_engine,
+        dispatch_mode="match",
+    )
 
 
 @pytest.fixture
@@ -1421,3 +1434,176 @@ class TestPipelineComponentInterfaceSmoke:
         assert price_to_cents(0.01) == 1
         assert price_to_cents(9999.99) == 999999
         assert price_to_cents(225.50) == 22550
+
+
+# ==============================================================================
+# Boundary 13: End-to-End Firehose Producer to Engine Integration (Day 7)
+# ==============================================================================
+
+class TestEndToEndOrderFlowFirehoseToEngineBoundary:
+    """Verifies the complete pipeline flow from FastOrderGenerator producer to MatchingEngine."""
+
+    def test_producer_to_engine_roundtrip_via_consumer_adapter(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        matching_engine: MatchingEngine,
+        order_adapter: OrderAdapter,
+    ):
+        """FastOrderGenerator generates orders into ring buffer, drained by ZeroCopyConsumer into engine."""
+        generator = FastOrderGenerator(initial_order_id=20000)
+        batch = generator.generate_batch(batch_size=50)
+        assert len(batch) == 50
+
+        written = isolated_ring_buffer.write_batch(batch)
+        assert written == 50
+        assert isolated_ring_buffer.available_to_read() == 50
+
+        consumer = ZeroCopyConsumer(
+            ring_buffer=isolated_ring_buffer,
+            batch_size=25,
+            order_handler=order_adapter.dispatch_raw_order,
+        )
+        stats = consumer.run(total_orders=50, print_progress=False)
+
+        assert stats.total_orders_read == 50
+        assert isolated_ring_buffer.is_empty() is True
+        assert (
+            order_adapter.stats.total_orders_dispatched
+            + order_adapter.stats.unhandled_order_types
+            == 50
+        )
+
+    def test_empty_buffer_immediate_drain_returns_zero(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        order_adapter: OrderAdapter,
+    ):
+        """Draining an empty buffer returns zero trades and does not mutate engine state."""
+        assert isolated_ring_buffer.is_empty() is True
+        trades = order_adapter.drain_all()
+        assert len(trades) == 0
+        assert order_adapter.stats.total_orders_read == 0
+
+    def test_burst_queued_orders_drained_in_batches_preserves_invariants(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        matching_engine: MatchingEngine,
+        order_adapter: OrderAdapter,
+    ):
+        """Burst of 60 orders (30 BUY @ 150.00, 30 SELL @ 150.00) drained in batches matches completely."""
+        sym_id = SYMBOLS["AAPL"]
+        base_ts = 1_700_000_000_000_000_000
+        orders = []
+        for i in range(30):
+            orders.append(
+                (21000 + i, base_ts + i * 10, 150.00, 10, sym_id, int(Side.BUY), int(OrderType.LIMIT))
+            )
+        for i in range(30):
+            orders.append(
+                (22000 + i, base_ts + 1000 + i * 10, 150.00, 10, sym_id, int(Side.SELL), int(OrderType.LIMIT))
+            )
+
+        isolated_ring_buffer.write_batch(orders)
+        assert isolated_ring_buffer.available_to_read() == 60
+
+        # Drain in small chunks
+        consumer = ZeroCopyConsumer(
+            ring_buffer=isolated_ring_buffer,
+            batch_size=10,
+            order_handler=order_adapter.dispatch_raw_order,
+        )
+        consumer.run(total_orders=60, print_progress=False)
+
+        assert isolated_ring_buffer.is_empty() is True
+        assert order_adapter.stats.total_orders_dispatched == 60
+        assert order_adapter.stats.total_trades_generated == 30
+        assert order_adapter.stats.total_volume_matched == 300
+        assert matching_engine.bid_count() == 0
+        assert matching_engine.ask_count() == 0
+
+    def test_unmatched_and_non_crossing_stream_produces_zero_trades(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        matching_engine: MatchingEngine,
+        order_adapter: OrderAdapter,
+    ):
+        """Stream of non-crossing orders populates order book depth without false executions."""
+        sym_id = SYMBOLS["AAPL"]
+        base_ts = 1_000_000
+        orders = [
+            (23001, base_ts + 100, 140.00, 20, sym_id, int(Side.BUY), int(OrderType.LIMIT)),
+            (23002, base_ts + 200, 142.00, 30, sym_id, int(Side.BUY), int(OrderType.LIMIT)),
+            (23003, base_ts + 300, 155.00, 25, sym_id, int(Side.SELL), int(OrderType.LIMIT)),
+            (23004, base_ts + 400, 160.00, 35, sym_id, int(Side.SELL), int(OrderType.LIMIT)),
+        ]
+        isolated_ring_buffer.write_batch(orders)
+        trades = order_adapter.drain_all()
+
+        assert len(trades) == 0
+        assert order_adapter.stats.total_trades_generated == 0
+        assert order_adapter.stats.non_crossing_orders == 4
+        assert matching_engine.bid_count() == 2
+        assert matching_engine.ask_count() == 2
+        assert matching_engine.get_best_bid_price() == 142.00
+        assert matching_engine.get_best_ask_price() == 155.00
+
+    def test_interleaved_symbols_routed_to_distinct_engines(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+    ):
+        """Interleaved AAPL and MSFT stream routes accurately without cross-talk."""
+        engine_aapl = MatchingEngine()
+        engine_msft = MatchingEngine()
+        adapter = OrderAdapter(
+            ring_buffer=isolated_ring_buffer,
+            symbol_engines={
+                SYMBOLS["AAPL"]: engine_aapl,
+                SYMBOLS["MSFT"]: engine_msft,
+            },
+            dispatch_mode="match",
+        )
+
+        base_ts = 2_000_000
+        orders = [
+            (24001, base_ts + 100, 220.00, 10, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT)),
+            (24002, base_ts + 200, 410.00, 10, SYMBOLS["MSFT"], int(Side.BUY), int(OrderType.LIMIT)),
+            (24003, base_ts + 300, 220.00, 10, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT)),
+            (24004, base_ts + 400, 410.00, 10, SYMBOLS["MSFT"], int(Side.SELL), int(OrderType.LIMIT)),
+        ]
+        isolated_ring_buffer.write_batch(orders)
+        trades = adapter.drain_all()
+
+        assert len(trades) == 2
+        assert engine_aapl.bid_count() == 0
+        assert engine_aapl.ask_count() == 0
+        assert engine_msft.bid_count() == 0
+        assert engine_msft.ask_count() == 0
+
+    def test_field_preservation_and_latency_tracking_across_e2e_boundary(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        matching_engine: MatchingEngine,
+        order_adapter: OrderAdapter,
+    ):
+        """Verifies nanosecond timestamp preservation and positive latency metrics."""
+        ts = 1_700_000_000_987_654_321
+        order = Order(
+            order_id=25001,
+            timestamp_ns=ts,
+            price=150.25,
+            quantity=100,
+            symbol_id=SYMBOLS["AAPL"],
+            side=int(Side.BUY),
+            order_type=int(OrderType.LIMIT),
+        )
+        isolated_ring_buffer.write_order(order)
+        order_adapter.drain_all()
+
+        assert len(order_adapter.execution_events) == 1
+        ev = order_adapter.execution_events[0]
+        assert ev.order_id == 25001
+        assert ev.price == 150.25
+        assert ev.quantity == 100
+        assert ev.latency_ns >= 0
+        assert ev.entry_timestamp_ns <= ev.exit_timestamp_ns
+
