@@ -70,6 +70,17 @@ Week 3, Day 6:
   * Guarantees total executed quantity never exceeds incoming or any individual resting order quantity.
   * Guarantees no negative quantities in any TradeResult or any order remaining_quantity field.
 
+Week 3, Day 7:
+- Best Bid/Ask Management & Order-Book Snapshots:
+  * Maintain the best bid as the highest available BUY price.
+  * Maintain the best ask as the lowest available SELL price.
+  * Dynamically update best bid and best ask upon order arrival, partial fills, and complete fills.
+  * Eager removal of exhausted price levels with immediate best bid/ask reassignment.
+  * Order-Book Snapshot API (get_order_book_snapshot, get_snapshot, snapshot, order_book_snapshot).
+  * Strict Price-Time Priority order: Bids descending (highest first), Asks ascending (lowest first).
+  * 100% mutation isolation via independent COrder clones preventing external state corruption.
+  * Safe handling of empty books, one-sided books, multi-level books, and fully consumed levels.
+
 
 Price Representation
 --------------------
@@ -222,6 +233,70 @@ cdef class COrder:
             "remaining_quantity": self.remaining_quantity,
             "timestamp_ns": self.timestamp_ns,
         }
+
+    cpdef COrder copy(self):
+        """Return an independent copy of this order."""
+        cdef COrder clone = _create_corder(
+            self.order_id,
+            self.side,
+            self.price_cents,
+            self.quantity,
+            self.remaining_quantity,
+            self.timestamp_ns,
+            self.sequence_num,
+        )
+        return clone
+
+    def __getitem__(self, str key):
+        if key == "order_id" or key == "id":
+            return self.order_id
+        elif key == "side":
+            return self.side
+        elif key == "price":
+            return self.price
+        elif key == "price_cents":
+            return self.price_cents
+        elif key == "quantity" or key == "qty":
+            return self.quantity
+        elif key == "remaining_quantity" or key == "rem":
+            return self.remaining_quantity
+        elif key == "timestamp_ns" or key == "ts":
+            return self.timestamp_ns
+        elif key == "sequence_num" or key == "seq":
+            return self.sequence_num
+        elif key == "filled_quantity":
+            return self.filled_quantity
+        elif key == "is_filled":
+            return self.is_filled
+        elif key == "is_partially_filled":
+            return self.is_partially_filled
+        raise KeyError(key)
+
+    def get(self, str key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, str key):
+        return key in (
+            "order_id", "id", "side", "price", "price_cents",
+            "quantity", "qty", "remaining_quantity", "rem",
+            "timestamp_ns", "ts", "sequence_num", "seq",
+            "filled_quantity", "is_filled", "is_partially_filled"
+        )
+
+    def keys(self):
+        return [
+            "order_id", "side", "price_cents",
+            "quantity", "remaining_quantity", "timestamp_ns"
+        ]
+
+    def items(self):
+        return [(k, self[k]) for k in self.keys()]
+
+    def values(self):
+        return [self[k] for k in self.keys()]
 
 
 cdef inline COrder _create_corder(
@@ -1094,6 +1169,155 @@ cdef class MatchingEngine:
     cpdef dict top_of_book(self):
         """Alias for ``get_top_of_book()``."""
         return self.get_top_of_book()
+
+    # Order-Book Snapshot interface (Week 3, Day 7)
+    cpdef dict get_order_book_snapshot(self, bint as_dict=False):
+        """Return a complete snapshot of the limit order book.
+
+        The snapshot accurately represents active BUY (bids) and SELL (asks)
+        orders in strict price-time priority:
+        - Bids are ordered from highest price to lowest price (FIFO on tie).
+        - Asks are ordered from lowest price to highest price (FIFO on tie).
+
+        To ensure mutation isolation, all orders returned in the snapshot
+        are independent copies (or plain dictionaries if ``as_dict=True``);
+        external callers cannot modify the internal state of the order book.
+
+        Parameters
+        ----------
+        as_dict : bint, default False
+            If True, order representations in 'bids' and 'asks' are plain dicts.
+            If False, they are independent COrder clone instances.
+
+        Returns
+        -------
+        dict
+            Order book snapshot dictionary with keys:
+            - 'bids': list of active BUY orders (highest to lowest price)
+            - 'asks': list of active SELL orders (lowest to highest price)
+            - 'buy_orders': alias to 'bids'
+            - 'sell_orders': alias to 'asks'
+            - 'bid_levels': aggregated [(price, quantity), ...] from highest to lowest
+            - 'ask_levels': aggregated [(price, quantity), ...] from lowest to highest
+            - 'best_bid': best BUY order copy or None if empty
+            - 'best_ask': best SELL order copy or None if empty
+            - 'best_bid_price': best BUY price (float) or None
+            - 'best_ask_price': best SELL price (float) or None
+            - 'best_bid_quantity': aggregate quantity at best bid (0 if empty)
+            - 'best_ask_quantity': aggregate quantity at best ask (0 if empty)
+            - 'spread': best_ask_price - best_bid_price (float) or None
+            - 'spread_cents': best_ask_cents - best_bid_cents (int) or None
+            - 'order_count': total orders accepted by engine
+            - 'bid_count': number of active resting BUY orders
+            - 'ask_count': number of active resting SELL orders
+        """
+        cdef list prioritized_bids = self.get_prioritized_bids()
+        cdef list prioritized_asks = self.get_prioritized_asks()
+        cdef list snap_bids = []
+        cdef list snap_asks = []
+        cdef list bid_levels = []
+        cdef list ask_levels = []
+        cdef Py_ssize_t i
+        cdef COrder o
+        cdef long long cur_cents = -1
+        cdef unsigned int cur_qty = 0
+
+        # Build bids snapshot and aggregated levels
+        for i in range(len(prioritized_bids)):
+            o = <COrder>prioritized_bids[i]
+            if as_dict:
+                snap_bids.append(o.as_dict())
+            else:
+                snap_bids.append(o.copy())
+            if o.price_cents == cur_cents:
+                cur_qty += o.remaining_quantity
+            else:
+                if cur_cents != -1:
+                    bid_levels.append((cur_cents / 100.0, cur_qty))
+                cur_cents = o.price_cents
+                cur_qty = o.remaining_quantity
+        if cur_cents != -1:
+            bid_levels.append((cur_cents / 100.0, cur_qty))
+
+        # Build asks snapshot and aggregated levels
+        cur_cents = -1
+        cur_qty = 0
+        for i in range(len(prioritized_asks)):
+            o = <COrder>prioritized_asks[i]
+            if as_dict:
+                snap_asks.append(o.as_dict())
+            else:
+                snap_asks.append(o.copy())
+            if o.price_cents == cur_cents:
+                cur_qty += o.remaining_quantity
+            else:
+                if cur_cents != -1:
+                    ask_levels.append((cur_cents / 100.0, cur_qty))
+                cur_cents = o.price_cents
+                cur_qty = o.remaining_quantity
+        if cur_cents != -1:
+            ask_levels.append((cur_cents / 100.0, cur_qty))
+
+        cdef COrder bb = self.get_best_buy_order()
+        cdef COrder ba = self.get_best_sell_order()
+        cdef object best_bid_obj = None
+        cdef object best_ask_obj = None
+        cdef object bid_price = None
+        cdef object ask_price = None
+        cdef unsigned int bid_qty = 0
+        cdef unsigned int ask_qty = 0
+        cdef object sp = None
+        cdef object sp_cents = None
+
+        if bb is not None:
+            bid_price = bb.price
+            bid_qty = self.get_best_buy_quantity(aggregate=True)
+            best_bid_obj = bb.as_dict() if as_dict else bb.copy()
+
+        if ba is not None:
+            ask_price = ba.price
+            ask_qty = self.get_best_sell_quantity(aggregate=True)
+            best_ask_obj = ba.as_dict() if as_dict else ba.copy()
+
+        if bb is not None and ba is not None:
+            sp_cents = ba.price_cents - bb.price_cents
+            sp = round((<long long>sp_cents) / 100.0, 6)
+
+        return {
+            "bids": snap_bids,
+            "asks": snap_asks,
+            "buy_orders": snap_bids,
+            "sell_orders": snap_asks,
+            "bid_levels": bid_levels,
+            "ask_levels": ask_levels,
+            "best_bid": best_bid_obj,
+            "best_ask": best_ask_obj,
+            "best_bid_price": bid_price,
+            "best_ask_price": ask_price,
+            "best_bid_quantity": bid_qty,
+            "best_ask_quantity": ask_qty,
+            "spread": sp,
+            "spread_cents": sp_cents,
+            "order_count": self._order_count,
+            "bid_count": len(snap_bids),
+            "ask_count": len(snap_asks),
+        }
+
+    cpdef dict get_snapshot(self, bint as_dict=False):
+        """Alias for ``get_order_book_snapshot(as_dict=as_dict)``."""
+        return self.get_order_book_snapshot(as_dict=as_dict)
+
+    cpdef dict snapshot(self, bint as_dict=False):
+        """Alias for ``get_order_book_snapshot(as_dict=as_dict)``."""
+        return self.get_order_book_snapshot(as_dict=as_dict)
+
+    cpdef dict get_book_snapshot(self, bint as_dict=False):
+        """Alias for ``get_order_book_snapshot(as_dict=as_dict)``."""
+        return self.get_order_book_snapshot(as_dict=as_dict)
+
+    cpdef dict order_book_snapshot(self, bint as_dict=False):
+        """Alias for ``get_order_book_snapshot(as_dict=as_dict)``."""
+        return self.get_order_book_snapshot(as_dict=as_dict)
 
     # Crossing price detection
     cpdef bint has_crossing_prices(self):

@@ -5073,3 +5073,567 @@ class TestWeek3Day6TradeResultFieldCorrectness:
         assert result[0].is_partial_fill is True
         asks = eng.get_asks()
         assert asks[0].remaining_quantity == 20
+
+
+
+# ===========================================================================
+# Week 3 – Day 7: Best Bid/Ask Management & Order-Book Snapshots
+# ===========================================================================
+
+class TestWeek3Day7BestBidAskManagement:
+    """Validate best bid as highest BUY price and best ask as lowest SELL price."""
+
+    def _eng(self):
+        from chronos.matching_engine import MatchingEngine
+        return MatchingEngine()
+
+    def test_best_bid_highest_buy_price(self):
+        """Best bid is the highest available BUY price."""
+        from chronos.matching_engine import SIDE_BUY
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 10, timestamp_ns=100)
+        eng.submit_order(2, SIDE_BUY, 105.0, 20, timestamp_ns=200)
+        eng.submit_order(3, SIDE_BUY, 102.5, 30, timestamp_ns=300)
+
+        assert eng.get_best_bid_price() == 105.0
+        assert eng.get_best_bid_price_cents() == 10500
+        best = eng.get_best_bid()
+        assert best is not None
+        assert best.order_id == 2
+        assert best.price == 105.0
+
+    def test_best_ask_lowest_sell_price(self):
+        """Best ask is the lowest available SELL price."""
+        from chronos.matching_engine import SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_SELL, 110.0, 10, timestamp_ns=100)
+        eng.submit_order(2, SIDE_SELL, 106.0, 20, timestamp_ns=200)
+        eng.submit_order(3, SIDE_SELL, 108.5, 30, timestamp_ns=300)
+
+        assert eng.get_best_ask_price() == 106.0
+        assert eng.get_best_ask_price_cents() == 10600
+        best = eng.get_best_ask()
+        assert best is not None
+        assert best.order_id == 2
+        assert best.price == 106.0
+
+    def test_best_bid_updates_on_new_higher_buy(self):
+        """Submitting a higher BUY raises best bid immediately."""
+        from chronos.matching_engine import SIDE_BUY
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 10, timestamp_ns=100)
+        assert eng.get_best_bid_price() == 100.0
+
+        eng.submit_order(2, SIDE_BUY, 103.0, 15, timestamp_ns=200)
+        assert eng.get_best_bid_price() == 103.0
+        assert eng.get_best_bid().order_id == 2
+
+    def test_best_bid_unchanged_on_new_lower_buy(self):
+        """Submitting a lower BUY does not displace the current best bid."""
+        from chronos.matching_engine import SIDE_BUY
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 105.0, 10, timestamp_ns=100)
+        assert eng.get_best_bid_price() == 105.0
+
+        eng.submit_order(2, SIDE_BUY, 102.0, 15, timestamp_ns=200)
+        assert eng.get_best_bid_price() == 105.0
+        assert eng.get_best_bid().order_id == 1
+
+    def test_best_ask_updates_on_new_lower_sell(self):
+        """Submitting a lower SELL lowers best ask immediately."""
+        from chronos.matching_engine import SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_SELL, 110.0, 10, timestamp_ns=100)
+        assert eng.get_best_ask_price() == 110.0
+
+        eng.submit_order(2, SIDE_SELL, 107.0, 15, timestamp_ns=200)
+        assert eng.get_best_ask_price() == 107.0
+        assert eng.get_best_ask().order_id == 2
+
+    def test_best_ask_unchanged_on_new_higher_sell(self):
+        """Submitting a higher SELL does not displace the current best ask."""
+        from chronos.matching_engine import SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_SELL, 105.0, 10, timestamp_ns=100)
+        assert eng.get_best_ask_price() == 105.0
+
+        eng.submit_order(2, SIDE_SELL, 108.0, 15, timestamp_ns=200)
+        assert eng.get_best_ask_price() == 105.0
+        assert eng.get_best_ask().order_id == 1
+
+    def test_best_bid_time_priority_at_equal_price(self):
+        """At equal BUY prices, earlier arrival (FIFO) order is returned as best bid."""
+        from chronos.matching_engine import SIDE_BUY
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 10, timestamp_ns=100)
+        eng.submit_order(2, SIDE_BUY, 100.0, 20, timestamp_ns=200)
+
+        best = eng.get_best_bid()
+        assert best.order_id == 1
+
+    def test_best_ask_time_priority_at_equal_price(self):
+        """At equal SELL prices, earlier arrival (FIFO) order is returned as best ask."""
+        from chronos.matching_engine import SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_SELL, 100.0, 10, timestamp_ns=100)
+        eng.submit_order(2, SIDE_SELL, 100.0, 20, timestamp_ns=200)
+
+        best = eng.get_best_ask()
+        assert best.order_id == 1
+
+    def test_aggregate_quantity_at_best_bid_and_ask(self):
+        """get_best_bid/ask_quantity with aggregate=True/False returns correct sums."""
+        from chronos.matching_engine import SIDE_BUY, SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 15, timestamp_ns=100)
+        eng.submit_order(2, SIDE_BUY, 100.0, 25, timestamp_ns=200)
+        eng.submit_order(3, SIDE_BUY, 99.0, 50, timestamp_ns=300)
+
+        assert eng.get_best_bid_quantity(aggregate=True) == 40
+        assert eng.get_best_bid_quantity(aggregate=False) == 15
+
+        eng.submit_order(4, SIDE_SELL, 102.0, 10, timestamp_ns=400)
+        eng.submit_order(5, SIDE_SELL, 102.0, 30, timestamp_ns=500)
+        eng.submit_order(6, SIDE_SELL, 105.0, 50, timestamp_ns=600)
+
+        assert eng.get_best_ask_quantity(aggregate=True) == 40
+        assert eng.get_best_ask_quantity(aggregate=False) == 10
+
+
+class TestWeek3Day7BestBidAskUpdatesAfterExecutions:
+    """Validate dynamic updates to best bid and best ask after executions and order removals."""
+
+    def _eng(self):
+        from chronos.matching_engine import MatchingEngine
+        return MatchingEngine()
+
+    def test_best_bid_quantity_decrements_after_partial_fill(self):
+        """Partial fill on best bid decrements quantity while price stays intact."""
+        from chronos.matching_engine import SIDE_BUY, SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 50, timestamp_ns=100)
+        eng.submit_order(2, SIDE_BUY, 99.0, 40, timestamp_ns=200)
+
+        # Incoming SELL 20 matches best bid partially
+        trades = eng.match_order(10, SIDE_SELL, 100.0, 20, timestamp_ns=300)
+        assert len(trades) == 1
+
+        assert eng.get_best_bid_price() == 100.0
+        assert eng.get_best_bid_quantity(aggregate=True) == 30
+        assert eng.get_best_bid().remaining_quantity == 30
+
+    def test_best_ask_quantity_decrements_after_partial_fill(self):
+        """Partial fill on best ask decrements quantity while price stays intact."""
+        from chronos.matching_engine import SIDE_BUY, SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_SELL, 100.0, 50, timestamp_ns=100)
+        eng.submit_order(2, SIDE_SELL, 102.0, 40, timestamp_ns=200)
+
+        # Incoming BUY 20 matches best ask partially
+        trades = eng.match_order(10, SIDE_BUY, 100.0, 20, timestamp_ns=300)
+        assert len(trades) == 1
+
+        assert eng.get_best_ask_price() == 100.0
+        assert eng.get_best_ask_quantity(aggregate=True) == 30
+        assert eng.get_best_ask().remaining_quantity == 30
+
+    def test_best_bid_advances_to_next_level_after_complete_fill(self):
+        """When the entire best bid price level is filled, best bid advances to the next level."""
+        from chronos.matching_engine import SIDE_BUY, SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 20, timestamp_ns=100)
+        eng.submit_order(2, SIDE_BUY, 98.0, 30, timestamp_ns=200)
+
+        eng.match_order(10, SIDE_SELL, 100.0, 20, timestamp_ns=300)
+
+        assert eng.get_best_bid_price() == 98.0
+        assert eng.get_best_bid().order_id == 2
+        assert eng.get_best_bid_quantity(aggregate=True) == 30
+
+    def test_best_ask_advances_to_next_level_after_complete_fill(self):
+        """When the entire best ask price level is filled, best ask advances to the next level."""
+        from chronos.matching_engine import SIDE_BUY, SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_SELL, 100.0, 20, timestamp_ns=100)
+        eng.submit_order(2, SIDE_SELL, 103.0, 30, timestamp_ns=200)
+
+        eng.match_order(10, SIDE_BUY, 100.0, 20, timestamp_ns=300)
+
+        assert eng.get_best_ask_price() == 103.0
+        assert eng.get_best_ask().order_id == 2
+        assert eng.get_best_ask_quantity(aggregate=True) == 30
+
+    def test_removal_of_last_order_at_price_level_multi_orders(self):
+        """When multiple orders exist at the best price, price moves only when the last is filled."""
+        from chronos.matching_engine import SIDE_BUY, SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 10, timestamp_ns=100)
+        eng.submit_order(2, SIDE_BUY, 100.0, 15, timestamp_ns=200)
+        eng.submit_order(3, SIDE_BUY, 95.0, 20, timestamp_ns=300)
+
+        # Fill order 1 fully
+        eng.match_order(10, SIDE_SELL, 100.0, 10, timestamp_ns=400)
+        assert eng.get_best_bid_price() == 100.0
+        assert eng.get_best_bid().order_id == 2
+        assert eng.get_best_bid_quantity(aggregate=True) == 15
+
+        # Fill order 2 fully -> best bid moves to 95.0
+        eng.match_order(20, SIDE_SELL, 100.0, 15, timestamp_ns=500)
+        assert eng.get_best_bid_price() == 95.0
+        assert eng.get_best_bid().order_id == 3
+        assert eng.get_best_bid_quantity(aggregate=True) == 20
+
+    def test_all_orders_consumed_clears_best_bid_and_ask(self):
+        """Consuming all orders resets best bid/ask to None and quantities to 0."""
+        from chronos.matching_engine import SIDE_BUY, SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 20, timestamp_ns=100)
+        eng.submit_order(2, SIDE_SELL, 105.0, 20, timestamp_ns=200)
+
+        # Fill SELL #2
+        eng.match_order(10, SIDE_BUY, 105.0, 20, timestamp_ns=300)
+        assert eng.get_best_ask() is None
+        assert eng.get_best_ask_price() is None
+        assert eng.get_best_ask_quantity() == 0
+        assert eng.get_spread() is None
+
+        # Fill BUY #1
+        eng.match_order(20, SIDE_SELL, 100.0, 20, timestamp_ns=400)
+        assert eng.get_best_bid() is None
+        assert eng.get_best_bid_price() is None
+        assert eng.get_best_bid_quantity() == 0
+        assert eng.get_spread() is None
+
+
+class TestWeek3Day7OrderBookSnapshotEmptyAndOneSided:
+    """Validate snapshot behavior on empty books and one-sided books."""
+
+    def _eng(self):
+        from chronos.matching_engine import MatchingEngine
+        return MatchingEngine()
+
+    def test_empty_book_snapshot_structure(self):
+        """Snapshot on clean engine has empty order lists, None prices, and zero counts."""
+        eng = self._eng()
+        snap = eng.get_order_book_snapshot()
+
+        assert isinstance(snap, dict)
+        assert snap["bids"] == []
+        assert snap["asks"] == []
+        assert snap["bid_levels"] == []
+        assert snap["ask_levels"] == []
+        assert snap["best_bid"] is None
+        assert snap["best_ask"] is None
+        assert snap["best_bid_price"] is None
+        assert snap["best_ask_price"] is None
+        assert snap["best_bid_quantity"] == 0
+        assert snap["best_ask_quantity"] == 0
+        assert snap["spread"] is None
+        assert snap["spread_cents"] is None
+        assert snap["bid_count"] == 0
+        assert snap["ask_count"] == 0
+        assert snap["order_count"] == 0
+
+    def test_one_sided_bids_only_snapshot(self):
+        """Snapshot on book with only BUY orders correctly populates bids and leaves asks empty."""
+        from chronos.matching_engine import SIDE_BUY
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 10, timestamp_ns=100)
+        eng.submit_order(2, SIDE_BUY, 101.0, 20, timestamp_ns=200)
+
+        snap = eng.get_order_book_snapshot()
+        assert len(snap["bids"]) == 2
+        assert snap["asks"] == []
+        assert snap["best_bid_price"] == 101.0
+        assert snap["best_bid_quantity"] == 20
+        assert snap["best_ask"] is None
+        assert snap["best_ask_price"] is None
+        assert snap["best_ask_quantity"] == 0
+        assert snap["spread"] is None
+        assert snap["bid_count"] == 2
+        assert snap["ask_count"] == 0
+
+    def test_one_sided_asks_only_snapshot(self):
+        """Snapshot on book with only SELL orders correctly populates asks and leaves bids empty."""
+        from chronos.matching_engine import SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_SELL, 105.0, 15, timestamp_ns=100)
+        eng.submit_order(2, SIDE_SELL, 103.0, 25, timestamp_ns=200)
+
+        snap = eng.get_order_book_snapshot()
+        assert snap["bids"] == []
+        assert len(snap["asks"]) == 2
+        assert snap["best_ask_price"] == 103.0
+        assert snap["best_ask_quantity"] == 25
+        assert snap["best_bid"] is None
+        assert snap["best_bid_price"] is None
+        assert snap["best_bid_quantity"] == 0
+        assert snap["spread"] is None
+        assert snap["bid_count"] == 0
+        assert snap["ask_count"] == 2
+
+    def test_snapshot_after_engine_clear_resets_completely(self):
+        """Calling clear() resets snapshot back to pristine empty state."""
+        from chronos.matching_engine import SIDE_BUY, SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 10, timestamp_ns=100)
+        eng.submit_order(2, SIDE_SELL, 105.0, 10, timestamp_ns=200)
+        assert eng.get_order_book_snapshot()["order_count"] == 2
+
+        eng.clear()
+        snap = eng.get_order_book_snapshot()
+        assert snap["bids"] == []
+        assert snap["asks"] == []
+        assert snap["order_count"] == 0
+        assert snap["best_bid"] is None
+        assert snap["best_ask"] is None
+
+
+class TestWeek3Day7OrderBookSnapshotMultiLevelAndSorting:
+    """Validate snapshot sorting (bids descending, asks ascending) and level aggregation."""
+
+    def _eng(self):
+        from chronos.matching_engine import MatchingEngine
+        return MatchingEngine()
+
+    def test_bids_sorted_descending_price(self):
+        """Snapshot bids are strictly ordered from highest price to lowest price."""
+        from chronos.matching_engine import SIDE_BUY
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 10, timestamp_ns=100)
+        eng.submit_order(2, SIDE_BUY, 105.0, 20, timestamp_ns=200)
+        eng.submit_order(3, SIDE_BUY, 102.5, 30, timestamp_ns=300)
+
+        snap = eng.get_order_book_snapshot()
+        bids = snap["bids"]
+        assert len(bids) == 3
+        prices = [b.price for b in bids]
+        assert prices == [105.0, 102.5, 100.0]
+        assert [b.order_id for b in bids] == [2, 3, 1]
+
+    def test_asks_sorted_ascending_price(self):
+        """Snapshot asks are strictly ordered from lowest price to highest price."""
+        from chronos.matching_engine import SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_SELL, 110.0, 10, timestamp_ns=100)
+        eng.submit_order(2, SIDE_SELL, 106.0, 20, timestamp_ns=200)
+        eng.submit_order(3, SIDE_SELL, 108.5, 30, timestamp_ns=300)
+
+        snap = eng.get_order_book_snapshot()
+        asks = snap["asks"]
+        assert len(asks) == 3
+        prices = [a.price for a in asks]
+        assert prices == [106.0, 108.5, 110.0]
+        assert [a.order_id for a in asks] == [2, 3, 1]
+
+    def test_price_time_priority_preserved_in_snapshot_equal_prices(self):
+        """At equal prices, FIFO arrival priority is preserved in snapshot order."""
+        from chronos.matching_engine import SIDE_BUY, SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 10, timestamp_ns=100)
+        eng.submit_order(2, SIDE_BUY, 100.0, 20, timestamp_ns=200)
+        eng.submit_order(3, SIDE_SELL, 105.0, 30, timestamp_ns=300)
+        eng.submit_order(4, SIDE_SELL, 105.0, 40, timestamp_ns=400)
+
+        snap = eng.get_order_book_snapshot()
+        assert [b.order_id for b in snap["bids"]] == [1, 2]
+        assert [a.order_id for a in snap["asks"]] == [3, 4]
+
+    def test_bid_and_ask_levels_aggregation(self):
+        """bid_levels and ask_levels aggregate quantities correctly per price tier."""
+        from chronos.matching_engine import SIDE_BUY, SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 10, timestamp_ns=100)
+        eng.submit_order(2, SIDE_BUY, 100.0, 15, timestamp_ns=200)
+        eng.submit_order(3, SIDE_BUY, 99.0, 25, timestamp_ns=300)
+
+        eng.submit_order(4, SIDE_SELL, 102.0, 20, timestamp_ns=400)
+        eng.submit_order(5, SIDE_SELL, 102.0, 30, timestamp_ns=500)
+        eng.submit_order(6, SIDE_SELL, 104.0, 40, timestamp_ns=600)
+
+        snap = eng.get_order_book_snapshot()
+        assert snap["bid_levels"] == [(100.0, 25), (99.0, 25)]
+        assert snap["ask_levels"] == [(102.0, 50), (104.0, 40)]
+        assert snap["spread"] == 2.0
+        assert snap["spread_cents"] == 200
+
+    def test_snapshot_as_dict_mode(self):
+        """When as_dict=True, orders in snapshot are plain Python dicts."""
+        from chronos.matching_engine import SIDE_BUY, SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 10, timestamp_ns=100)
+        eng.submit_order(2, SIDE_SELL, 105.0, 20, timestamp_ns=200)
+
+        snap = eng.get_order_book_snapshot(as_dict=True)
+        assert isinstance(snap["bids"][0], dict)
+        assert snap["bids"][0]["order_id"] == 1
+        assert snap["bids"][0]["price_cents"] == 10000
+        assert isinstance(snap["asks"][0], dict)
+        assert snap["asks"][0]["order_id"] == 2
+        assert isinstance(snap["best_bid"], dict)
+        assert isinstance(snap["best_ask"], dict)
+
+    def test_snapshot_order_mapping_protocol(self):
+        """Order objects in default snapshot support item access (e.g. order['price'])."""
+        from chronos.matching_engine import SIDE_BUY
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 50, timestamp_ns=100)
+
+        snap = eng.get_order_book_snapshot()
+        order = snap["bids"][0]
+        assert order["price"] == 100.0
+        assert order["price_cents"] == 10000
+        assert order["quantity"] == 50
+        assert order["remaining_quantity"] == 50
+        assert order["order_id"] == 1
+        assert order.get("nonexistent", "default") == "default"
+
+
+class TestWeek3Day7OrderBookSnapshotMutationIsolation:
+    """Ensure external callers cannot accidentally mutate internal order book state."""
+
+    def _eng(self):
+        from chronos.matching_engine import MatchingEngine
+        return MatchingEngine()
+
+    def test_snapshot_list_modification_isolation(self):
+        """Clearing or modifying snapshot bids/asks list does not affect the engine."""
+        from chronos.matching_engine import SIDE_BUY, SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 10, timestamp_ns=100)
+        eng.submit_order(2, SIDE_SELL, 105.0, 10, timestamp_ns=200)
+
+        snap = eng.get_order_book_snapshot()
+        snap["bids"].clear()
+        snap["asks"].pop()
+
+        assert eng.bid_count() == 1
+        assert eng.ask_count() == 1
+        assert len(eng.get_bids()) == 1
+        assert len(eng.get_asks()) == 1
+
+    def test_snapshot_order_attribute_modification_isolation(self):
+        """Mutating order attributes on a snapshot order does not affect the engine's resting order."""
+        from chronos.matching_engine import SIDE_BUY
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 50, timestamp_ns=100)
+
+        snap = eng.get_order_book_snapshot()
+        cloned_order = snap["bids"][0]
+        cloned_order.remaining_quantity = 0
+        cloned_order.price_cents = 99999
+
+        # Engine's resting order remains pristine
+        assert eng.get_best_bid().remaining_quantity == 50
+        assert eng.get_best_bid().price_cents == 10000
+        assert eng.get_best_bid_quantity() == 50
+        assert eng.get_best_bid_price() == 100.0
+
+    def test_snapshot_dict_attribute_modification_isolation(self):
+        """Modifying snapshot top-level dictionary keys does not mutate engine state."""
+        from chronos.matching_engine import SIDE_BUY
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 50, timestamp_ns=100)
+
+        snap = eng.get_order_book_snapshot()
+        snap["best_bid_price"] = 999999.0
+        snap["best_bid_quantity"] = 0
+        snap["order_count"] = 0
+
+        assert eng.get_best_bid_price() == 100.0
+        assert eng.get_best_bid_quantity() == 50
+        assert eng.order_count() == 1
+
+    def test_subsequent_snapshots_unaffected_by_past_modifications(self):
+        """A new snapshot is completely fresh and unaffected by mutations on an earlier snapshot."""
+        from chronos.matching_engine import SIDE_BUY
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 50, timestamp_ns=100)
+
+        snap1 = eng.get_order_book_snapshot()
+        snap1["bids"][0].remaining_quantity = 0
+        snap1["bids"].clear()
+
+        snap2 = eng.get_order_book_snapshot()
+        assert len(snap2["bids"]) == 1
+        assert snap2["bids"][0].remaining_quantity == 50
+        assert snap2["best_bid_price"] == 100.0
+
+
+class TestWeek3Day7OrderBookSnapshotUpdatesAfterMatching:
+    """Validate snapshot updates following executions, multi-level sweeps, and residuals."""
+
+    def _eng(self):
+        from chronos.matching_engine import MatchingEngine
+        return MatchingEngine()
+
+    def test_snapshot_after_partial_match(self):
+        """Snapshot reflects updated remaining quantity on the partially filled resting order."""
+        from chronos.matching_engine import SIDE_BUY, SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_SELL, 100.0, 50, timestamp_ns=100)
+
+        eng.match_order(10, SIDE_BUY, 100.0, 20, timestamp_ns=200)
+
+        snap = eng.get_order_book_snapshot()
+        assert len(snap["asks"]) == 1
+        assert snap["asks"][0].remaining_quantity == 30
+        assert snap["best_ask_quantity"] == 30
+        assert snap["best_ask_price"] == 100.0
+        assert snap["bids"] == []
+
+    def test_snapshot_after_multi_level_sweep(self):
+        """Fully consumed levels disappear from snapshot; partially consumed level stays."""
+        from chronos.matching_engine import SIDE_BUY, SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_SELL, 50.0, 10, timestamp_ns=100)
+        eng.submit_order(2, SIDE_SELL, 51.0, 10, timestamp_ns=200)
+        eng.submit_order(3, SIDE_SELL, 52.0, 20, timestamp_ns=300)
+
+        # Sweeps levels 50 and 51, partially fills 52 by 5
+        eng.match_order(10, SIDE_BUY, 55.0, 25, timestamp_ns=400)
+
+        snap = eng.get_order_book_snapshot()
+        assert len(snap["asks"]) == 1
+        assert snap["asks"][0].order_id == 3
+        assert snap["asks"][0].price == 52.0
+        assert snap["asks"][0].remaining_quantity == 15
+        assert snap["best_ask_price"] == 52.0
+        assert snap["best_ask_quantity"] == 15
+        assert snap["ask_levels"] == [(52.0, 15)]
+
+    def test_snapshot_after_cascading_fill_with_incoming_residual(self):
+        """Leftover incoming quantity rests in opposite book side and appears in snapshot."""
+        from chronos.matching_engine import SIDE_BUY, SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_SELL, 100.0, 30, timestamp_ns=100)
+
+        # Incoming BUY 50 consumes 30; residual 20 rests in bids
+        eng.match_order(10, SIDE_BUY, 100.0, 50, timestamp_ns=200)
+
+        snap = eng.get_order_book_snapshot()
+        assert snap["asks"] == []
+        assert snap["best_ask"] is None
+        assert len(snap["bids"]) == 1
+        assert snap["bids"][0].order_id == 10
+        assert snap["bids"][0].remaining_quantity == 20
+        assert snap["bids"][0].price == 100.0
+        assert snap["best_bid_price"] == 100.0
+        assert snap["best_bid_quantity"] == 20
+
+    def test_snapshot_aliases(self):
+        """get_snapshot, snapshot, get_book_snapshot, and order_book_snapshot return identical data."""
+        from chronos.matching_engine import SIDE_BUY, SIDE_SELL
+        eng = self._eng()
+        eng.submit_order(1, SIDE_BUY, 100.0, 10, timestamp_ns=100)
+        eng.submit_order(2, SIDE_SELL, 105.0, 20, timestamp_ns=200)
+
+        s1 = eng.get_order_book_snapshot()
+        s2 = eng.get_snapshot()
+        s3 = eng.snapshot()
+        s4 = eng.get_book_snapshot()
+        s5 = eng.order_book_snapshot()
+
+        assert s1["best_bid_price"] == s2["best_bid_price"] == s3["best_bid_price"] == s4["best_bid_price"] == s5["best_bid_price"]
+        assert len(s1["bids"]) == len(s2["bids"]) == len(s3["bids"]) == len(s4["bids"]) == len(s5["bids"])
+        assert len(s1["asks"]) == len(s2["asks"]) == len(s3["asks"]) == len(s4["asks"]) == len(s5["asks"])
