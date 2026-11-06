@@ -58,6 +58,11 @@ LABEL_TOTAL_ORDERS = "Total Orders Processed"
 LABEL_ORDERS_PROCESSED = LABEL_TOTAL_ORDERS
 LABEL_PROCESSED_ORDERS = LABEL_TOTAL_ORDERS
 LABEL_THROUGHPUT = "Throughput (orders/sec)"
+LABEL_ORDER_THROUGHPUT = LABEL_THROUGHPUT
+LABEL_THROUGHPUT_ORDERS_PER_SEC = LABEL_THROUGHPUT
+LABEL_PROCESSED_ORDERS_PER_SEC = LABEL_THROUGHPUT
+LABEL_ORDERS_PER_SECOND = LABEL_THROUGHPUT
+LABEL_ORDER_PROCESSING_THROUGHPUT = LABEL_THROUGHPUT
 LABEL_LATENCY = "Latency (microseconds)"
 
 # Trade execution field labels
@@ -633,6 +638,59 @@ def calculate_throughput_from_counts(
     return calculate_throughput(delta, elapsed_seconds)
 
 
+def calculate_throughput_ns(
+    delta_orders: Union[int, float],
+    elapsed_ns: Union[int, float],
+) -> Optional[float]:
+    """Calculate throughput as processed orders divided by elapsed nanoseconds.
+
+    Args:
+        delta_orders: Change in processed order count (must be non-negative).
+        elapsed_ns: Elapsed interval in nanoseconds (must be strictly positive).
+
+    Returns:
+        Throughput in orders/sec rounded to 2 decimal places, or None if
+        elapsed_ns <= 0, delta_orders < 0, or either input is invalid.
+    """
+    if delta_orders is None or elapsed_ns is None:
+        return None
+
+    try:
+        d_orders = float(delta_orders)
+        d_ns = float(elapsed_ns)
+    except (ValueError, TypeError):
+        return None
+
+    if math.isnan(d_orders) or math.isinf(d_orders) or math.isnan(d_ns) or math.isinf(d_ns):
+        return None
+
+    if d_ns <= 0 or d_orders < 0:
+        return None
+
+    if d_orders == 0.0:
+        return 0.0
+
+    elapsed_seconds = d_ns / 1_000_000_000.0
+    return calculate_throughput(d_orders, elapsed_seconds)
+
+
+def calculate_throughput_from_counts_ns(
+    current_count: Union[int, float],
+    previous_count: Union[int, float],
+    elapsed_ns: Union[int, float],
+) -> Optional[float]:
+    """Calculate throughput from current and previous order counts over elapsed nanoseconds."""
+    if current_count is None or previous_count is None:
+        return None
+    try:
+        c_curr = float(current_count)
+        c_prev = float(previous_count)
+    except (ValueError, TypeError):
+        return None
+    delta = c_curr - c_prev
+    return calculate_throughput_ns(delta, elapsed_ns)
+
+
 def format_throughput(
     throughput: Optional[Union[float, int, str]],
     is_demo: bool = False,
@@ -654,6 +712,9 @@ def format_throughput(
         ValueError: If throughput is a negative number.
     """
     if throughput is None:
+        return DEMO_THROUGHPUT if is_demo else NO_SAMPLE_THROUGHPUT
+
+    if isinstance(throughput, bool):
         return DEMO_THROUGHPUT if is_demo else NO_SAMPLE_THROUGHPUT
 
     if isinstance(throughput, str):
@@ -1452,7 +1513,10 @@ class TerminalDashboard:
 
         self._clock: Callable[[], float] = clock if clock is not None else time.monotonic
         self._ns_clock: Callable[[], int] = ns_clock if ns_clock is not None else time.perf_counter_ns
+        self._has_custom_clock: bool = clock is not None
+        self._has_custom_ns_clock: bool = ns_clock is not None
         self._last_throughput_time: Optional[float] = None
+        self._last_throughput_time_ns: Optional[int] = None
         self._last_orders_count: Optional[int] = None
         self._throughput: Optional[float] = None
         self._throughput_override: Optional[str] = None
@@ -1558,7 +1622,11 @@ class TerminalDashboard:
         self.orders_processed += int_delta
         return self.orders_processed
 
-    def record_order_processed(self, order: Optional[Any] = None) -> int:
+    def record_order_processed(
+        self,
+        order: Optional[Any] = None,
+        timestamp_ns: Optional[int] = None,
+    ) -> int:
         """Record a single processed order event and update latency metrics.
 
         The counter represents the number of orders accepted or processed by the engine,
@@ -1573,6 +1641,7 @@ class TerminalDashboard:
         Args:
             order: Optional order representation (dict, object, tuple, or None).
                    If an order_id is present, duplicate events for the same order are ignored.
+            timestamp_ns: Optional nanosecond timestamp of processing event.
 
         Returns:
             The updated orders_processed count.
@@ -1585,23 +1654,27 @@ class TerminalDashboard:
 
         # Measure inter-event latency BEFORE incrementing the counter.
         # Done on real processing events, not in the render loop.
-        self._record_latency_sample()
+        self._record_latency_sample(timestamp_ns=timestamp_ns)
 
         self.increment_orders_processed(1)
         return self.orders_processed
 
-    def on_order_processed(self, order: Optional[Any] = None) -> int:
+    def on_order_processed(
+        self,
+        order: Optional[Any] = None,
+        timestamp_ns: Optional[int] = None,
+    ) -> int:
         """Event handler callback for order processed events (alias for record_order_processed)."""
-        return self.record_order_processed(order)
+        return self.record_order_processed(order, timestamp_ns=timestamp_ns)
 
-    def _record_latency_sample(self) -> None:
+    def _record_latency_sample(self, timestamp_ns: Optional[int] = None) -> None:
         """Record one inter-event latency sample using the nanosecond clock.
 
         Called only from record_order_processed() — never from the render loop.
         Safe when ns_clock raises or returns invalid values.
         """
         try:
-            now_ns = int(self._ns_clock())
+            now_ns = int(timestamp_ns) if timestamp_ns is not None else int(self._ns_clock())
         except Exception:
             return
 
@@ -1875,17 +1948,84 @@ class TerminalDashboard:
         else:
             self.throughput = value
 
-    def update_throughput(self, current_time: Optional[float] = None) -> Optional[float]:
+    def _update_throughput_ns(self, now_ns: int) -> Optional[float]:
+        """Internal helper to calculate throughput using nanosecond timestamps."""
+        if self._last_throughput_time_ns is None:
+            self._last_throughput_time_ns = now_ns
+            self._last_orders_count = self.orders_processed
+            return self._throughput
+
+        elapsed_ns = now_ns - self._last_throughput_time_ns
+
+        # Invalid interval (e.g. clock jumped backwards): handle safely without crashing
+        if elapsed_ns < 0:
+            self._last_throughput_time_ns = now_ns
+            self._last_orders_count = self.orders_processed
+            return self._throughput
+
+        # Zero elapsed time: avoid division by zero, return current value unchanged
+        if elapsed_ns == 0:
+            return self._throughput
+
+        # Elapsed > 0: compute delta orders
+        last_count = self._last_orders_count if self._last_orders_count is not None else 0
+        delta_orders = self.orders_processed - last_count
+        if delta_orders < 0:
+            # Counter was reset or moved backwards; reset reference point safely
+            self._last_orders_count = self.orders_processed
+            self._last_throughput_time_ns = now_ns
+            return self._throughput
+
+        calc = calculate_throughput_ns(delta_orders, elapsed_ns)
+        self._throughput = calc
+        self._last_orders_count = self.orders_processed
+        self._last_throughput_time_ns = now_ns
+        return self._throughput
+
+    def update_throughput_ns(self, current_time_ns: Optional[int] = None) -> Optional[float]:
+        """Update throughput using monotonic nanosecond timestamps.
+
+        Args:
+            current_time_ns: Optional nanosecond timestamp override. If None, uses self._ns_clock().
+
+        Returns:
+            Updated throughput in orders/sec, or current throughput if elapsed_ns == 0.
+        """
+        if self._throughput_override is not None:
+            return self._throughput
+
+        try:
+            now_ns = int(current_time_ns) if current_time_ns is not None else int(self._ns_clock())
+        except Exception:
+            return self._throughput
+
+        return self._update_throughput_ns(now_ns)
+
+    def update_throughput(
+        self,
+        current_time: Optional[Union[float, int]] = None,
+        current_time_ns: Optional[int] = None,
+    ) -> Optional[float]:
         """Calculate and update throughput based on processed orders delta and elapsed time.
 
         Args:
-            current_time: Optional timestamp override in seconds. If None, uses self._clock().
+            current_time: Optional timestamp override in seconds (or nanoseconds if large integer).
+            current_time_ns: Optional timestamp override in nanoseconds.
 
         Returns:
             The updated throughput value, or current value if elapsed time is zero.
         """
         if self._throughput_override is not None:
             return self._throughput
+
+        if current_time_ns is not None:
+            return self.update_throughput_ns(current_time_ns)
+
+        if current_time is not None and isinstance(current_time, int) and current_time > 100_000_000_000:
+            return self.update_throughput_ns(current_time)
+
+        if self._has_custom_ns_clock and not self._has_custom_clock and current_time is None:
+            return self.update_throughput_ns()
 
         try:
             now = float(current_time) if current_time is not None else float(self._clock())
@@ -1924,6 +2064,73 @@ class TerminalDashboard:
         self._last_throughput_time = now
         return self._throughput
 
+    def update_throughput_from_metrics(
+        self,
+        orders_count: int,
+        timestamp_ns: Optional[int] = None,
+        timestamp_s: Optional[float] = None,
+    ) -> Optional[float]:
+        """Update processed orders count and calculate throughput from supplied timestamp.
+
+        Args:
+            orders_count: Current cumulative count of processed orders.
+            timestamp_ns: Optional nanosecond monotonic timestamp.
+            timestamp_s: Optional second monotonic timestamp.
+
+        Returns:
+            Updated throughput in orders/sec.
+        """
+        self.set_orders_processed(orders_count)
+        if timestamp_ns is not None:
+            return self.update_throughput_ns(timestamp_ns)
+        if timestamp_s is not None:
+            return self.update_throughput(current_time=timestamp_s)
+        return self.update_throughput()
+
+    def update_from_consumer_stats(self, stats: Any) -> Optional[float]:
+        """Update orders processed and throughput from consumer or adapter stats.
+
+        Accepts objects or dicts exposing total_orders_read / orders_processed and
+        rate or timestamp information.
+        """
+        if stats is None:
+            return self._throughput
+
+        orders = None
+        if isinstance(stats, dict):
+            orders = stats.get("total_orders_read", stats.get("orders_processed", stats.get("total_orders")))
+        else:
+            for attr in ("total_orders_read", "orders_processed", "total_orders"):
+                if hasattr(stats, attr):
+                    orders = getattr(stats, attr)
+                    break
+
+        if orders is not None:
+            try:
+                self.set_orders_processed(int(orders))
+            except (ValueError, TypeError):
+                pass
+
+        rate = None
+        if isinstance(stats, dict):
+            rate = stats.get("current_rate", stats.get("throughput", stats.get("avg_rate")))
+        else:
+            for attr in ("current_rate", "throughput", "avg_rate"):
+                if hasattr(stats, attr):
+                    rate = getattr(stats, attr)
+                    break
+
+        if rate is not None:
+            try:
+                f_rate = float(rate)
+                if f_rate >= 0 and not (math.isnan(f_rate) or math.isinf(f_rate)):
+                    self.throughput = round(f_rate, 2)
+                    return self._throughput
+            except (ValueError, TypeError):
+                pass
+
+        return self.update_throughput()
+
     def get_throughput(self) -> Optional[float]:
         """Return the current throughput in orders/sec."""
         return self._throughput
@@ -1943,6 +2150,7 @@ class TerminalDashboard:
         self._throughput = None
         self._throughput_override = None
         self._last_throughput_time = None
+        self._last_throughput_time_ns = None
         self._last_orders_count = None
 
     @property
