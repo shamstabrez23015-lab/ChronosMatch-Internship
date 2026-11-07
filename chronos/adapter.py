@@ -178,6 +178,7 @@ class OrderAdapter:
         dispatch_mode: str = "match",
         trade_latency_tracker: Optional[TradeLatencyTracker] = None,
         audit_worker: Optional[Any] = None,
+        audit_trades: bool = False,
     ):
         """Initialize OrderAdapter.
 
@@ -190,6 +191,7 @@ class OrderAdapter:
                            'submit' to invoke engine.submit_order (passive storage).
             trade_latency_tracker: Optional TradeLatencyTracker instance for nanosecond trade tracking.
             audit_worker: Optional SQLiteAuditWorker instance for non-blocking trade auditing.
+            audit_trades: Whether to persist individual TradeResult records in addition to execution events.
         """
         self.ring_buffer = ring_buffer
         self.default_engine = engine
@@ -203,6 +205,7 @@ class OrderAdapter:
         self.dispatch_mode = dispatch_mode
 
         self.audit_worker = audit_worker
+        self.audit_trades = bool(audit_trades)
         self.stats = AdapterStats()
         self.trade_latency_tracker: TradeLatencyTracker = (
             trade_latency_tracker if trade_latency_tracker is not None else TradeLatencyTracker()
@@ -301,6 +304,12 @@ class OrderAdapter:
                 if self.audit_worker is not None:
                     try:
                         self.audit_worker.record(event)
+                        if self.audit_trades and trades:
+                            from chronos.audit import AuditRecord
+                            for trade in trades:
+                                self.audit_worker.record(
+                                    AuditRecord.from_trade(trade, symbol_id=symbol_id)
+                                )
                     except Exception:
                         pass
                 return trades
