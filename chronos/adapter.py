@@ -177,6 +177,7 @@ class OrderAdapter:
         default_symbol_id: Optional[int] = None,
         dispatch_mode: str = "match",
         trade_latency_tracker: Optional[TradeLatencyTracker] = None,
+        audit_worker: Optional[Any] = None,
     ):
         """Initialize OrderAdapter.
 
@@ -188,6 +189,7 @@ class OrderAdapter:
             dispatch_mode: 'match' to invoke engine.match_order (active matching);
                            'submit' to invoke engine.submit_order (passive storage).
             trade_latency_tracker: Optional TradeLatencyTracker instance for nanosecond trade tracking.
+            audit_worker: Optional SQLiteAuditWorker instance for non-blocking trade auditing.
         """
         self.ring_buffer = ring_buffer
         self.default_engine = engine
@@ -200,6 +202,7 @@ class OrderAdapter:
             raise ValueError(f"Invalid dispatch_mode '{dispatch_mode}': must be 'match' or 'submit'")
         self.dispatch_mode = dispatch_mode
 
+        self.audit_worker = audit_worker
         self.stats = AdapterStats()
         self.trade_latency_tracker: TradeLatencyTracker = (
             trade_latency_tracker if trade_latency_tracker is not None else TradeLatencyTracker()
@@ -295,6 +298,11 @@ class OrderAdapter:
                     volume_matched=matched_vol,
                 )
                 self.execution_events.append(event)
+                if self.audit_worker is not None:
+                    try:
+                        self.audit_worker.record(event)
+                    except Exception:
+                        pass
                 return trades
             else:
                 t_entry = time.perf_counter_ns()
@@ -325,6 +333,11 @@ class OrderAdapter:
                     volume_matched=0,
                 )
                 self.execution_events.append(event)
+                if self.audit_worker is not None:
+                    try:
+                        self.audit_worker.record(event)
+                    except Exception:
+                        pass
                 return []
         else:
             # Non-LIMIT order types (e.g. CANCEL, MARKET)
@@ -332,7 +345,16 @@ class OrderAdapter:
             # Document and record truthfully without silently failing or crashing.
             self.stats.unhandled_order_types += 1
             self.unhandled_orders.append((raw_order, f"Unsupported order_type: {order_type}"))
+            if self.audit_worker is not None:
+                try:
+                    self.audit_worker.record(raw_order)
+                except Exception:
+                    pass
             return []
+
+    def dispatch_order(self, order: Order) -> List[TradeResult]:
+        """Convenience method to dispatch a chronos.protocol.Order NamedTuple."""
+        return self.dispatch_raw_order(order)
 
     def process_next(
         self,

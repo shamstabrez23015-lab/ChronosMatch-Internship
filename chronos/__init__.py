@@ -34,6 +34,13 @@ from chronos.benchmark import (
     calculate_throughput,
 )
 from chronos.trade_latency import TradeLatencySnapshot, TradeLatencyTracker
+from chronos.audit import AuditRecord, AuditStats, AuditWorker, SQLiteAuditWorker
+from chronos.config import (
+    DEFAULT_AUDIT_DB_PATH,
+    DEFAULT_AUDIT_BATCH_SIZE,
+    DEFAULT_AUDIT_FLUSH_INTERVAL_S,
+    DEFAULT_AUDIT_QUEUE_SIZE,
+)
 
 __all__ = [
     "ORDER_SIZE",
@@ -53,6 +60,10 @@ __all__ = [
     "OrderAdapter",
     "AdapterStats",
     "TradeExecutionEvent",
+    "AuditRecord",
+    "AuditStats",
+    "AuditWorker",
+    "SQLiteAuditWorker",
     "ChronosConfig",
     "SystemConfig",
     "DEFAULT_BUFFER_CAPACITY",
@@ -62,6 +73,10 @@ __all__ = [
     "DEFAULT_BENCHMARK_ORDERS",
     "DEFAULT_REFRESH_INTERVAL_MS",
     "DEFAULT_BUFFER_PATH",
+    "DEFAULT_AUDIT_DB_PATH",
+    "DEFAULT_AUDIT_BATCH_SIZE",
+    "DEFAULT_AUDIT_FLUSH_INTERVAL_S",
+    "DEFAULT_AUDIT_QUEUE_SIZE",
     "BenchmarkConfig",
     "BenchmarkSummary",
     "PipelineBenchmarkRunner",

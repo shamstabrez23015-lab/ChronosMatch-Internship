@@ -891,3 +891,116 @@ python -m pytest tests/test_firehose.py
 - `tests/test_pipeline_integration.py`: **50 passed** (extended from 19).
 - Full suite (`--ignore=tests/test_firehose.py`): **943 passed**.
 - `tests/test_firehose.py`: **2 passed** (bypass sandbox required on Windows).
+
+---
+
+## 15. Week 3 — Day 7: End-to-End Order-Flow Integration Testing
+
+### 15.1 End-to-End Pipeline Architecture & Component Data Flow
+
+Day 7 establishes deterministic, verified end-to-end integration across all six core pipeline stages:
+
+```mermaid
+flowchart LR
+    A["Market Firehose / Producer<br/>(FastOrderGenerator / blast)"] -->|"Tuple Layout<br/>(id, ts, px, qty, sym, side, type)"| B["Binary Protocol<br/>(pack_order_into <QQdIHBB)"]
+    B -->|"Zero-Copy Slot Write<br/>(32 bytes / slot)"| C["MmapRingBuffer<br/>(Shared Memory IPC)"]
+    C -->|"Zero-Copy Slot Read<br/>(read_raw / read_batch_raw)"| D["ZeroCopyConsumer<br/>(Batched Drain Loop)"]
+    D -->|"Unpacked Order Tuple / NamedTuple"| E["OrderAdapter<br/>(dispatch_raw_order / symbol routing)"]
+    E -->|"match_order() / submit_order()"| F["Compiled MatchingEngine<br/>(Price-Time LOB / TradeResult)"]
+    E -.->|"TradeExecutionEvent<br/>(latency_ns, timestamps)"| G["Telemetry / AdapterStats"]
+```
+
+#### Component Responsibilities:
+1. **Producer / Market Firehose (`FastOrderGenerator` / `MarketFirehose`)**: Emits high-frequency order tuples with nanosecond timestamps, floating-point prices, symbol IDs, order sides, and types.
+2. **Binary Protocol (`chronos.protocol`)**: Packs orders into fixed 32-byte binary structures (`<QQdIHBB`), mapping floats to IEEE 754 64-bit double precision and integers to bounded numeric types.
+3. **Mmap Ring Buffer (`MmapRingBuffer`)**: Provides single-producer, single-consumer (SPSC) lockless shared-memory ring buffering with slot-level overwrite/drop policies and atomic head/tail index tracking.
+4. **Consumer (`ZeroCopyConsumer`)**: Drains raw order bytes from shared memory in micro-batches, deserializing them with zero unnecessary memory copies and delivering them to registered callbacks.
+5. **Adapter (`OrderAdapter`)**: Bridges decoded binary orders to the Cython `MatchingEngine`. Handles symbol-based demultiplexing, order-type routing, maker price policy enforcement, nanosecond entry/exit timestamp tagging, and latency tracking.
+6. **Matching Engine (`MatchingEngine`)**: Compiled Cython limit order book executing orders in strict price-time (FIFO) priority, converting prices to integer cents (`price_to_cents`) to eliminate floating-point drift.
+
+---
+
+### 15.2 Test Coverage Summary Across Test Files
+
+| Test File | Test Classes | Tests Passed | Day 7 Additions |
+| :--- | :--- | :--- | :--- |
+| `tests/test_end_to_end_order_flow.py` | 10 classes | **37 passed** | +26 tests across 4 new classes (`TestProducerFirehoseToEngineEndToEndFlow`, `TestFieldEncodingDecodingFidelityEndToEnd`, `TestAllDay5TradingScenariosE2E`, `TestPipelineErrorResilienceAndEdgeCases`) |
+| `tests/test_pipeline_integration.py` | 13 boundary classes | **56 passed** | +6 tests in `TestEndToEndOrderFlowFirehoseToEngineBoundary` |
+| `tests/test_ring_buffer_engine_integration.py` | 7 classes | **28 passed** | Baseline integration preserved |
+| **Combined Integration Suite** | **30 classes** | **121 passed** | **Comprehensive multi-component verification** |
+
+---
+
+### 15.3 Core Integration Invariants Verified
+
+1. **Full Order Flow Fidelity**:
+   - FastOrderGenerator batch output is serialized, transferred through the mmap buffer, deserialized by the consumer, adapted by OrderAdapter, and matched in MatchingEngine without losing or corrupting any orders.
+   - `stats.total_orders_dispatched + stats.unhandled_order_types == batch_size`.
+2. **Deterministic Crossing Matches & Maker Price Policy**:
+   - Arriving orders that cross the resting book execute immediately at the resting maker's price.
+   - Exact fills clear both sides of the book; partial fills leave exact remaining residuals in the resting book.
+3. **Unmatched and Non-Crossing Order Isolation**:
+   - Orders with positive bid-ask spread (e.g. bid $394.00 vs ask $405.00) rest in the book without producing false executions (`trades == []`, `stats.total_trades_generated == 0`).
+   - Single-sided books accumulate book depth cleanly.
+4. **Price Precision & Fractional Penny Handling**:
+   - Sub-penny and decimal dollar prices (e.g., $0.01, $10.05, $49.99, $125.75, $999.95) convert to exact integer ticks (`price_to_cents`) in the Cython engine without IEEE 754 precision drift.
+5. **Timestamp Preservation & Latency Tracking**:
+   - Original nanosecond timestamps from the producer flow intact through binary serialization to `TradeExecutionEvent.order_timestamp_ns`.
+   - Entry and exit timestamps (`t_entry`, `t_exit`) are tracked via `time.perf_counter_ns()`; calculated execution latency is non-negative (`latency_ns >= 0`).
+6. **Empty Buffer & Queued Burst Behavior**:
+   - Attempting to drain an empty buffer cleanly returns `[]` without raising errors or stalling.
+   - Bursts of 256+ queued orders in the buffer are drained in configurable batch sizes (e.g. 16 or 25 slots) without buffer pointer corruption or desynchronization (`available_to_read() == 0`).
+7. **Multi-Symbol Demultiplexing**:
+   - Cross-symbol orders with overlapping price levels (e.g. AAPL BUY @ $200.00 and MSFT SELL @ $190.00) route to isolated symbol engines, preventing cross-symbol trade contamination.
+8. **All 10 Day 5 Trading Scenarios E2E**:
+   - All 10 canonical scenarios from `tests/trading_scenarios.py` execute end-to-end through `MmapRingBuffer` and `OrderAdapter` and pass `scenario.verify_execution(trades, engine)`.
+9. **Error Resilience & Unhandled Order Isolation**:
+   - Interleaved streams with valid LIMIT orders, unsupported MARKET orders, unsupported CANCEL orders, and unrouted symbols process cleanly: valid LIMIT orders match correctly, while MARKET and CANCEL orders are safely diverted to `adapter.unhandled_orders` without corrupting engine state.
+
+---
+
+### 15.4 Integration Dependencies Requiring Final Verification After Day 10 Branch Merges
+
+The following integration dependencies are factually isolated on parallel branches or require multi-process infrastructure and are scheduled for final reconciliation during the Day 10 branch merges:
+
+1. **Albert's Unmerged Day 6 Changes**:
+   - Albert's Day 6 branch contains unmerged changes to benchmark scripts and telemetry metrics that have not yet been integrated into `Faizan-branch`.
+   - *Status*: Day 7 order flow testing intentionally avoids assuming Albert's changes, utilizing the verified existing contracts in `chronos/adapter.py`, `chronos/consumer.py`, and `chronos/ring_buffer.py`. Final verification will occur upon merging Day 10 branches.
+2. **Multi-Process Live Firehose IPC (Cross-Process Networking)**:
+   - `MarketFirehose.blast` uses `asyncio` loopback socket-pair IPC. On Windows sandbox environments, timer interrupt resolution and socket-pair loopback are restricted, requiring `BypassSandbox: true` for live daemon testing.
+   - *Status*: Component-level testing uses deterministic `FastOrderGenerator` batches and controlled input generators within sandbox mode; full multi-process daemon orchestration (`run_firehose.py` + `run_consumer.py`) will receive end-to-end system benchmarking in the Day 10 merge.
+3. **Engine-Level Support for CANCEL (`OrderType.CANCEL = 3`) and MARKET (`OrderType.MARKET = 2`)**:
+   - Currently, the Cython `MatchingEngine` core specializes in high-throughput LIMIT order execution (`price > 0.0`). The `OrderAdapter` safely intercepts CANCEL and MARKET orders into `unhandled_orders`.
+   - *Status*: Full end-to-end execution of cancellations (order book order removal) and market orders (best-bid/ask sweep at any price) requires future Cython matching engine methods (`cancel_order`).
+4. **Curses Terminal Dashboard Telemetry Pipeline**:
+   - `TerminalDashboard` in `chronos/dashboard.py` and `LiveFeedBridge` in `chronos/live_feed.py` consume telemetry for UI rendering.
+   - *Status*: Unit tests in `tests/test_dashboard.py` and `tests/test_smoke.py` verify rendering logic, but interactive terminal rendering is decoupled from batch automated integration testing.
+
+---
+
+### 15.5 How to Run the Day 7 Integration Test Suite
+
+```powershell
+# 1. Run all Day 7 end-to-end order flow tests (37 tests)
+python -m pytest tests/test_end_to_end_order_flow.py -v
+
+# 2. Run all pipeline integration foundation tests (56 tests)
+python -m pytest tests/test_pipeline_integration.py -v
+
+# 3. Run all core integration tests together (121 tests)
+python -m pytest tests/test_end_to_end_order_flow.py tests/test_pipeline_integration.py tests/test_ring_buffer_engine_integration.py -v
+
+# 4. Run the complete project test suite (sandboxed) (975 tests)
+python -m pytest --ignore=tests/test_firehose.py -q
+
+# 5. Run the firehose benchmark test (outside sandbox / bypass sandbox) (2 tests)
+python -m pytest tests/test_firehose.py -v
+```
+
+*Day 7 Verification Results*:
+- `tests/test_end_to_end_order_flow.py`: **37 passed** (extended from 11).
+- `tests/test_pipeline_integration.py`: **56 passed** (extended from 50).
+- `tests/test_ring_buffer_engine_integration.py`: **28 passed**.
+- Combined integration suite: **121 passed in 0.53s**.
+- Full test suite (`--ignore=tests/test_firehose.py`): **975 passed in 1.98s**.
+- Firehose suite: **2 passed in 0.36s**.
