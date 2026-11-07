@@ -81,6 +81,15 @@ Week 3, Day 7:
   * 100% mutation isolation via independent COrder clones preventing external state corruption.
   * Safe handling of empty books, one-sided books, multi-level books, and fully consumed levels.
 
+Week 3, Day 8:
+- Matched-Trade Record Generation & TradeResult Validation:
+  * Comprehensive validation of TradeResult records for full and partial fills.
+  * Precise tracking of buy_order_id, sell_order_id, executed_quantity, and maker execution_price.
+  * Correct multi-level trade record generation with decremented buy/sell remaining quantities.
+  * Strict quantity conservation (no lost or duplicated execution volume).
+  * Price-time priority verification in generated trade sequence.
+  * Order book state, depth, and best bid/ask consistency post-execution.
+
 
 Price Representation
 --------------------
@@ -420,6 +429,54 @@ cdef class TradeResult:
             "buy_remaining_quantity": self.buy_remaining_quantity,
             "sell_remaining_quantity": self.sell_remaining_quantity,
         }
+
+    def __getitem__(self, str key):
+        if key == "buy_order_id":
+            return self.buy_order_id
+        elif key == "sell_order_id":
+            return self.sell_order_id
+        elif key == "executed_quantity" or key == "trade_quantity" or key == "quantity" or key == "qty":
+            return self.executed_quantity
+        elif key == "execution_price_cents" or key == "price_cents":
+            return self.execution_price_cents
+        elif key == "execution_price" or key == "price":
+            return self.execution_price
+        elif key == "buy_remaining_quantity":
+            return self.buy_remaining_quantity
+        elif key == "sell_remaining_quantity":
+            return self.sell_remaining_quantity
+        elif key == "is_full_fill":
+            return self.is_full_fill
+        elif key == "is_partial_fill":
+            return self.is_partial_fill
+        raise KeyError(key)
+
+    def get(self, str key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, str key):
+        return key in (
+            "buy_order_id", "sell_order_id", "executed_quantity", "trade_quantity",
+            "quantity", "qty", "execution_price_cents", "price_cents",
+            "execution_price", "price", "buy_remaining_quantity", "sell_remaining_quantity",
+            "is_full_fill", "is_partial_fill"
+        )
+
+    def keys(self):
+        return [
+            "buy_order_id", "sell_order_id", "executed_quantity",
+            "execution_price_cents", "execution_price",
+            "buy_remaining_quantity", "sell_remaining_quantity"
+        ]
+
+    def items(self):
+        return [(k, self[k]) for k in self.keys()]
+
+    def values(self):
+        return [self[k] for k in self.keys()]
 
 
 cdef inline TradeResult _create_trade_result(
