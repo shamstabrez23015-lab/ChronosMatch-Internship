@@ -13,7 +13,7 @@ from chronos.protocol import (
     unpack_order_raw,
 )
 from chronos.ring_buffer import MmapRingBuffer, RingBufferFullError
-from chronos.dashboard import DashboardConfig, TerminalDashboard
+from chronos.dashboard import AuditStatusInfo, DashboardConfig, TerminalDashboard
 from chronos.adapter import AdapterStats, OrderAdapter
 from chronos.config import (
     ChronosConfig,
@@ -47,6 +47,7 @@ __all__ = [
     "unpack_order_raw",
     "MmapRingBuffer",
     "RingBufferFullError",
+    "AuditStatusInfo",
     "DashboardConfig",
     "TerminalDashboard",
     "OrderAdapter",

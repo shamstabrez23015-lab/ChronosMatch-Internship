@@ -5179,3 +5179,521 @@ class TestOrderThroughputMonitoringDay7:
         assert dashboard.orders_processed == 0
         assert dashboard.trades_processed == 0
 
+
+# ===========================================================================
+# Section 38: Week 3 Day 8 - Audit Activity and Persistence Status Tests
+# ===========================================================================
+
+from chronos.dashboard import (
+    SECTION_AUDIT_STATUS,
+    SECTION_AUDIT,
+    LABEL_AUDIT_WORKER,
+    LABEL_AUDIT_STATUS,
+    LABEL_AUDIT_WORKER_STATUS,
+    LABEL_AUDIT_RECORDS_WRITTEN,
+    LABEL_AUDIT_WRITTEN,
+    LABEL_AUDIT_RECORDS_PENDING,
+    LABEL_AUDIT_PENDING,
+    LABEL_AUDIT_WRITE_ERRORS,
+    LABEL_AUDIT_FAILED_RECORDS,
+    LABEL_AUDIT_LAST_FLUSH,
+    AuditStatusInfo,
+    format_audit_counter,
+    format_audit_worker_status,
+    _coerce_audit_status,
+    build_audit_status_lines,
+)
+
+
+class TestAuditStatusConstants:
+    """Verify audit and persistence status section constants and labels."""
+
+    def test_section_audit_status_is_str(self):
+        assert isinstance(SECTION_AUDIT_STATUS, str)
+        assert len(SECTION_AUDIT_STATUS) > 0
+        assert SECTION_AUDIT == SECTION_AUDIT_STATUS
+
+    def test_label_audit_worker_is_str(self):
+        assert isinstance(LABEL_AUDIT_WORKER, str)
+        assert LABEL_AUDIT_STATUS == LABEL_AUDIT_WORKER
+        assert LABEL_AUDIT_WORKER_STATUS == LABEL_AUDIT_WORKER
+
+    def test_label_records_written_is_str(self):
+        assert isinstance(LABEL_AUDIT_RECORDS_WRITTEN, str)
+        assert LABEL_AUDIT_WRITTEN == LABEL_AUDIT_RECORDS_WRITTEN
+
+    def test_label_records_pending_is_str(self):
+        assert isinstance(LABEL_AUDIT_RECORDS_PENDING, str)
+        assert LABEL_AUDIT_PENDING == LABEL_AUDIT_RECORDS_PENDING
+
+    def test_label_write_errors_is_str(self):
+        assert isinstance(LABEL_AUDIT_WRITE_ERRORS, str)
+        assert LABEL_AUDIT_FAILED_RECORDS == LABEL_AUDIT_WRITE_ERRORS
+
+    def test_label_last_flush_is_str(self):
+        assert isinstance(LABEL_AUDIT_LAST_FLUSH, str)
+
+
+class TestFormatAuditCounter:
+    """Verify pure function format_audit_counter formatting."""
+
+    def test_none_returns_na(self):
+        assert format_audit_counter(None) == "N/A"
+
+    def test_zero_returns_zero_string(self):
+        assert format_audit_counter(0) == "0"
+        assert format_audit_counter("0") == "0"
+
+    def test_positive_integers_formatted_with_commas(self):
+        assert format_audit_counter(1) == "1"
+        assert format_audit_counter(100) == "100"
+        assert format_audit_counter(1000) == "1,000"
+        assert format_audit_counter(12500) == "12,500"
+        assert format_audit_counter(1000000) == "1,000,000"
+
+    def test_string_integers_formatted(self):
+        assert format_audit_counter("54321") == "54,321"
+
+    def test_negative_values_raise_value_error(self):
+        with pytest.raises(ValueError, match="cannot be negative"):
+            format_audit_counter(-1)
+
+        with pytest.raises(ValueError, match="cannot be negative"):
+            format_audit_counter("-10")
+
+    def test_invalid_string_returns_na(self):
+        assert format_audit_counter("invalid") == "N/A"
+
+
+class TestFormatAuditWorkerStatus:
+    """Verify pure function format_audit_worker_status formatting."""
+
+    def test_none_or_empty_returns_na(self):
+        assert format_audit_worker_status(None) == "N/A"
+        assert format_audit_worker_status("") == "N/A"
+        assert format_audit_worker_status("   ") == "N/A"
+
+    def test_running_status(self):
+        assert format_audit_worker_status("running") == "Running"
+        assert format_audit_worker_status("RUNNING") == "Running"
+        assert format_audit_worker_status("Running") == "Running"
+        assert format_audit_worker_status(True) == "Running"
+
+    def test_stopped_status(self):
+        assert format_audit_worker_status("stopped") == "Stopped"
+        assert format_audit_worker_status("STOPPED") == "Stopped"
+        assert format_audit_worker_status("Stopped") == "Stopped"
+        assert format_audit_worker_status(False) == "Stopped"
+
+    def test_error_status_without_message(self):
+        assert format_audit_worker_status("error") == "Error"
+        assert format_audit_worker_status("ERROR") == "Error"
+
+    def test_error_status_with_message(self):
+        assert format_audit_worker_status("error", error_message="Disk full") == "Error: Disk full"
+        assert format_audit_worker_status("ERROR", error_message="I/O failure") == "Error: I/O failure"
+
+    def test_other_status_values(self):
+        assert format_audit_worker_status("idle") == "Idle"
+        assert format_audit_worker_status("paused") == "Paused"
+
+
+class TestAuditStatusCoercion:
+    """Verify _coerce_audit_status handles diverse input shapes gracefully."""
+
+    def test_none_returns_none(self):
+        assert _coerce_audit_status(None) is None
+
+    def test_audit_status_info_instance_preserved(self):
+        info = AuditStatusInfo(worker_status="running", records_written=42)
+        assert _coerce_audit_status(info) is info
+
+    def test_dict_input(self):
+        data = {
+            "worker_status": "running",
+            "records_written": 100,
+            "records_pending": 5,
+            "write_errors": 0,
+            "last_flush": "2026-11-07 20:00:00",
+        }
+        res = _coerce_audit_status(data)
+        assert isinstance(res, AuditStatusInfo)
+        assert res.worker_status == "running"
+        assert res.records_written == 100
+        assert res.records_pending == 5
+        assert res.write_errors == 0
+        assert res.last_flush == "2026-11-07 20:00:00"
+
+    def test_dict_with_alternate_keys(self):
+        data = {
+            "status": "stopped",
+            "written": 50,
+            "pending": 2,
+            "errors": 1,
+            "last_flush_time": "12:00:00",
+            "error": "Timeout",
+        }
+        res = _coerce_audit_status(data)
+        assert res.worker_status == "stopped"
+        assert res.records_written == 50
+        assert res.records_pending == 2
+        assert res.write_errors == 1
+        assert res.last_flush == "12:00:00"
+        assert res.error_message == "Timeout"
+
+    def test_object_with_attributes(self):
+        class MockAuditWorker:
+            worker_status = "running"
+            records_written = 200
+            records_pending = 0
+            write_errors = 0
+            last_flush = "10:15:30"
+
+        res = _coerce_audit_status(MockAuditWorker())
+        assert res.worker_status == "running"
+        assert res.records_written == 200
+        assert res.last_flush == "10:15:30"
+
+    def test_object_with_get_status_method(self):
+        class MockWorkerService:
+            def get_status(self):
+                return {"worker_status": "error", "error_message": "DB connection failed"}
+
+        res = _coerce_audit_status(MockWorkerService())
+        assert res.worker_status == "error"
+        assert res.error_message == "DB connection failed"
+
+    def test_callable_returning_dict(self):
+        fn = lambda: {"worker_status": "running", "records_written": 77}
+        res = _coerce_audit_status(fn)
+        assert res.worker_status == "running"
+        assert res.records_written == 77
+
+
+class TestBuildAuditStatusLines:
+    """Verify build_audit_status_lines pure layout function."""
+
+    def test_returns_list_of_strings(self):
+        lines = build_audit_status_lines(width=72)
+        assert isinstance(lines, list)
+        assert all(isinstance(line, str) for line in lines)
+
+    def test_section_header_present(self):
+        lines = build_audit_status_lines(width=72)
+        text = "\n".join(lines)
+        assert SECTION_AUDIT_STATUS in text
+
+    def test_missing_audit_information_shows_na_and_no_last_flush(self):
+        """When audit information is missing, counters show N/A and last flush is omitted."""
+        lines = build_audit_status_lines(width=72, audit_status=None)
+        text = "\n".join(lines)
+        assert LABEL_AUDIT_WORKER in text
+        assert LABEL_AUDIT_RECORDS_WRITTEN in text
+        assert LABEL_AUDIT_RECORDS_PENDING in text
+        assert LABEL_AUDIT_WRITE_ERRORS in text
+        assert "N/A" in text
+        # Last flush indicator is ONLY shown if provided
+        assert LABEL_AUDIT_LAST_FLUSH not in text
+
+    def test_worker_running_state(self):
+        info = AuditStatusInfo(worker_status="running", records_written=500, records_pending=10, write_errors=0)
+        lines = build_audit_status_lines(width=72, audit_status=info)
+        text = "\n".join(lines)
+        assert "Running" in text
+        assert "500" in text
+        assert "10" in text
+        assert "0" in text
+
+    def test_worker_stopped_state(self):
+        info = AuditStatusInfo(worker_status="stopped", records_written=1000, records_pending=0, write_errors=0)
+        lines = build_audit_status_lines(width=72, audit_status=info)
+        text = "\n".join(lines)
+        assert "Stopped" in text
+        assert "1,000" in text
+
+    def test_worker_error_state_without_message(self):
+        info = AuditStatusInfo(worker_status="error", records_written=10, records_pending=50, write_errors=3)
+        lines = build_audit_status_lines(width=72, audit_status=info)
+        text = "\n".join(lines)
+        assert "Error" in text
+        assert "3" in text
+
+    def test_worker_error_state_with_message(self):
+        info = AuditStatusInfo(
+            worker_status="error",
+            error_message="Disk write failed",
+            records_written=10,
+            records_pending=5,
+            write_errors=1,
+        )
+        lines = build_audit_status_lines(width=72, audit_status=info)
+        text = "\n".join(lines)
+        assert "Error: Disk write failed" in text
+
+    def test_last_flush_displayed_when_provided(self):
+        """Last flush indicator is displayed when existing implementation provides it."""
+        info = AuditStatusInfo(
+            worker_status="running",
+            records_written=100,
+            records_pending=0,
+            write_errors=0,
+            last_flush="2026-11-07 20:30:00",
+        )
+        lines = build_audit_status_lines(width=72, audit_status=info)
+        text = "\n".join(lines)
+        assert LABEL_AUDIT_LAST_FLUSH in text
+        assert "2026-11-07 20:30:00" in text
+
+    def test_persistence_counters_thousands_separators(self):
+        info = AuditStatusInfo(
+            worker_status="running",
+            records_written=1234567,
+            records_pending=89101,
+            write_errors=1234,
+        )
+        lines = build_audit_status_lines(width=72, audit_status=info)
+        text = "\n".join(lines)
+        assert "1,234,567" in text
+        assert "89,101" in text
+        assert "1,234" in text
+
+    def test_dividers_match_width(self):
+        width = 60
+        lines = build_audit_status_lines(width=width)
+        dividers = [line for line in lines if line == "-" * width]
+        assert len(dividers) >= 2
+
+
+class TestTerminalDashboardAuditStatusState:
+    """Verify audit status state management on TerminalDashboard."""
+
+    def test_default_audit_status_is_none(self):
+        d = TerminalDashboard(use_sample_data=False)
+        assert d.audit_status is None
+        assert d.get_audit_status() is None
+        assert d.get_audit_worker_display() == "N/A"
+        assert d.get_audit_written_display() == "N/A"
+        assert d.get_audit_pending_display() == "N/A"
+        assert d.get_audit_errors_display() == "N/A"
+        assert d.get_audit_last_flush_display() is None
+
+    def test_init_with_audit_status_info(self):
+        info = AuditStatusInfo(worker_status="running", records_written=100)
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        assert d.audit_status is info
+        assert d.get_audit_worker_display() == "Running"
+        assert d.get_audit_written_display() == "100"
+
+    def test_init_with_audit_status_dict(self):
+        data = {"worker_status": "stopped", "records_written": 250, "write_errors": 1}
+        d = TerminalDashboard(use_sample_data=False, audit_status=data)
+        assert d.audit_status is not None
+        assert d.audit_status.worker_status == "stopped"
+        assert d.get_audit_worker_display() == "Stopped"
+        assert d.get_audit_written_display() == "250"
+        assert d.get_audit_errors_display() == "1"
+
+    def test_set_and_update_audit_status(self):
+        d = TerminalDashboard(use_sample_data=False)
+        info = AuditStatusInfo(worker_status="running", records_written=50)
+        d.set_audit_status(info)
+        assert d.audit_status is info
+
+        updated = AuditStatusInfo(worker_status="running", records_written=150)
+        d.update_audit_status(updated)
+        assert d.audit_status is updated
+        assert d.get_audit_written_display() == "150"
+
+    def test_clear_audit_status(self):
+        info = AuditStatusInfo(worker_status="running", records_written=50)
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        assert d.audit_status is not None
+        d.clear_audit_status()
+        assert d.audit_status is None
+        assert d.get_audit_worker_display() == "N/A"
+
+    def test_property_setter_with_coercion(self):
+        d = TerminalDashboard(use_sample_data=False)
+        d.audit_status = {"worker_status": "running", "records_written": 75}
+        assert isinstance(d.audit_status, AuditStatusInfo)
+        assert d.audit_status.worker_status == "running"
+        assert d.audit_status.records_written == 75
+
+
+class TestDashboardDisplayLinesAuditIntegration:
+    """Verify get_display_lines integration with audit status section."""
+
+    def test_display_lines_contains_audit_section_by_default(self):
+        d = TerminalDashboard(use_sample_data=False)
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_AUDIT_STATUS in text
+        assert LABEL_AUDIT_WORKER in text
+        assert LABEL_AUDIT_RECORDS_WRITTEN in text
+        assert LABEL_AUDIT_RECORDS_PENDING in text
+        assert LABEL_AUDIT_WRITE_ERRORS in text
+        assert "N/A" in text
+
+    def test_display_lines_reflects_running_worker(self):
+        info = AuditStatusInfo(
+            worker_status="running",
+            records_written=1250,
+            records_pending=25,
+            write_errors=0,
+            last_flush="15:30:00",
+        )
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_AUDIT_STATUS in text
+        assert "Running" in text
+        assert "1,250" in text
+        assert "25" in text
+        assert "0" in text
+        assert LABEL_AUDIT_LAST_FLUSH in text
+        assert "15:30:00" in text
+
+    def test_display_lines_reflects_stopped_worker(self):
+        info = AuditStatusInfo(worker_status="stopped", records_written=400, records_pending=0, write_errors=0)
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert "Stopped" in text
+        assert "400" in text
+
+    def test_display_lines_reflects_error_worker(self):
+        info = AuditStatusInfo(
+            worker_status="error",
+            error_message="File system read-only",
+            records_written=100,
+            records_pending=50,
+            write_errors=5,
+        )
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert "Error: File system read-only" in text
+        assert "5" in text
+
+    def test_display_lines_param_override(self):
+        d = TerminalDashboard(use_sample_data=False)
+        override_info = AuditStatusInfo(worker_status="running", records_written=999)
+        lines = d.get_display_lines(rows=50, cols=100, audit_status=override_info)
+        text = "\n".join(lines)
+        assert "Running" in text
+        assert "999" in text
+
+    def test_small_terminal_fallback_does_not_crash_with_audit(self):
+        info = AuditStatusInfo(worker_status="running", records_written=1000)
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        lines = d.get_display_lines(rows=10, cols=30)
+        text = "\n".join(lines)
+        assert "too small" in text.lower()
+        assert QUIT_MESSAGE in text
+
+
+class TestDashboardRenderAuditIntegration:
+    """Verify curses render() integration with audit status section."""
+
+    def test_render_includes_audit_section_header(self):
+        d = TerminalDashboard(use_sample_data=False)
+        win = MockCursesWindow(rows=60, cols=100)
+        d.render(win)
+        rendered = " ".join(call[2] for call in win.addstr_calls)
+        assert SECTION_AUDIT_STATUS in rendered
+        assert LABEL_AUDIT_WORKER in rendered
+
+    def test_render_shows_running_status_and_counters(self):
+        info = AuditStatusInfo(
+            worker_status="running",
+            records_written=5000,
+            records_pending=12,
+            write_errors=0,
+            last_flush="12:34:56",
+        )
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        win = MockCursesWindow(rows=60, cols=100)
+        d.render(win)
+        rendered = " ".join(call[2] for call in win.addstr_calls)
+        assert "Running" in rendered
+        assert "5,000" in rendered
+        assert "12" in rendered
+        assert LABEL_AUDIT_LAST_FLUSH in rendered
+        assert "12:34:56" in rendered
+
+    def test_render_shows_stopped_state(self):
+        info = AuditStatusInfo(worker_status="stopped", records_written=200)
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        win = MockCursesWindow(rows=60, cols=100)
+        d.render(win)
+        rendered = " ".join(call[2] for call in win.addstr_calls)
+        assert "Stopped" in rendered
+        assert "200" in rendered
+
+    def test_render_shows_error_state(self):
+        info = AuditStatusInfo(worker_status="error", error_message="Permission denied", write_errors=2)
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        win = MockCursesWindow(rows=60, cols=100)
+        d.render(win)
+        rendered = " ".join(call[2] for call in win.addstr_calls)
+        assert "Error: Permission denied" in rendered
+        assert "2" in rendered
+
+    def test_render_small_window_safe(self):
+        info = AuditStatusInfo(worker_status="running", records_written=100)
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        win = MockCursesWindow(rows=5, cols=20)
+        d.render(win)
+        assert win.erased is True
+        assert win.refreshed is True
+        rendered = " ".join(call[2] for call in win.addstr_calls)
+        assert "too small" in rendered.lower()
+
+
+class TestAuditStatusPreservesExistingFeatures:
+    """Verify adding the audit status section preserves all existing dashboard capabilities."""
+
+    def test_all_sections_present_in_display_lines(self):
+        info = AuditStatusInfo(worker_status="running", records_written=100)
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        d.record_order_processed({"order_id": 1, "side": 1, "price": 500.0, "quantity": 10})
+        d.record_trade_execution(latency_us=15.0)
+
+        lines = d.get_display_lines(rows=60, cols=100)
+        text = "\n".join(lines)
+
+        from chronos.dashboard import (
+            SECTION_MARKET_SUMMARY,
+            SECTION_ORDER_BOOK,
+            SECTION_PERFORMANCE,
+            SECTION_TRADE_EXECUTION,
+            QUIT_MESSAGE,
+        )
+
+        assert SECTION_MARKET_SUMMARY in text
+        assert SECTION_ORDER_BOOK in text
+        assert SECTION_PERFORMANCE in text
+        assert SECTION_TRADE_EXECUTION in text
+        assert SECTION_AUDIT_STATUS in text
+        assert QUIT_MESSAGE in text
+
+    def test_order_counter_and_latency_preserved(self):
+        ns_clock = FakeNsClock(start_ns=0)
+        info = AuditStatusInfo(worker_status="running", records_written=50)
+        d = TerminalDashboard(ns_clock=ns_clock, use_sample_data=False, audit_status=info)
+
+        d.record_order_processed({"order_id": 10})
+        ns_clock.advance_us(100.0)
+        d.record_order_processed({"order_id": 20})
+
+        assert d.orders_processed == 2
+        assert d.get_latency_display() == "100.0"
+        assert d.audit_status.records_written == 50
+
+    def test_quit_input_handling_preserved(self):
+        d = TerminalDashboard(audit_status=AuditStatusInfo(worker_status="running"))
+        assert d.handle_input(ord("q")) is False
+        assert d.handle_input(ord("Q")) is False
+        assert d.handle_input(ord("x")) is True
+
+

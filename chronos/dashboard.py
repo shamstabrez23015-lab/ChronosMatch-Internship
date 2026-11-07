@@ -42,6 +42,20 @@ SECTION_TRADE_EXECUTION = "TRADE EXECUTION METRICS"
 SECTION_TRADE_METRICS = SECTION_TRADE_EXECUTION
 SECTION_TRADE_LATENCY = "TRADE EXECUTION LATENCY"
 SECTION_TRADE_EXECUTION_LATENCY = "TRADE EXECUTION LATENCY"
+SECTION_AUDIT_STATUS = "AUDIT & PERSISTENCE STATUS"
+SECTION_AUDIT = SECTION_AUDIT_STATUS
+
+# Audit and persistence status field labels
+LABEL_AUDIT_WORKER = "Audit Worker"
+LABEL_AUDIT_STATUS = LABEL_AUDIT_WORKER
+LABEL_AUDIT_WORKER_STATUS = LABEL_AUDIT_WORKER
+LABEL_AUDIT_RECORDS_WRITTEN = "Records Written"
+LABEL_AUDIT_WRITTEN = LABEL_AUDIT_RECORDS_WRITTEN
+LABEL_AUDIT_RECORDS_PENDING = "Records Pending"
+LABEL_AUDIT_PENDING = LABEL_AUDIT_RECORDS_PENDING
+LABEL_AUDIT_WRITE_ERRORS = "Write Errors"
+LABEL_AUDIT_FAILED_RECORDS = LABEL_AUDIT_WRITE_ERRORS
+LABEL_AUDIT_LAST_FLUSH = "Last Flush"
 
 # Market summary field labels
 LABEL_BEST_BID = "Best Bid"
@@ -1191,6 +1205,241 @@ def build_whale_alert_lines(
         divider,
     ]
 
+
+# ---------------------------------------------------------------------------
+# Audit Activity & Persistence Status structures and helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AuditStatusInfo:
+    """Container for audit worker status and persistence metrics.
+
+    Designed as a backward-compatible optional input. When Faizan's audit
+    worker is merged, it can provide this data; until then the dashboard
+    gracefully handles None or missing fields.
+
+    Fields:
+        worker_status: Current audit worker state ('running', 'stopped', 'error', or None/unknown).
+        error_message: Optional error description when worker_status is 'error'.
+        records_written: Count of records successfully persisted.
+        records_pending: Count of records waiting in queue to be written.
+        write_errors: Count of failed persistence write attempts.
+        last_flush: Optional human-readable timestamp or label of the last flush.
+    """
+
+    worker_status: Optional[Union[str, bool]] = None
+    records_written: Optional[int] = None
+    records_pending: Optional[int] = None
+    write_errors: Optional[int] = None
+    last_flush: Optional[Union[str, float, int]] = None
+    error_message: Optional[str] = None
+
+
+def format_audit_counter(count: Optional[Union[int, str]]) -> str:
+    """Format an audit record count with thousands separators or 'N/A' if None.
+
+    Args:
+        count: Non-negative integer count, integer-convertible string, or None.
+
+    Returns:
+        Formatted string (e.g., '0', '125', '12,500') or 'N/A' if None.
+
+    Raises:
+        ValueError: If count is negative.
+    """
+    if count is None:
+        return NO_SAMPLE_LATENCY
+    try:
+        val = int(count)
+    except (ValueError, TypeError):
+        return NO_SAMPLE_LATENCY
+    if val < 0:
+        raise ValueError(f"Audit counter cannot be negative: {val}")
+    return f"{val:,}"
+
+
+def format_audit_worker_status(
+    status: Optional[Union[str, bool]] = None,
+    error_message: Optional[str] = None,
+) -> str:
+    """Format audit worker status string for display.
+
+    Args:
+        status: Status string ('running', 'stopped', 'error', etc.), bool, or None.
+        error_message: Optional error message if status is 'error'.
+
+    Returns:
+        Formatted status string ('Running', 'Stopped', 'Error', 'Error: <msg>', or 'N/A').
+    """
+    if status is None:
+        return NO_SAMPLE_LATENCY
+    if isinstance(status, bool):
+        return "Running" if status else "Stopped"
+    s = str(status).strip()
+    if not s:
+        return NO_SAMPLE_LATENCY
+    s_lower = s.lower()
+    if s_lower == "running":
+        return "Running"
+    if s_lower == "stopped":
+        return "Stopped"
+    if s_lower == "error":
+        return f"Error: {error_message}" if error_message else "Error"
+    return s.capitalize() if len(s) > 1 else s.upper()
+
+
+def _coerce_audit_status(data: Any) -> Optional[AuditStatusInfo]:
+    """Coerce various audit status representations into AuditStatusInfo.
+
+    Supports:
+        - AuditStatusInfo instances directly
+        - Dicts with common keys
+        - Objects with attributes or inspection methods
+        - Callables returning dict or object
+    """
+    if data is None:
+        return None
+    if isinstance(data, AuditStatusInfo):
+        return data
+
+    obj = data
+    if callable(obj) and not isinstance(obj, type) and not hasattr(obj, "worker_status") and not hasattr(obj, "records_written"):
+        try:
+            obj = obj()
+        except Exception:
+            return None
+
+    if obj is None:
+        return None
+    if isinstance(obj, AuditStatusInfo):
+        return obj
+
+    if hasattr(obj, "get_status") and callable(getattr(obj, "get_status")):
+        try:
+            status_obj = obj.get_status()
+            if status_obj is not None:
+                obj = status_obj
+        except Exception:
+            pass
+    elif hasattr(obj, "get_metrics") and callable(getattr(obj, "get_metrics")):
+        try:
+            metrics_obj = obj.get_metrics()
+            if metrics_obj is not None:
+                obj = metrics_obj
+        except Exception:
+            pass
+
+    def _get_val(source: Any, *keys: str) -> Any:
+        if isinstance(source, dict):
+            for k in keys:
+                if k in source and source[k] is not None:
+                    return source[k]
+        else:
+            for k in keys:
+                if hasattr(source, k):
+                    val = getattr(source, k)
+                    if val is not None:
+                        return val
+        return None
+
+    status = _get_val(obj, "worker_status", "status", "state")
+    if status is None and hasattr(obj, "is_running"):
+        status = "running" if getattr(obj, "is_running") else "stopped"
+
+    written = _get_val(obj, "records_written", "written", "records_persisted", "total_written")
+    pending = _get_val(obj, "records_pending", "pending", "queue_size", "queued", "unflushed_records")
+    errors = _get_val(obj, "write_errors", "failed_records", "errors", "error_count", "failed_writes")
+    flush = _get_val(obj, "last_flush", "last_flush_time", "flush_timestamp", "last_flush_indicator")
+    err_msg = _get_val(obj, "error_message", "error", "last_error")
+
+    def _clean_int(val: Any) -> Optional[int]:
+        if val is None:
+            return None
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return None
+
+    return AuditStatusInfo(
+        worker_status=status,
+        records_written=_clean_int(written) if written is not None else None,
+        records_pending=_clean_int(pending) if pending is not None else None,
+        write_errors=_clean_int(errors) if errors is not None else None,
+        last_flush=str(flush) if flush is not None else None,
+        error_message=str(err_msg) if err_msg is not None else None,
+    )
+
+
+def build_audit_status_lines(
+    width: int,
+    audit_status: Optional[Union[AuditStatusInfo, Dict[str, Any], Any]] = None,
+    worker_status: Optional[str] = None,
+    records_written: Optional[Union[int, str]] = None,
+    records_pending: Optional[Union[int, str]] = None,
+    write_errors: Optional[Union[int, str]] = None,
+    last_flush: Optional[Union[str, float, int]] = None,
+    error_message: Optional[str] = None,
+) -> List[str]:
+    """Return Audit & Persistence Status section lines.
+
+    When audit_status is None (audit worker not connected) and no overrides are passed,
+    all available metrics display 'N/A'. No live values are invented.
+    Last-flush indicator is displayed only if provided.
+
+    Args:
+        width: Available content width in characters.
+        audit_status: Optional AuditStatusInfo or dict.
+        worker_status: Optional worker status override.
+        records_written: Optional records written override.
+        records_pending: Optional records pending override.
+        write_errors: Optional write errors override.
+        last_flush: Optional last flush indicator.
+        error_message: Optional error message.
+
+    Returns:
+        List of formatted strings for the audit status section.
+    """
+    info = _coerce_audit_status(audit_status) if audit_status is not None else None
+
+    # Resolve values with explicit overrides taking precedence
+    st = worker_status if worker_status is not None else (info.worker_status if info else None)
+    err = error_message if error_message is not None else (info.error_message if info else None)
+    wr = records_written if records_written is not None else (info.records_written if info else None)
+    pd = records_pending if records_pending is not None else (info.records_pending if info else None)
+    er = write_errors if write_errors is not None else (info.write_errors if info else None)
+    lf = last_flush if last_flush is not None else (info.last_flush if info else None)
+
+    worker_str = format_audit_worker_status(st, error_message=err)
+    written_str = format_audit_counter(wr)
+    pending_str = format_audit_counter(pd)
+    errors_str = format_audit_counter(er)
+
+    divider = "-" * width
+    col_w = max(width - 4, 10)
+
+    def _row(label: str, val_str: str) -> str:
+        val_w = max(len(val_str), 8)
+        label_w = max(col_w - val_w - 2, 10)
+        return f"  {label:<{label_w}} {val_str:>{val_w}}"
+
+    lines: List[str] = [
+        f"  {SECTION_AUDIT_STATUS}",
+        divider,
+        _row(LABEL_AUDIT_WORKER, worker_str),
+        _row(LABEL_AUDIT_RECORDS_WRITTEN, written_str),
+        _row(LABEL_AUDIT_RECORDS_PENDING, pending_str),
+        _row(LABEL_AUDIT_WRITE_ERRORS, errors_str),
+    ]
+
+    # Display last-flush indicator only if the implementation/input provides it
+    if lf is not None:
+        flush_str = str(lf)
+        lines.append(_row(LABEL_AUDIT_LAST_FLUSH, flush_str))
+
+    lines.append(divider)
+    return lines
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -1442,6 +1691,7 @@ class TerminalDashboard:
         live_feed: Optional[Any] = None,
         trades_processed: Optional[int] = None,
         trade_latency_unit: Optional[str] = None,
+        audit_status: Optional[Union[AuditStatusInfo, Dict[str, Any], Any]] = None,
     ) -> None:
         """Initialize the dashboard.
 
@@ -1561,6 +1811,13 @@ class TerminalDashboard:
         self._last_whale_event: Optional[WhaleOrderEvent] = None
         self._whale_history: List[WhaleOrderEvent] = []
         self._max_whale_history: int = 10
+
+        # Audit activity & persistence tracking state
+        self._audit_status: Optional[AuditStatusInfo] = (
+            _coerce_audit_status(audit_status)
+            if audit_status is not None and not isinstance(audit_status, AuditStatusInfo)
+            else audit_status
+        )
 
     @property
     def orders_processed(self) -> int:
@@ -1884,6 +2141,69 @@ class TerminalDashboard:
         """Clear the whale order tracking state (last event and full history)."""
         self._last_whale_event = None
         self._whale_history.clear()
+
+    # ------------------------------------------------------------------
+    # Audit & persistence status state management
+    # ------------------------------------------------------------------
+
+    @property
+    def audit_status(self) -> Optional[AuditStatusInfo]:
+        """Return the current audit status info, or None if unavailable."""
+        return self._audit_status
+
+    @audit_status.setter
+    def audit_status(self, value: Optional[Union[AuditStatusInfo, Dict[str, Any], Any]]) -> None:
+        """Set or update the audit status info."""
+        self._audit_status = _coerce_audit_status(value) if value is not None else None
+
+    def set_audit_status(self, status: Optional[Union[AuditStatusInfo, Dict[str, Any], Any]]) -> None:
+        """Explicitly set or update the audit status from an audit worker or monitor."""
+        self.audit_status = status
+
+    def update_audit_status(self, status: Optional[Union[AuditStatusInfo, Dict[str, Any], Any]]) -> None:
+        """Update audit status (alias for set_audit_status)."""
+        self.set_audit_status(status)
+
+    def clear_audit_status(self) -> None:
+        """Clear audit status info (set to None / unavailable)."""
+        self._audit_status = None
+
+    def get_audit_status(self) -> Optional[AuditStatusInfo]:
+        """Return the current audit status info."""
+        return self._audit_status
+
+    def get_audit_worker_display(self) -> str:
+        """Return formatted audit worker status string for display."""
+        if self._audit_status is not None:
+            return format_audit_worker_status(
+                self._audit_status.worker_status,
+                error_message=self._audit_status.error_message,
+            )
+        return NO_SAMPLE_LATENCY
+
+    def get_audit_written_display(self) -> str:
+        """Return formatted records written count for display."""
+        if self._audit_status is not None and self._audit_status.records_written is not None:
+            return format_audit_counter(self._audit_status.records_written)
+        return NO_SAMPLE_LATENCY
+
+    def get_audit_pending_display(self) -> str:
+        """Return formatted records pending count for display."""
+        if self._audit_status is not None and self._audit_status.records_pending is not None:
+            return format_audit_counter(self._audit_status.records_pending)
+        return NO_SAMPLE_LATENCY
+
+    def get_audit_errors_display(self) -> str:
+        """Return formatted write errors count for display."""
+        if self._audit_status is not None and self._audit_status.write_errors is not None:
+            return format_audit_counter(self._audit_status.write_errors)
+        return NO_SAMPLE_LATENCY
+
+    def get_audit_last_flush_display(self) -> Optional[str]:
+        """Return formatted last flush indicator string, or None if not provided."""
+        if self._audit_status is not None and self._audit_status.last_flush is not None:
+            return str(self._audit_status.last_flush)
+        return None
 
     def get_trade_latency_min_display(self, decimals: int = 1) -> str:
         """Return formatted minimum trade execution latency for display."""
@@ -2252,6 +2572,7 @@ class TerminalDashboard:
         trade_latency_min: Optional[Union[float, int, str]] = None,
         trade_latency_max: Optional[Union[float, int, str]] = None,
         trade_latency_unit: Optional[str] = None,
+        audit_status: Optional[Union[AuditStatusInfo, Dict[str, Any], Any]] = None,
     ) -> List[str]:
         """Generate all display lines for the current state.
 
@@ -2388,6 +2709,9 @@ class TerminalDashboard:
             unit=t_unit,
         )
         lines.append("")
+        eff_audit = audit_status if audit_status is not None else self._audit_status
+        lines += build_audit_status_lines(width, audit_status=eff_audit)
+        lines.append("")
         whale_lines = build_whale_alert_lines(width, whale=self._last_whale_event)
         if whale_lines:
             lines += whale_lines
@@ -2511,6 +2835,7 @@ class TerminalDashboard:
         trade_latency_min: Optional[Union[float, int, str]] = None,
         trade_latency_max: Optional[Union[float, int, str]] = None,
         trade_latency_unit: Optional[str] = None,
+        audit_status: Optional[Union[AuditStatusInfo, Dict[str, Any], Any]] = None,
     ) -> None:
         """Render a single frame of the dashboard onto the curses window."""
         try:
@@ -2538,6 +2863,7 @@ class TerminalDashboard:
                 trade_latency_min=trade_latency_min,
                 trade_latency_max=trade_latency_max,
                 trade_latency_unit=trade_latency_unit,
+                audit_status=audit_status,
             )
             for idx, line in enumerate(lines):
                 self._safe_addstr(stdscr, idx, 0, line)
@@ -2730,6 +3056,19 @@ class TerminalDashboard:
         put(f"  {lbl_trade_min:<{col_w - 10}} {trade_lat_min_str:>8}", attrs["label"])
         put(f"  {lbl_trade_max:<{col_w - 10}} {trade_lat_max_str:>8}", attrs["label"])
         put(divider, attrs["border"])
+        blank()
+
+        # ---- Audit & Persistence Status ----
+        eff_audit = audit_status if audit_status is not None else self._audit_status
+        _audit_lines = build_audit_status_lines(width, audit_status=eff_audit)
+        for _al in _audit_lines:
+            _stripped = _al.strip()
+            if _stripped.startswith("-") or _stripped.startswith("="):
+                put(_al, attrs["border"])
+            elif SECTION_AUDIT_STATUS in _stripped:
+                put(_al, attrs["section"])
+            else:
+                put(_al, attrs["label"])
         blank()
 
         # ---- Whale Order Alert ----
