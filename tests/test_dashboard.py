@@ -5697,3 +5697,535 @@ class TestAuditStatusPreservesExistingFeatures:
         assert d.handle_input(ord("x")) is True
 
 
+# ===========================================================================
+# Section 39: Week 4 Day 9 - Whale Order Visualization & Highlighting Refinements
+# ===========================================================================
+
+
+class TestWhaleQualifyingAndNonQualifyingOrders:
+    """Test detection logic for qualifying and non-qualifying whale orders."""
+
+    def test_qualifying_two_price_levels(self):
+        trades = [
+            {"price": 100.0, "executed_quantity": 50},
+            {"price": 101.0, "executed_quantity": 50},
+        ]
+        whale = detect_whale_order(order_id=101, trades=trades, side=1)
+        assert whale is not None
+        assert whale.is_whale is True
+        assert whale.order_id == 101
+        assert whale.side == 1
+        assert whale.price_levels_cleared == 2
+        assert whale.total_quantity == 100
+        assert whale.prices == [100.0, 101.0]
+
+    def test_qualifying_multiple_price_levels(self):
+        trades = [
+            {"price": 105.0, "executed_quantity": 20},
+            {"price": 104.0, "executed_quantity": 30},
+            {"price": 103.0, "executed_quantity": 40},
+            {"price": 102.0, "executed_quantity": 50},
+        ]
+        whale = detect_whale_order(order_id=202, trades=trades, side=2)
+        assert whale is not None
+        assert whale.price_levels_cleared == 4
+        assert whale.total_quantity == 140
+        assert whale.volume_matched == 140
+        assert whale.prices == [105.0, 104.0, 103.0, 102.0]
+
+    def test_non_qualifying_empty_or_none_trades(self):
+        assert detect_whale_order(order_id=1, trades=None) is None
+        assert detect_whale_order(order_id=1, trades=[]) is None
+
+    def test_non_qualifying_single_price_level_multiple_trades(self):
+        trades = [
+            {"price": 100.0, "executed_quantity": 10},
+            {"price": 100.0, "executed_quantity": 20},
+            {"price": 100.0, "executed_quantity": 30},
+        ]
+        assert detect_whale_order(order_id=303, trades=trades, side=1) is None
+
+    def test_corrupted_or_zero_trades_filtered(self):
+        trades = [
+            {"price": 100.0, "executed_quantity": 50},
+            "invalid_trade_string",
+            {"price": 100.0, "executed_quantity": 25},
+        ]
+        # Only 1 distinct valid price level -> non-qualifying
+        assert detect_whale_order(order_id=404, trades=trades) is None
+
+    def test_configurable_min_levels_threshold(self):
+        trades = [
+            {"price": 100.0, "executed_quantity": 50},
+            {"price": 101.0, "executed_quantity": 50},
+        ]
+        # With default min_levels=2: qualifies
+        assert detect_whale_order(order_id=1, trades=trades, min_levels=2) is not None
+        # With stricter min_levels=3: does not qualify
+        assert detect_whale_order(order_id=1, trades=trades, min_levels=3) is None
+
+
+class TestWhaleMultiplePriceLevelsOrderBook:
+    """Test Whale visualization across multiple order-book price levels."""
+
+    def test_depth_renders_exact_prices_and_quantities(self):
+        bids = [
+            {"price": 150.00, "quantity": 1250, "side": 1},
+            {"price": 149.95, "quantity": 450, "side": 1},
+            {"price": 149.90, "quantity": 800, "side": 1},
+        ]
+        asks = [
+            {"price": 150.25, "quantity": 120, "side": 2},
+            {"price": 150.30, "quantity": 3400, "side": 2},
+            {"price": 150.35, "quantity": 250, "side": 2},
+        ]
+        whale = WhaleOrderEvent(
+            order_id=888,
+            side=1,
+            total_quantity=3520,
+            price_levels_cleared=2,
+            prices=[150.25, 150.30],
+            volume_matched=3520,
+        )
+        dashboard = TerminalDashboard(
+            buy_orders=bids,
+            sell_orders=asks,
+            use_sample_data=False,
+            whale=whale,
+        )
+        lines = dashboard.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+
+        # Exact prices and quantities must appear in order book
+        assert "150.00" in text
+        assert "1,250" in text or "1250" in text
+        assert "149.95" in text
+        assert "450" in text
+        assert "150.25" in text
+        assert "120" in text
+        assert "150.30" in text
+        assert "3,400" in text or "3400" in text
+
+        # Whale alert section must show swept prices
+        assert "150.25 -> 150.30" in text
+
+    def test_swept_prices_formatting_and_truncation(self):
+        whale = WhaleOrderEvent(
+            order_id=999,
+            side=2,
+            total_quantity=500,
+            price_levels_cleared=6,
+            prices=[100.0, 99.5, 99.0, 98.5, 98.0, 97.5],
+            volume_matched=500,
+        )
+        lines = build_whale_alert_lines(width=80, whale=whale)
+        text = "\n".join(lines)
+        assert "100.00 -> 99.50 -> 99.00 -> 98.50 -> 98.00 ..." in text
+
+    def test_whale_highlighting_applied_to_swept_levels_in_render(self):
+        """In curses render, order book rows swept by whale receive whale color/attr."""
+        bids = [
+            {"price": 101.00, "quantity": 50, "side": 1},
+            {"price": 100.00, "quantity": 60, "side": 1},
+            {"price": 99.00, "quantity": 70, "side": 1},
+        ]
+        asks = [
+            {"price": 102.00, "quantity": 80, "side": 2},
+            {"price": 103.00, "quantity": 90, "side": 2},
+        ]
+        # SELL whale that swept bids at 101.00 and 100.00
+        whale = WhaleOrderEvent(
+            order_id=77,
+            side=2,
+            total_quantity=110,
+            price_levels_cleared=2,
+            prices=[101.00, 100.00],
+            volume_matched=110,
+        )
+        dashboard = TerminalDashboard(
+            buy_orders=bids,
+            sell_orders=asks,
+            use_sample_data=False,
+            whale=whale,
+        )
+        win = MockCursesWindow(rows=60, cols=100)
+        dashboard.render(win)
+
+        attrs = dashboard._build_attrs()
+        # Find calls writing order book bid/ask lines (excluding market summary and alert lines)
+        bid_101_calls = [
+            c for c in win.addstr_calls
+            if "101.00" in c[2] and LABEL_BEST_BID not in c[2] and "Swept:" not in c[2]
+        ]
+        bid_100_calls = [
+            c for c in win.addstr_calls
+            if "100.00" in c[2] and LABEL_BEST_BID not in c[2] and "Swept:" not in c[2]
+        ]
+        bid_99_calls = [
+            c for c in win.addstr_calls
+            if "99.00" in c[2] and LABEL_BEST_BID not in c[2] and "Swept:" not in c[2]
+        ]
+        ask_102_calls = [
+            c for c in win.addstr_calls
+            if "102.00" in c[2] and LABEL_BEST_ASK not in c[2] and "Swept:" not in c[2]
+        ]
+
+        assert len(bid_101_calls) > 0
+        assert len(bid_100_calls) > 0
+        assert len(bid_99_calls) > 0
+
+        # 101.00 and 100.00 were swept by SELL whale -> highlighted with whale_sell
+        assert bid_101_calls[0][3] == attrs["whale_sell"]
+        assert bid_100_calls[0][3] == attrs["whale_sell"]
+        # 99.00 was NOT swept -> normal bid attribute
+        assert bid_99_calls[0][3] == attrs["bid"]
+        # 102.00 ask was NOT swept -> normal ask attribute
+        assert ask_102_calls[0][3] == attrs["ask"]
+
+
+class TestWhaleBuyAndSellHighlighting:
+    """Test visual highlighting distinguishes BUY vs SELL whale orders."""
+
+    def test_whale_buy_order_attributes_in_render(self):
+        whale_buy = WhaleOrderEvent(
+            order_id=10,
+            side=1,  # BUY
+            total_quantity=200,
+            price_levels_cleared=2,
+            prices=[102.0, 103.0],
+            volume_matched=200,
+        )
+        dashboard = TerminalDashboard(use_sample_data=False, whale=whale_buy)
+        win = MockCursesWindow(rows=60, cols=100)
+        dashboard.render(win)
+
+        attrs = dashboard._build_attrs()
+        # Verify alert lines render with whale_buy attribute
+        side_calls = [c for c in win.addstr_calls if "BUY" in c[2] and LABEL_WHALE_SIDE in c[2]]
+        assert len(side_calls) > 0
+        assert side_calls[0][3] == attrs["whale_buy"]
+
+    def test_whale_sell_order_attributes_in_render(self):
+        whale_sell = WhaleOrderEvent(
+            order_id=20,
+            side=2,  # SELL
+            total_quantity=300,
+            price_levels_cleared=2,
+            prices=[100.0, 99.0],
+            volume_matched=300,
+        )
+        dashboard = TerminalDashboard(use_sample_data=False, whale=whale_sell)
+        win = MockCursesWindow(rows=60, cols=100)
+        dashboard.render(win)
+
+        attrs = dashboard._build_attrs()
+        # Verify alert lines render with whale_sell attribute
+        side_calls = [c for c in win.addstr_calls if "SELL" in c[2] and LABEL_WHALE_SIDE in c[2]]
+        assert len(side_calls) > 0
+        assert side_calls[0][3] == attrs["whale_sell"]
+
+    def test_whale_attributes_defined_in_attrs(self):
+        dashboard = TerminalDashboard()
+        attrs = dashboard._build_attrs()
+        for key in ("whale_buy", "whale_sell", "whale_alert", "whale_badge"):
+            assert key in attrs
+
+    def test_monochrome_fallback_uses_bold_or_standout(self):
+        dashboard = TerminalDashboard()
+        # Mock _has_colors_safe to return False (monochrome terminal)
+        dashboard._has_colors_safe = lambda: False
+        attrs = dashboard._build_attrs()
+        # In curses environment with no color, bold must still be active
+        import curses
+        if curses is not None:
+            assert attrs["whale_buy"] != 0
+            assert attrs["whale_sell"] != 0
+            assert attrs["whale_alert"] != 0
+
+
+class TestWhaleUpdatesAfterOrderBookChanges:
+    """Test Whale visualization updates after order addition, partial fill, and removal."""
+
+    def test_order_book_addition_preserves_whale_alert(self):
+        dashboard = TerminalDashboard(use_sample_data=False)
+        whale = WhaleOrderEvent(
+            order_id=50, side=1, total_quantity=100,
+            price_levels_cleared=2, prices=[101.0, 102.0], volume_matched=100,
+        )
+        dashboard.record_whale_order(whale)
+
+        # Add new orders to book
+        dashboard.update_orders(
+            buy_orders=[{"price": 100.0, "quantity": 50, "side": 1}],
+            sell_orders=[{"price": 103.0, "quantity": 60, "side": 2}],
+        )
+
+        lines = dashboard.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_WHALE_ALERT in text
+        assert "100.00" in text
+        assert "103.00" in text
+
+    def test_order_book_partial_fill_updates_remaining_quantity(self):
+        whale = WhaleOrderEvent(
+            order_id=60, side=2, total_quantity=80,
+            price_levels_cleared=2, prices=[101.0, 100.0], volume_matched=80,
+        )
+        # Resting bid originally had 100, now partially filled to 20
+        dashboard = TerminalDashboard(
+            buy_orders=[{"price": 100.0, "quantity": 20, "side": 1}],
+            use_sample_data=False,
+            whale=whale,
+        )
+        win = MockCursesWindow(rows=60, cols=100)
+        dashboard.render(win)
+
+        # Order book shows reduced remaining quantity (20)
+        bid_calls = [
+            c for c in win.addstr_calls
+            if "100.00" in c[2] and LABEL_BEST_BID not in c[2] and "Swept:" not in c[2]
+        ]
+        assert len(bid_calls) > 0
+        assert "20" in bid_calls[0][2]
+        # And because 100.00 was swept, it is highlighted
+        attrs = dashboard._build_attrs()
+        assert bid_calls[0][3] == attrs["whale_sell"]
+
+    def test_clearing_whale_history_resets_order_book_highlighting(self):
+        whale = WhaleOrderEvent(
+            order_id=70, side=2, total_quantity=50,
+            price_levels_cleared=2, prices=[100.0, 99.0], volume_matched=50,
+        )
+        dashboard = TerminalDashboard(
+            buy_orders=[{"price": 100.0, "quantity": 50, "side": 1}],
+            use_sample_data=False,
+            whale=whale,
+        )
+        win1 = MockCursesWindow(rows=60, cols=100)
+        dashboard.render(win1)
+        attrs = dashboard._build_attrs()
+        ob_calls_win1 = [
+            c for c in win1.addstr_calls
+            if "100.00" in c[2] and LABEL_BEST_BID not in c[2] and "Swept:" not in c[2]
+        ]
+        assert ob_calls_win1[0][3] == attrs["whale_sell"]
+
+        # Clear whale history
+        dashboard.clear_whale_history()
+        win2 = MockCursesWindow(rows=60, cols=100)
+        dashboard.render(win2)
+        # Now 100.00 reverts to normal bid attribute
+        ob_calls_win2 = [
+            c for c in win2.addstr_calls
+            if "100.00" in c[2] and LABEL_BEST_BID not in c[2] and "Swept:" not in c[2]
+        ]
+        assert ob_calls_win2[0][3] == attrs["bid"]
+        assert SECTION_WHALE_ALERT not in " ".join(c[2] for c in win2.addstr_calls)
+
+    def test_new_qualifying_whale_replaces_previous(self):
+        w1 = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=100,
+            price_levels_cleared=2, prices=[10.0, 11.0], volume_matched=100,
+        )
+        w2 = WhaleOrderEvent(
+            order_id=2, side=2, total_quantity=200,
+            price_levels_cleared=3, prices=[20.0, 19.0, 18.0], volume_matched=200,
+        )
+        dashboard = TerminalDashboard(use_sample_data=False)
+        dashboard.record_whale_order(w1)
+        dashboard.record_whale_order(w2)
+
+        lines = dashboard.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert "20.00 -> 19.00 -> 18.00" in text
+        assert "10.00 -> 11.00" not in text
+        assert dashboard.last_whale_event is w2
+        assert len(dashboard.whale_history) == 2
+
+
+class TestWhaleLiveDashboardIntegration:
+    """Test LiveFeedBridge integration with real MatchingEngine producing whale sweeps."""
+
+    def test_live_matching_engine_multi_level_sell_sweep(self):
+        try:
+            from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        except Exception:
+            pytest.skip("MatchingEngine not available")
+
+        engine = MatchingEngine()
+        # Seed resting bids at 2 distinct price levels
+        engine.submit_order(1, SIDE_BUY, 102.0, 50, 1000)
+        engine.submit_order(2, SIDE_BUY, 101.0, 50, 1100)
+
+        dashboard = TerminalDashboard(use_sample_data=False)
+        bridge = LiveFeedBridge(engine=engine, dashboard=dashboard)
+        bridge.sync_to_dashboard()
+
+        # Submit aggressive SELL sweeping both levels
+        sweep_order = (99, 1_000_000, 100.0, 100, SIDE_SELL, SIDE_SELL, 1)
+        bridge._handle_raw_order(sweep_order)
+        bridge.sync_to_dashboard()
+
+        whale = dashboard.get_last_whale_event()
+        assert whale is not None
+        assert whale.order_id == 99
+        assert whale.side == SIDE_SELL
+        assert whale.price_levels_cleared >= 2
+        assert whale.is_whale is True
+
+        lines = dashboard.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_WHALE_ALERT in text
+        assert "SELL" in text
+
+    def test_live_matching_engine_multi_level_buy_sweep(self):
+        try:
+            from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        except Exception:
+            pytest.skip("MatchingEngine not available")
+
+        engine = MatchingEngine()
+        # Seed resting asks at 2 distinct price levels
+        engine.submit_order(10, SIDE_SELL, 201.0, 40, 1000)
+        engine.submit_order(11, SIDE_SELL, 202.0, 60, 1100)
+
+        dashboard = TerminalDashboard(use_sample_data=False)
+        bridge = LiveFeedBridge(engine=engine, dashboard=dashboard)
+        bridge.sync_to_dashboard()
+
+        # Submit aggressive BUY sweeping both levels
+        sweep_order = (77, 1_000_000, 205.0, 100, SIDE_BUY, SIDE_BUY, 1)
+        bridge._handle_raw_order(sweep_order)
+        bridge.sync_to_dashboard()
+
+        whale = dashboard.get_last_whale_event()
+        assert whale is not None
+        assert whale.order_id == 77
+        assert whale.side == SIDE_BUY
+        assert whale.price_levels_cleared >= 2
+
+        lines = dashboard.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_WHALE_ALERT in text
+        assert "BUY" in text
+
+    def test_live_mode_avoids_hardcoded_demo_values(self):
+        try:
+            from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        except Exception:
+            pytest.skip("MatchingEngine not available")
+
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 75.0, 30, 1000)
+        engine.submit_order(2, SIDE_SELL, 76.0, 40, 2000)
+
+        dashboard = TerminalDashboard(use_sample_data=False)
+        bridge = LiveFeedBridge(engine=engine, dashboard=dashboard)
+        bridge.sync_to_dashboard()
+
+        lines = dashboard.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert "75.00" in text
+        assert "76.00" in text
+        # Must not contain demo prices from sample data
+        assert "500.00" not in text
+        assert "505.00" not in text
+        assert dashboard.is_sample_data is False
+
+    def test_live_feed_preserves_order_counters_and_audit(self):
+        info = AuditStatusInfo(worker_status="running", records_written=42)
+        dashboard = TerminalDashboard(use_sample_data=False, audit_status=info)
+        bridge = LiveFeedBridge(dashboard=dashboard)
+
+        # Process a regular order
+        bridge._handle_raw_order((1, 1000, 100.0, 10, 1, 1, 1))
+        assert dashboard.orders_processed == 1
+
+        lines = dashboard.get_display_lines(rows=60, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_PERFORMANCE in text
+        assert SECTION_AUDIT_STATUS in text
+        assert "Running" in text
+        assert "42" in text
+
+
+class TestWhaleDashboardResponsivenessAndSmallTerminal:
+    """Test dashboard layout responsiveness, small terminal fallback, and section preservation."""
+
+    def test_small_terminal_rows_fallback_safe(self):
+        whale = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=100,
+            price_levels_cleared=2, prices=[100.0, 101.0], volume_matched=100,
+        )
+        dashboard = TerminalDashboard(whale=whale)
+        win = MockCursesWindow(rows=10, cols=40)
+        dashboard.render(win)
+
+        rendered = " ".join(c[2] for c in win.addstr_calls)
+        assert "too small" in rendered.lower()
+        # Whale order event is preserved
+        assert dashboard.get_last_whale_event() is whale
+
+    def test_small_terminal_cols_fallback_safe(self):
+        whale = WhaleOrderEvent(
+            order_id=1, side=2, total_quantity=100,
+            price_levels_cleared=2, prices=[100.0, 99.0], volume_matched=100,
+        )
+        dashboard = TerminalDashboard(whale=whale)
+        win = MockCursesWindow(rows=40, cols=50)
+        dashboard.render(win)
+
+        rendered = " ".join(c[2] for c in win.addstr_calls)
+        assert "too small" in rendered.lower()
+
+    def test_whale_alert_does_not_overflow_window(self):
+        whale = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=100,
+            price_levels_cleared=2, prices=[100.0, 101.0], volume_matched=100,
+        )
+        dashboard = TerminalDashboard(whale=whale)
+        # Exactly minimum rows (30)
+        win = MockCursesWindow(rows=MIN_TERMINAL_ROWS, cols=MIN_TERMINAL_COLS)
+        dashboard.render(win)
+
+        rendered = " ".join(c[2] for c in win.addstr_calls)
+        # Footer quit message is safely rendered
+        assert QUIT_MESSAGE in rendered
+        # No call writes at or beyond max rows
+        for c in win.addstr_calls:
+            assert c[0] < MIN_TERMINAL_ROWS
+
+    def test_whale_alert_preserves_all_other_sections(self):
+        from chronos.dashboard import (
+            SECTION_MARKET_SUMMARY,
+            SECTION_ORDER_BOOK,
+            SECTION_PERFORMANCE,
+            SECTION_TRADE_EXECUTION,
+            SECTION_AUDIT_STATUS,
+        )
+        whale = WhaleOrderEvent(
+            order_id=88, side=1, total_quantity=200,
+            price_levels_cleared=2, prices=[50.0, 51.0], volume_matched=200,
+        )
+        info = AuditStatusInfo(worker_status="running", records_written=10)
+        dashboard = TerminalDashboard(whale=whale, audit_status=info)
+        lines = dashboard.get_display_lines(rows=60, cols=100)
+        text = "\n".join(lines)
+
+        assert SECTION_MARKET_SUMMARY in text
+        assert SECTION_ORDER_BOOK in text
+        assert SECTION_PERFORMANCE in text
+        assert SECTION_TRADE_EXECUTION in text
+        assert SECTION_AUDIT_STATUS in text
+        assert SECTION_WHALE_ALERT in text
+        assert QUIT_MESSAGE in text
+
+    def test_dashboard_config_whale_min_levels_custom_and_default(self):
+        cfg_def = DashboardConfig()
+        assert cfg_def.whale_min_levels == WHALE_MIN_PRICE_LEVELS
+
+        cfg_custom = DashboardConfig(whale_min_levels=3)
+        assert cfg_custom.whale_min_levels == 3
+
+
+

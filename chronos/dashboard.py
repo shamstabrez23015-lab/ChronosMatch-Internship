@@ -1120,6 +1120,7 @@ def detect_whale_order(
     order_id: int,
     trades: Optional[List[Any]],
     side: Optional[int] = None,
+    min_levels: int = WHALE_MIN_PRICE_LEVELS,
 ) -> Optional[WhaleOrderEvent]:
     """Detect if an order executed across multiple price levels (whale sweep).
 
@@ -1132,6 +1133,8 @@ def detect_whale_order(
                 Each item must expose a ``price`` attribute (or index 2) and
                 an ``executed_quantity`` attribute (or index 3).
         side: Optional aggressor side (1=BUY, 2=SELL); stored for display only.
+        min_levels: Minimum distinct price levels to qualify as a whale sweep
+                    (default: WHALE_MIN_PRICE_LEVELS = 2).
 
     Returns:
         A :class:`WhaleOrderEvent` if 2+ distinct price levels were swept,
@@ -1144,9 +1147,19 @@ def detect_whale_order(
     total_volume: int = 0
     for t in trades:
         try:
-            p = float(t.price) if hasattr(t, "price") else float(t.execution_price) if hasattr(t, "execution_price") else float(t[2])
-            q = int(t.executed_quantity) if hasattr(t, "executed_quantity") else int(t[3])
-        except (AttributeError, IndexError, TypeError, ValueError):
+            if isinstance(t, dict):
+                p = float(t.get("price", t.get("execution_price", 0)))
+                q = int(t.get("executed_quantity", t.get("quantity", t.get("qty", 0))))
+            elif hasattr(t, "price"):
+                p = float(t.price)
+                q = int(t.executed_quantity if hasattr(t, "executed_quantity") else t.quantity)
+            elif hasattr(t, "execution_price"):
+                p = float(t.execution_price)
+                q = int(t.executed_quantity if hasattr(t, "executed_quantity") else t.quantity)
+            else:
+                p = float(t[2])
+                q = int(t[3])
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
             continue
         prices.append(p)
         total_volume += q
@@ -1157,7 +1170,7 @@ def detect_whale_order(
         seen[p] = None
     distinct_prices = list(seen.keys())
 
-    if len(distinct_prices) < WHALE_MIN_PRICE_LEVELS:
+    if len(distinct_prices) < min_levels:
         return None
 
     return WhaleOrderEvent(
@@ -1188,9 +1201,16 @@ def build_whale_alert_lines(
 
     divider = "-" * width
     col_w = max(width - 4, 10)
-    side_str = "BUY" if whale.side == 1 else "SELL" if whale.side == 2 else "?"
+    side_str = "BUY" if whale.side in (1, "1", "BUY", "buy") else "SELL" if whale.side in (2, "2", "SELL", "sell") else "?"
     levels_str = str(whale.price_levels_cleared)
-    prices_str = " -> ".join(f"{p:.2f}" for p in whale.prices[:5])
+
+    formatted_prices: List[str] = []
+    for p in whale.prices[:5]:
+        try:
+            formatted_prices.append(f"{float(p):.2f}")
+        except (ValueError, TypeError):
+            formatted_prices.append(str(p))
+    prices_str = " -> ".join(formatted_prices)
     if len(whale.prices) > 5:
         prices_str += " ..."
 
@@ -1453,6 +1473,7 @@ class DashboardConfig:
     min_rows: int = MIN_TERMINAL_ROWS
     min_cols: int = MIN_TERMINAL_COLS
     trade_latency_unit: str = DEFAULT_TRADE_LATENCY_UNIT
+    whale_min_levels: int = WHALE_MIN_PRICE_LEVELS
 
 
 # ---------------------------------------------------------------------------
@@ -1692,6 +1713,7 @@ class TerminalDashboard:
         trades_processed: Optional[int] = None,
         trade_latency_unit: Optional[str] = None,
         audit_status: Optional[Union[AuditStatusInfo, Dict[str, Any], Any]] = None,
+        whale: Optional[WhaleOrderEvent] = None,
     ) -> None:
         """Initialize the dashboard.
 
@@ -1811,6 +1833,8 @@ class TerminalDashboard:
         self._last_whale_event: Optional[WhaleOrderEvent] = None
         self._whale_history: List[WhaleOrderEvent] = []
         self._max_whale_history: int = 10
+        if whale is not None:
+            self.record_whale_order(whale)
 
         # Audit activity & persistence tracking state
         self._audit_status: Optional[AuditStatusInfo] = (
@@ -2136,6 +2160,16 @@ class TerminalDashboard:
     def get_last_whale_event(self) -> "Optional[WhaleOrderEvent]":
         """Return the most recently detected whale order event, or None."""
         return self._last_whale_event
+
+    @property
+    def last_whale_event(self) -> "Optional[WhaleOrderEvent]":
+        """Return the most recently detected whale order event, or None."""
+        return self._last_whale_event
+
+    @property
+    def whale_history(self) -> List["WhaleOrderEvent"]:
+        """Return a copy of recent whale order events."""
+        return list(self._whale_history)
 
     def clear_whale_history(self) -> None:
         """Clear the whale order tracking state (last event and full history)."""
@@ -2511,6 +2545,18 @@ class TerminalDashboard:
         """Alias for set_sell_orders, ready for live engine snapshot integration."""
         self.set_sell_orders(orders, is_sample=is_sample)
 
+    def update_orders(
+        self,
+        buy_orders: Optional[List[Any]] = None,
+        sell_orders: Optional[List[Any]] = None,
+        is_sample: bool = False,
+    ) -> None:
+        """Update buy and/or sell orders in a single call."""
+        if buy_orders is not None:
+            self.set_buy_orders(buy_orders, is_sample=is_sample)
+        if sell_orders is not None:
+            self.set_sell_orders(sell_orders, is_sample=is_sample)
+
     def get_buy_depth(self, max_levels: int = 5) -> List[PriceLevel]:
         """Return the current top BUY order-book depth up to max_levels levels (highest price first)."""
         return calculate_buy_depth(self.buy_orders, max_levels=max_levels)
@@ -2573,6 +2619,7 @@ class TerminalDashboard:
         trade_latency_max: Optional[Union[float, int, str]] = None,
         trade_latency_unit: Optional[str] = None,
         audit_status: Optional[Union[AuditStatusInfo, Dict[str, Any], Any]] = None,
+        whale: Optional[WhaleOrderEvent] = None,
     ) -> List[str]:
         """Generate all display lines for the current state.
 
@@ -2596,6 +2643,7 @@ class TerminalDashboard:
 
         b_orders = self.buy_orders if buy_orders is None else buy_orders
         s_orders = self.sell_orders if sell_orders is None else sell_orders
+        _whale = whale if whale is not None else self._last_whale_event
 
         best_bid_obj = calculate_best_bid(b_orders)
         best_bid_str = format_best_bid_price(best_bid_obj.price)
@@ -2712,7 +2760,8 @@ class TerminalDashboard:
         eff_audit = audit_status if audit_status is not None else self._audit_status
         lines += build_audit_status_lines(width, audit_status=eff_audit)
         lines.append("")
-        whale_lines = build_whale_alert_lines(width, whale=self._last_whale_event)
+        eff_whale = whale if whale is not None else self._last_whale_event
+        whale_lines = build_whale_alert_lines(width, whale=eff_whale)
         if whale_lines:
             lines += whale_lines
             lines.append("")
@@ -2797,16 +2846,23 @@ class TerminalDashboard:
             "title": 0, "subtitle": 0, "border": 0,
             "section": 0, "label": 0, "value": 0,
             "bid": 0, "ask": 0, "quit": 0,
+            "whale_buy": 0, "whale_sell": 0,
+            "whale_alert": 0, "whale_badge": 0,
         }
         if curses is None:
             return attrs
 
         bold = getattr(curses, "A_BOLD", 0)
         dim = getattr(curses, "A_DIM", 0)
+        standout = getattr(curses, "A_STANDOUT", bold)
         attrs["title"] = bold
         attrs["section"] = bold
         attrs["border"] = dim
         attrs["quit"] = dim
+        attrs["whale_buy"] = bold
+        attrs["whale_sell"] = bold
+        attrs["whale_alert"] = bold
+        attrs["whale_badge"] = standout
 
         if self._has_colors_safe():
             try:
@@ -2818,6 +2874,10 @@ class TerminalDashboard:
                 attrs["bid"] = curses.color_pair(6)
                 attrs["ask"] = curses.color_pair(7)
                 attrs["quit"] = dim | curses.color_pair(3)
+                attrs["whale_buy"] = bold | curses.color_pair(2)
+                attrs["whale_sell"] = bold | curses.color_pair(7)
+                attrs["whale_alert"] = bold | curses.color_pair(3)
+                attrs["whale_badge"] = bold | curses.color_pair(3)
             except Exception:
                 pass
         return attrs
@@ -2836,6 +2896,7 @@ class TerminalDashboard:
         trade_latency_max: Optional[Union[float, int, str]] = None,
         trade_latency_unit: Optional[str] = None,
         audit_status: Optional[Union[AuditStatusInfo, Dict[str, Any], Any]] = None,
+        whale: Optional[WhaleOrderEvent] = None,
     ) -> None:
         """Render a single frame of the dashboard onto the curses window."""
         try:
@@ -2864,6 +2925,7 @@ class TerminalDashboard:
                 trade_latency_max=trade_latency_max,
                 trade_latency_unit=trade_latency_unit,
                 audit_status=audit_status,
+                whale=whale,
             )
             for idx, line in enumerate(lines):
                 self._safe_addstr(stdscr, idx, 0, line)
@@ -2881,6 +2943,7 @@ class TerminalDashboard:
 
         b_orders = self.buy_orders if buy_orders is None else buy_orders
         s_orders = self.sell_orders if sell_orders is None else sell_orders
+        _whale = whale if whale is not None else self._last_whale_event
 
         best_bid_obj = calculate_best_bid(b_orders)
         best_bid_str = format_best_bid_price(best_bid_obj.price)
@@ -2952,13 +3015,41 @@ class TerminalDashboard:
         put(sub_hdr, attrs["label"])
 
         max_rows = max(len(bid_rows), len(ask_rows))
+        swept_prices: set = set()
+        if _whale is not None and getattr(_whale, "prices", None):
+            try:
+                swept_prices = {round(float(p), 6) for p in _whale.prices}
+            except Exception:
+                swept_prices = set()
+
         for i in range(max_rows):
             bp, bq = bid_rows[i] if i < len(bid_rows) else (PLACEHOLDER, PLACEHOLDER)
             ap, aq = ask_rows[i] if i < len(ask_rows) else (PLACEHOLDER, PLACEHOLDER)
             bid_cell = f"  {bp:>8}  {bq:>6}"
             ask_cell = f"  {ap:>8}  {aq:>6}"
-            self._safe_addstr(stdscr, y, start_x, f"{bid_cell:<{half + 2}}", attrs["bid"])
-            self._safe_addstr(stdscr, y, start_x + half + 2, ask_cell, attrs["ask"])
+
+            bid_attr = attrs["bid"]
+            if swept_prices and bp != PLACEHOLDER:
+                try:
+                    if round(float(bp), 6) in swept_prices:
+                        bid_attr = (
+                            attrs["whale_sell"] if _whale.side == 2 else attrs["whale_buy"]
+                        ) | (curses.A_BOLD if curses is not None else 0)
+                except (ValueError, TypeError):
+                    pass
+
+            ask_attr = attrs["ask"]
+            if swept_prices and ap != PLACEHOLDER:
+                try:
+                    if round(float(ap), 6) in swept_prices:
+                        ask_attr = (
+                            attrs["whale_buy"] if _whale.side == 1 else attrs["whale_sell"]
+                        ) | (curses.A_BOLD if curses is not None else 0)
+                except (ValueError, TypeError):
+                    pass
+
+            self._safe_addstr(stdscr, y, start_x, f"{bid_cell:<{half + 2}}", bid_attr)
+            self._safe_addstr(stdscr, y, start_x + half + 2, ask_cell, ask_attr)
             y += 1
 
         put(divider, attrs["border"])
@@ -3072,15 +3163,40 @@ class TerminalDashboard:
         blank()
 
         # ---- Whale Order Alert ----
-        _whale = self._last_whale_event
         if _whale is not None:
             _whale_lines = build_whale_alert_lines(width, whale=_whale)
+            is_buy = _whale.side in (1, "1", "BUY", "buy")
+            is_sell = _whale.side in (2, "2", "SELL", "sell")
+            side_attr = (
+                attrs["whale_buy"]
+                if is_buy
+                else attrs["whale_sell"]
+                if is_sell
+                else attrs["whale_alert"]
+            )
             for _wl in _whale_lines:
+                if y >= max_y - 2:
+                    break
                 _stripped = _wl.strip()
-                if _stripped.startswith("\u26a1"):
-                    put(_wl, attrs["quit"] | (curses.A_BOLD if curses is not None else 0))
+                if _stripped.startswith("\u26a1") or SECTION_WHALE_ALERT in _wl:
+                    header_attr = (
+                        attrs["whale_buy"]
+                        if is_buy
+                        else attrs["whale_sell"]
+                        if is_sell
+                        else attrs["whale_alert"]
+                    )
+                    put(_wl, header_attr | (curses.A_BOLD if curses is not None else 0))
                 elif _stripped.startswith("-") or _stripped.startswith("="):
                     put(_wl, attrs["border"])
+                elif LABEL_WHALE_SIDE in _wl:
+                    put(_wl, side_attr | (curses.A_BOLD if curses is not None else 0))
+                elif (
+                    LABEL_WHALE_LEVELS in _wl
+                    or LABEL_WHALE_VOLUME in _wl
+                    or "Swept:" in _wl
+                ):
+                    put(_wl, side_attr)
                 else:
                     put(_wl, attrs["value"])
             blank()
