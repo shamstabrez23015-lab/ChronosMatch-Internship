@@ -563,6 +563,8 @@ cdef inline int _compare_buy_orders(COrder a, COrder b):
       -1 if `b` has higher priority than `a`
        0 if identical priority
     """
+    if a is b:
+        return 0
     if a.price_cents > b.price_cents:
         return 1
     elif a.price_cents < b.price_cents:
@@ -585,6 +587,8 @@ cdef inline int _compare_sell_orders(COrder a, COrder b):
       -1 if `b` has higher priority than `a`
        0 if identical priority
     """
+    if a is b:
+        return 0
     if a.price_cents < b.price_cents:
         return 1
     elif a.price_cents > b.price_cents:
@@ -739,6 +743,9 @@ cdef class MatchingEngine:
     * **Day 6**: Multi-order matching via ``match_order()``.  A single incoming
       order sweeps across multiple compatible resting orders using strict
       price-time priority, producing one ``TradeResult`` per fill.
+    * **Day 7**: Best bid/ask inspection and order-book snapshots.
+    * **Day 8**: Matched-trade execution record generation and validation.
+    * **Day 9**: High-resolution performance benchmarking and non-crossing bypass.
 
     Not yet implemented (scheduled for later working days)
     ------------------------------------------------------
@@ -1797,8 +1804,15 @@ cdef class MatchingEngine:
         if side == _SIDE_BUY:
             # ---- Incoming BUY sweeps resting SELLs (ascending price) ----
             if self._asks:
-                opposite_sorted = self.get_prioritized_asks()
+                opposite_sorted = []
+                total_orders = len(self._asks)
+                for i in range(total_orders):
+                    resting = <COrder>self._asks[i]
+                    if resting.remaining_quantity > 0 and incoming_price_cents >= resting.price_cents:
+                        opposite_sorted.append(resting)
                 n = len(opposite_sorted)
+                if n > 1:
+                    _c_sort_sell_orders(opposite_sorted)
                 num_filled = 0
                 for i in range(n):
                     if incoming_remaining == 0:
@@ -1806,9 +1820,6 @@ cdef class MatchingEngine:
                     if fill_count >= buf_capacity:
                         break
                     resting = <COrder>opposite_sorted[i]
-                    # Price crossing: BUY price >= SELL price
-                    if incoming_price_cents < resting.price_cents:
-                        break  # sorted asc; no more matches
                     # Fill quantity: min of remaining quantities
                     if incoming_remaining <= resting.remaining_quantity:
                         exec_qty = incoming_remaining
@@ -1853,8 +1864,15 @@ cdef class MatchingEngine:
         else:
             # ---- Incoming SELL sweeps resting BUYs (descending price) ---
             if self._bids:
-                opposite_sorted = self.get_prioritized_bids()
+                opposite_sorted = []
+                total_orders = len(self._bids)
+                for i in range(total_orders):
+                    resting = <COrder>self._bids[i]
+                    if resting.remaining_quantity > 0 and incoming_price_cents <= resting.price_cents:
+                        opposite_sorted.append(resting)
                 n = len(opposite_sorted)
+                if n > 1:
+                    _c_sort_buy_orders(opposite_sorted)
                 num_filled = 0
                 for i in range(n):
                     if incoming_remaining == 0:
@@ -1862,9 +1880,6 @@ cdef class MatchingEngine:
                     if fill_count >= buf_capacity:
                         break
                     resting = <COrder>opposite_sorted[i]
-                    # Price crossing: SELL price <= BUY price
-                    if incoming_price_cents > resting.price_cents:
-                        break  # sorted desc; no more matches
                     # Fill quantity
                     if incoming_remaining <= resting.remaining_quantity:
                         exec_qty = incoming_remaining
@@ -1971,17 +1986,61 @@ cdef class MatchingEngine:
         self._sequence_counter += 1
         cdef unsigned long long incoming_seq = self._sequence_counter
 
+        # Fast non-crossing bypass (Week 4, Day 9 optimisation):
+        # If the opposite book is empty, or the best opposite price does not cross
+        # the incoming limit price, no match is possible. Insert the order directly
+        # without sorting or buffer allocation.
+        cdef COrder best_opp
+        cdef COrder new_order
+        if side == _SIDE_BUY:
+            if not self._asks:
+                new_order = _create_corder(
+                    order_id, _SIDE_BUY, incoming_price_cents,
+                    quantity, quantity, timestamp_ns, incoming_seq,
+                )
+                self._bids.append(new_order)
+                self._order_count += 1
+                return []
+            best_opp = self.get_best_sell_order()
+            if best_opp is None or incoming_price_cents < best_opp.price_cents:
+                new_order = _create_corder(
+                    order_id, _SIDE_BUY, incoming_price_cents,
+                    quantity, quantity, timestamp_ns, incoming_seq,
+                )
+                self._bids.append(new_order)
+                self._order_count += 1
+                return []
+        else:
+            if not self._bids:
+                new_order = _create_corder(
+                    order_id, _SIDE_SELL, incoming_price_cents,
+                    quantity, quantity, timestamp_ns, incoming_seq,
+                )
+                self._asks.append(new_order)
+                self._order_count += 1
+                return []
+            best_opp = self.get_best_buy_order()
+            if best_opp is None or incoming_price_cents > best_opp.price_cents:
+                new_order = _create_corder(
+                    order_id, _SIDE_SELL, incoming_price_cents,
+                    quantity, quantity, timestamp_ns, incoming_seq,
+                )
+                self._asks.append(new_order)
+                self._order_count += 1
+                return []
+
         # ---- delegate to C-level matching loop -------------------------
-        # Allocate a fixed-size fill buffer on the C heap.
-        # MAX_FILLS_PER_ORDER caps the buffer: an order cannot fill more
-        # opposite-side orders than the book holds, and realistic books
-        # rarely exceed a few thousand levels.
+        # Hybrid stack / heap allocation: use a fast stack buffer for up to 64
+        # fills to avoid malloc overhead on typical crossing orders.
+        cdef CTradeRecord stack_buf[64]
+        cdef CTradeRecord *fill_buf = stack_buf
+        cdef bint heap_allocated = False
         cdef Py_ssize_t MAX_FILLS = max(len(self._bids), len(self._asks), 1) + 1
-        cdef CTradeRecord *fill_buf = <CTradeRecord *>malloc(
-            MAX_FILLS * sizeof(CTradeRecord)
-        )
-        if fill_buf == NULL:
-            raise MemoryError("Failed to allocate fill buffer")
+        if MAX_FILLS > 64:
+            fill_buf = <CTradeRecord *>malloc(MAX_FILLS * sizeof(CTradeRecord))
+            if fill_buf == NULL:
+                raise MemoryError("Failed to allocate fill buffer")
+            heap_allocated = True
 
         cdef unsigned int remaining_after = 0
         cdef int fill_count = 0
@@ -2011,7 +2070,8 @@ cdef class MatchingEngine:
                     fill_buf[k].sell_remaining_quantity,
                 ))
         finally:
-            free(fill_buf)
+            if heap_allocated and fill_buf != NULL:
+                free(fill_buf)
 
         return trades
 
