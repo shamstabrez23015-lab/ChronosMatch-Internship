@@ -38,6 +38,8 @@ Week 2, Day 6:
   compatible resting orders using strict price-time priority.
 
 Week 2, Day 7:
+- Best Bid/Ask and Spread: Foundational API for top-of-book price inspection
+  (covered fully in Week 3, Day 3 and Day 7 revisions).
 
 Week 3, Day 3:
 - Best Bid / Best Ask Access and Order-Book State Management:
@@ -89,6 +91,21 @@ Week 3, Day 8:
   * Strict quantity conservation (no lost or duplicated execution volume).
   * Price-time priority verification in generated trade sequence.
   * Order book state, depth, and best bid/ask consistency post-execution.
+
+Week 4, Day 9:
+- Benchmarking & Safe Performance Optimisations:
+  * High-resolution monotonic benchmark harness (time.perf_counter_ns).
+  * Fast non-crossing bypass in match_order: if the opposite book is empty or
+    best opposite price does not cross the incoming limit, the order is inserted
+    passively without sorting or buffer allocation.
+  * Hybrid stack/heap fill buffer: uses a 64-slot C stack buffer for typical
+    fills to avoid per-call malloc overhead; falls back to heap only when
+    more than 64 resting orders can be filled in one sweep.
+  * Eligible-candidate filtering in _c_match_loop: only resting orders whose
+    price crosses the incoming limit are gathered and sorted, eliminating
+    unnecessary work on deep one-sided books.
+  * Self-identity bypass in comparison helpers (_compare_buy_orders,
+    _compare_sell_orders): instant return when comparing an order to itself.
 
 
 Price Representation
@@ -748,8 +765,6 @@ cdef class MatchingEngine:
     * **Day 9**: High-resolution performance benchmarking and non-crossing bypass.
 
     Not yet implemented (scheduled for later working days)
-    ------------------------------------------------------
-    * Ring-buffer zero-copy IPC integration.
     """
 
     cdef public unsigned long long _order_count
@@ -1934,17 +1949,21 @@ cdef class MatchingEngine:
     ):
         """Match a single incoming order against multiple compatible resting orders.
 
-        Multi-order matching algorithm (Day 6 / Week 3 Day 3 optimised)
-        -----------------------------------------------------------------
+        Multi-order matching algorithm (Day 6 / Week 3 Day 3 / Day 9 optimised)
+        -------------------------------------------------------------------------
         1. Validate the incoming order (side, price, quantity).
         2. Convert the incoming float price to integer cents via C-level helper.
-        3. Sort the opposite-side book by price-time priority (one sort per call).
-        4. Delegate the hot matching loop to ``_c_match_loop``, which writes
-           fill records directly into a malloc'd C buffer with no Python
+        3. Fast non-crossing bypass: if the opposite book is empty or the best
+           opposite price does not cross the incoming limit, insert the order
+           passively with zero allocation and return an empty list.
+        4. Filter and sort eligible resting orders by price-time priority (only
+           orders whose price crosses the incoming limit are considered).
+        5. Delegate the hot matching loop to ``_c_match_loop``, which writes
+           fill records directly into a stack or heap C buffer with no Python
            object allocation inside the loop.
-        5. Convert C fill records to TradeResult PyObjects in a single pass
+        6. Convert C fill records to TradeResult PyObjects in a single pass
            after the loop (boundary conversion).
-        6. Return the list of ``TradeResult`` records in execution order.
+        7. Return the list of ``TradeResult`` records in execution order.
 
         Execution price policy
         ----------------------
