@@ -217,10 +217,10 @@ python -m pytest tests/test_smoke.py -v
 The latest recorded run in the development environment reported:
 
 ```text
-723 passed in 1.66s
+1009 passed in 2.59s
 ```
 
-This is a snapshot of that test run, not a guarantee that every future environment or code revision will produce the same result.
+This is a snapshot of that test run as of Week 4 Day 10. The test suite has grown over the internship period (Weeks 1-4) to cover the binary protocol, ring buffer, matching engine, adapter, latency tracking, trading scenarios, pipeline integration, end-to-end order flow, and SQLite audit persistence. This number is not a guarantee that every future environment or code revision will produce the same result.
 
 ## Repository Structure
 

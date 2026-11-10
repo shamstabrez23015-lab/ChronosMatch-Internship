@@ -800,7 +800,7 @@ def format_benchmark_report(summary: BenchmarkSummary, use_color: bool = True) -
 
     lines = []
     lines.append(f"{c_cyan}{'=' * 80}{c_reset}")
-    lines.append(f"{c_white}        CHRONOSMATCH :: ORDER PROCESSING PIPELINE BENCHMARK (DAY 8){c_reset}")
+    lines.append(f"{c_white}        CHRONOSMATCH :: ORDER PROCESSING PIPELINE BENCHMARK (DAY 10){c_reset}")
     lines.append(f"{c_cyan}{'=' * 80}{c_reset}")
     lines.append(f"  Tested Scope      : {c_white}{summary.scope_description}{c_reset}")
     lines.append(f"  Target Orders     : {c_white}{summary.target_orders:,} orders/run{c_reset}")
