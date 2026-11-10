@@ -547,4 +547,3 @@ class TestPublicAPICompat:
         engine.submit_order(3, SIDE_SELL, 100.0, 5, 3000)
         engine.match_order(4, SIDE_BUY, 100.0, 20, 4000)
         assert engine.order_count() == 3  # SELL 3 rested, BUY 4 residual rested
-

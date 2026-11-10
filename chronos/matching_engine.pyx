@@ -352,13 +352,13 @@ cdef inline COrder _create_corder(
 cdef class TradeResult:
     """Immutable record of a single partial or full fill execution.
 
-    Created by ``MatchingEngine.execute_partial_match()`` on every successful
-    trade.  All fields are C-level typed for cache-friendliness.
+    Created by ``MatchingEngine.execute_partial_match()`` or ``MatchingEngine.match_order()``
+    on every successful trade fill. All fields are C-level typed for cache-friendliness.
 
     Execution-price policy
     ----------------------
     The execution price is always the **resting SELL order's price** (lowest
-    ask / maker price).  This is the standard exchange convention: the passive
+    ask / maker price). This is the standard exchange convention: the passive
     (resting) side sets the price; the aggressive (incoming) side accepts it.
     For the single-shot ``execute_partial_match()`` call both orders are in
     the book, so the best SELL price is used as the canonical execution price.
@@ -375,6 +375,12 @@ cdef class TradeResult:
         Shares remaining in the BUY order after this fill.
     sell_remaining_quantity : unsigned int
         Shares remaining in the SELL order after this fill.
+    entry_timestamp_ns : unsigned long long
+        Nanosecond timestamp when trade execution began (via time.perf_counter_ns()).
+    exit_timestamp_ns : unsigned long long
+        Nanosecond timestamp when trade execution completed (via time.perf_counter_ns()).
+    latency_ns : unsigned long long
+        Execution latency in nanoseconds (exit_timestamp_ns - entry_timestamp_ns).
     """
 
     cdef public unsigned long long buy_order_id
@@ -383,6 +389,9 @@ cdef class TradeResult:
     cdef public long long execution_price_cents
     cdef public unsigned int buy_remaining_quantity
     cdef public unsigned int sell_remaining_quantity
+    cdef public unsigned long long entry_timestamp_ns
+    cdef public unsigned long long exit_timestamp_ns
+    cdef public unsigned long long latency_ns
 
     def __init__(
         self,
@@ -392,6 +401,9 @@ cdef class TradeResult:
         long long execution_price_cents,
         unsigned int buy_remaining_quantity,
         unsigned int sell_remaining_quantity,
+        unsigned long long entry_timestamp_ns=0,
+        unsigned long long exit_timestamp_ns=0,
+        unsigned long long latency_ns=0,
     ):
         self.buy_order_id = buy_order_id
         self.sell_order_id = sell_order_id
@@ -399,6 +411,26 @@ cdef class TradeResult:
         self.execution_price_cents = execution_price_cents
         self.buy_remaining_quantity = buy_remaining_quantity
         self.sell_remaining_quantity = sell_remaining_quantity
+        self.entry_timestamp_ns = entry_timestamp_ns
+        self.exit_timestamp_ns = exit_timestamp_ns
+        if latency_ns == 0 and exit_timestamp_ns >= entry_timestamp_ns and entry_timestamp_ns > 0:
+            self.latency_ns = exit_timestamp_ns - entry_timestamp_ns
+        else:
+            self.latency_ns = latency_ns
+
+    cpdef void set_timestamps(self, unsigned long long entry_ns, unsigned long long exit_ns):
+        """Set nanosecond entry and exit timestamps and calculate execution latency."""
+        self.entry_timestamp_ns = entry_ns
+        self.exit_timestamp_ns = exit_ns
+        if exit_ns >= entry_ns:
+            self.latency_ns = exit_ns - entry_ns
+        else:
+            self.latency_ns = 0
+
+    @property
+    def latency_us(self):
+        """Return execution latency in microseconds as a float."""
+        return self.latency_ns / 1000.0
 
     @property
     def execution_price(self):
@@ -426,6 +458,16 @@ cdef class TradeResult:
         return self.buy_remaining_quantity > 0 or self.sell_remaining_quantity > 0
 
     def __repr__(self):
+        if self.latency_ns > 0:
+            return (
+                f"TradeResult("
+                f"buy={self.buy_order_id}, sell={self.sell_order_id}, "
+                f"exec_qty={self.executed_quantity}, "
+                f"price_cents={self.execution_price_cents}, "
+                f"buy_rem={self.buy_remaining_quantity}, "
+                f"sell_rem={self.sell_remaining_quantity}, "
+                f"lat_ns={self.latency_ns})"
+            )
         return (
             f"TradeResult("
             f"buy={self.buy_order_id}, sell={self.sell_order_id}, "
@@ -435,9 +477,9 @@ cdef class TradeResult:
             f"sell_rem={self.sell_remaining_quantity})"
         )
 
-    def as_dict(self):
+    def as_dict(self, bint include_timing=False):
         """Return a plain-Python dictionary snapshot of the trade result."""
-        return {
+        res = {
             "buy_order_id": self.buy_order_id,
             "sell_order_id": self.sell_order_id,
             "executed_quantity": self.executed_quantity,
@@ -446,6 +488,11 @@ cdef class TradeResult:
             "buy_remaining_quantity": self.buy_remaining_quantity,
             "sell_remaining_quantity": self.sell_remaining_quantity,
         }
+        if include_timing:
+            res["entry_timestamp_ns"] = self.entry_timestamp_ns
+            res["exit_timestamp_ns"] = self.exit_timestamp_ns
+            res["latency_ns"] = self.latency_ns
+        return res
 
     def __getitem__(self, str key):
         if key == "buy_order_id":
@@ -550,6 +597,7 @@ cpdef long long price_to_cents(double price):
 # ---------------------------------------------------------------------------
 # C-level comparison helpers for Price-Time Priority (FIFO)
 # ---------------------------------------------------------------------------
+import time
 from functools import cmp_to_key
 
 cdef inline bint _is_earlier_order(COrder a, COrder b):
@@ -772,14 +820,22 @@ cdef class MatchingEngine:
     cdef list _bids
     cdef list _asks
     cdef public unsigned long long _sequence_counter
+    cdef public bint track_timestamps
+    cdef public unsigned long long last_latency_ns
+    cdef public unsigned long long total_matching_latency_ns
+    cdef public unsigned long long matching_events_count
 
-    def __init__(self):
+    def __init__(self, bint track_timestamps=True):
         """Initialise an empty matching engine with an empty order book."""
         self._order_count = 0
         self._ready = True
         self._bids = []
         self._asks = []
         self._sequence_counter = 0
+        self.track_timestamps = track_timestamps
+        self.last_latency_ns = 0
+        self.total_matching_latency_ns = 0
+        self.matching_events_count = 0
 
     # ---- status & readiness -----------------------------------------------
 
@@ -798,6 +854,12 @@ cdef class MatchingEngine:
             "order_count": self._order_count,
         }
 
+    cpdef double get_avg_matching_latency_ns(self):
+        """Return average matching latency in nanoseconds across match events."""
+        if self.matching_events_count == 0:
+            return 0.0
+        return <double>self.total_matching_latency_ns / self.matching_events_count
+
     # ---- order book initialization / reset --------------------------------
 
     cpdef void clear(self):
@@ -807,6 +869,9 @@ cdef class MatchingEngine:
         self._order_count = 0
         self._sequence_counter = 0
         self._ready = True
+        self.last_latency_ns = 0
+        self.total_matching_latency_ns = 0
+        self.matching_events_count = 0
 
     cpdef void reset(self):
         """Alias for ``clear()``."""
@@ -1693,6 +1758,11 @@ cdef class MatchingEngine:
         if n_bids == 0 or n_asks == 0:
             return None
 
+        cdef unsigned long long t_entry = 0
+        cdef unsigned long long t_exit = 0
+        if self.track_timestamps:
+            t_entry = time.perf_counter_ns()
+
         # Select the single highest-priority orders on each side
         cdef COrder best_buy = self.get_best_buy_order()
         cdef COrder best_sell = self.get_best_sell_order()
@@ -1750,7 +1820,7 @@ cdef class MatchingEngine:
                     _pm_remaining.append(_pm_scan)
             self._asks[:] = _pm_remaining
 
-        return _create_trade_result(
+        cdef TradeResult res_trade = _create_trade_result(
             buy_id,
             sell_id,
             exec_qty,
@@ -1758,6 +1828,15 @@ cdef class MatchingEngine:
             buy_rem,
             sell_rem,
         )
+
+        if self.track_timestamps:
+            t_exit = time.perf_counter_ns()
+            res_trade.set_timestamps(t_entry, t_exit)
+            self.last_latency_ns = res_trade.latency_ns
+            self.total_matching_latency_ns += res_trade.latency_ns
+            self.matching_events_count += 1
+
+        return res_trade
 
     # ---- multi-order matching (Week 2 Day 6 / Week 3 Day 3 refactor) ------
 
@@ -1999,6 +2078,13 @@ cdef class MatchingEngine:
 
         # C-level price conversion (no Python round() call)
         cdef long long incoming_price_cents = _price_to_cents_c(price)
+        cdef unsigned int incoming_remaining = quantity
+        cdef unsigned long long t_entry = 0
+        cdef unsigned long long t_exit = 0
+        cdef unsigned long long t_lat = 0
+
+        if self.track_timestamps:
+            t_entry = time.perf_counter_ns()
 
         # Sequence number assigned before the loop so residual orders
         # preserve their original arrival priority (no re-queue).
@@ -2091,6 +2177,18 @@ cdef class MatchingEngine:
         finally:
             if heap_allocated and fill_buf != NULL:
                 free(fill_buf)
+
+        if self.track_timestamps:
+            t_exit = time.perf_counter_ns()
+            if t_exit >= t_entry:
+                t_lat = t_exit - t_entry
+            else:
+                t_lat = 0
+            self.last_latency_ns = t_lat
+            self.total_matching_latency_ns += t_lat
+            self.matching_events_count += 1
+            for i in range(len(trades)):
+                (<TradeResult>trades[i]).set_timestamps(t_entry, t_exit)
 
         return trades
 

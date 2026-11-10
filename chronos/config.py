@@ -45,6 +45,12 @@ DEFAULT_REFRESH_INTERVAL_MS: int = 100  # 100 ms (10 frames/sec)
 MIN_TERMINAL_ROWS: int = 30  # Minimum terminal height
 MIN_TERMINAL_COLS: int = 72  # Minimum terminal width
 
+# SQLite Audit Worker Defaults (chronos/audit.py)
+DEFAULT_AUDIT_DB_PATH: str = os.path.join("data", "chronos_audit.db")
+DEFAULT_AUDIT_BATCH_SIZE: int = 100
+DEFAULT_AUDIT_FLUSH_INTERVAL_S: float = 0.1
+DEFAULT_AUDIT_QUEUE_SIZE: int = 10_000
+
 
 # ==============================================================================
 # Validation Helpers

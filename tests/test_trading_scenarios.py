@@ -12,16 +12,26 @@ Verifies:
 9. FIFO time priority and price priority match engine inspection.
 10. Binary protocol compatibility (32-byte struct pack/unpack roundtrip).
 11. Scenario immutability and resistance to shared-state mutation.
+12. Scenario categorization (successful matching, partial fills, multiple price levels, non-crossing, unmatched).
+13. Scenario execution helper methods (execute_in_engine, execute_in_adapter, verify_execution).
+14. Week 3 nanosecond trade timestamps and latency tracking integration.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from chronos.matching_engine import MatchingEngine, price_to_cents
+from chronos.adapter import OrderAdapter
+from chronos.matching_engine import MatchingEngine, TradeResult, price_to_cents
 from chronos.protocol import ORDER_SIZE, Order, Side, unpack_order_raw
 from tests.trading_scenarios import (
+    ALL_CATEGORIES,
     ALL_SCENARIOS,
+    CATEGORY_MULTIPLE_PRICE_LEVELS,
+    CATEGORY_NON_CROSSING,
+    CATEGORY_PARTIAL_FILLS,
+    CATEGORY_SUCCESSFUL_MATCHING,
+    CATEGORY_UNMATCHED_ORDERS,
     SCENARIO_1_EXACT_MATCH,
     SCENARIO_2_CROSSED_MARKET,
     SCENARIO_3_NO_TRADE,
@@ -38,7 +48,13 @@ from tests.trading_scenarios import (
     ScenarioOrder,
     TradingScenario,
     get_all_scenarios,
+    get_multiple_price_levels_scenarios,
+    get_non_crossing_scenarios,
+    get_partial_fill_scenarios,
     get_scenario,
+    get_scenarios_by_category,
+    get_successful_matching_scenarios,
+    get_unmatched_scenarios,
 )
 
 
@@ -139,7 +155,6 @@ class TestOrderFieldsValidation:
         """Verify timestamps are strictly monotonic or deterministic in arrival sequence."""
         if len(scenario.orders) > 1:
             timestamps = [o.timestamp_ns for o in scenario.orders]
-            # Timestamps in arrival sequence must be non-decreasing
             for i in range(len(timestamps) - 1):
                 assert timestamps[i] <= timestamps[i + 1]
 
@@ -263,7 +278,6 @@ class TestQuantityConservationAndArithmetic:
         """Verify initial quantity equals executed quantity plus remaining quantity for all orders."""
         order_map = {o.order_id: o.quantity for o in scenario.orders}
 
-        # Calculate total executed quantity per order from expected trades
         executed_per_order = {o.order_id: 0 for o in scenario.orders}
         for trade in scenario.expected.trades:
             executed_per_order[trade.buy_order_id] += trade.trade_quantity
@@ -292,7 +306,6 @@ class TestSpecificScenarios:
     """In-depth verification for each individual scenario requirement."""
 
     def test_scenario_1_exact_match(self):
-        """Scenario 1: Exact price match with equal quantities (50 each)."""
         s = SCENARIO_1_EXACT_MATCH
         assert s.expected.has_crossing is True
         assert s.expected.total_matched_quantity == 50
@@ -303,14 +316,12 @@ class TestSpecificScenarios:
         assert t.execution_price == 100.00 and t.trade_quantity == 50
 
     def test_scenario_2_crossed_market(self):
-        """Scenario 2: BUY (105.00) higher than SELL (100.00) crosses."""
         s = SCENARIO_2_CROSSED_MARKET
         assert s.expected.has_crossing is True
         assert s.expected.total_matched_quantity == 100
         assert s.expected.remaining_quantities == {201: 0, 202: 0}
 
     def test_scenario_3_no_trade_wide_spread(self):
-        """Scenario 3: BUY (95.00) below SELL (105.00) results in zero trades."""
         s = SCENARIO_3_NO_TRADE
         assert s.expected.has_crossing is False
         assert s.expected.total_matched_quantity == 0
@@ -318,7 +329,6 @@ class TestSpecificScenarios:
         assert s.expected.remaining_quantities == {301: 100, 302: 100}
 
     def test_scenario_4_partial_fill_buy_larger(self):
-        """Scenario 4: BUY (qty 100) partially fills against SELL (qty 40); 60 remains."""
         s = SCENARIO_4_PARTIAL_FILL_BUY_LARGER
         assert s.expected.has_crossing is True
         assert s.expected.total_matched_quantity == 40
@@ -328,7 +338,6 @@ class TestSpecificScenarios:
         assert s.expected.trades[0].trade_quantity == 40
 
     def test_scenario_5_partial_fill_sell_larger(self):
-        """Scenario 5: SELL (qty 80) partially fills against BUY (qty 30); 50 remains."""
         s = SCENARIO_5_PARTIAL_FILL_SELL_LARGER
         assert s.expected.has_crossing is True
         assert s.expected.total_matched_quantity == 30
@@ -338,19 +347,16 @@ class TestSpecificScenarios:
         assert s.expected.trades[0].trade_quantity == 30
 
     def test_scenario_6_exact_full_fill(self):
-        """Scenario 6: Exact full fill with identical quantity 75 on both sides."""
         s = SCENARIO_6_EXACT_FULL_FILL
         assert s.expected.has_crossing is True
         assert s.expected.total_matched_quantity == 75
         assert s.expected.remaining_quantities == {601: 0, 602: 0}
 
     def test_scenario_7_fifo_same_price(self):
-        """Scenario 7: Equal price BUYs: earlier 701 is filled before later 702."""
         s = SCENARIO_7_FIFO_SAME_PRICE
         assert s.expected.has_crossing is True
         assert s.expected.prioritized_buy_ids == (701, 702)
         assert s.expected.best_buy_id == 701
-        # Order 701 (qty 40) filled fully; Order 702 (qty 60) filled 10, remaining 50
         assert s.expected.remaining_quantities[701] == 0
         assert s.expected.remaining_quantities[702] == 50
         assert s.expected.remaining_quantities[703] == 0
@@ -361,12 +367,10 @@ class TestSpecificScenarios:
         assert s.expected.trades[1].trade_quantity == 10
 
     def test_scenario_8_price_priority_buy(self):
-        """Scenario 8: Higher BUY price (802 @ 102.00) takes priority over earlier 801 @ 100.00."""
         s = SCENARIO_8_PRICE_PRIORITY_BUY
         assert s.expected.has_crossing is True
         assert s.expected.prioritized_buy_ids == (802, 801)
         assert s.expected.best_buy_id == 802
-        # Order 802 matches first: fills 30. SELL 803 has 10 left, matched with 801.
         assert s.expected.remaining_quantities[802] == 0
         assert s.expected.remaining_quantities[801] == 40
         assert s.expected.remaining_quantities[803] == 0
@@ -377,12 +381,10 @@ class TestSpecificScenarios:
         assert s.expected.trades[1].trade_quantity == 10
 
     def test_scenario_9_price_priority_sell(self):
-        """Scenario 9: Lower SELL price (902 @ 200.00) takes priority over earlier 901 @ 205.00."""
         s = SCENARIO_9_PRICE_PRIORITY_SELL
         assert s.expected.has_crossing is True
         assert s.expected.prioritized_sell_ids == (902, 901)
         assert s.expected.best_sell_id == 902
-        # Order 902 matches first: fills 25. BUY 903 has 25 left, matched with 901.
         assert s.expected.remaining_quantities[902] == 0
         assert s.expected.remaining_quantities[901] == 15
         assert s.expected.remaining_quantities[903] == 0
@@ -393,7 +395,6 @@ class TestSpecificScenarios:
         assert s.expected.trades[1].trade_quantity == 25
 
     def test_scenario_10_empty_order_book(self):
-        """Scenario 10: Empty order book has no crossing, no best orders, no matches."""
         s = SCENARIO_10_EMPTY_ORDER_BOOK
         assert s.expected.has_crossing is False
         assert s.expected.best_buy_id is None
@@ -413,20 +414,17 @@ class TestScenarioImmutability:
     """Verify scenarios cannot be accidentally mutated across test runs."""
 
     def test_scenario_order_is_frozen(self):
-        """Verify ScenarioOrder fields cannot be modified."""
         order = SCENARIO_1_EXACT_MATCH.orders[0]
         with pytest.raises(Exception):
-            order.price = 999.0  # Frozen dataclass raises FrozenInstanceError
+            order.price = 999.0
 
     def test_scenario_orders_list_copy(self):
-        """Verify get_orders returns a list copy that does not alter scenario."""
         s = get_scenario("scenario_1_exact_match")
         orders_list = s.get_orders()
         orders_list.clear()
         assert len(s.orders) == 2
 
     def test_scenario_copy_is_isolated(self):
-        """Verify deep copy isolates remaining_quantities dictionary."""
         s = get_scenario("scenario_4_partial_fill_buy_larger")
         copy_s = s.copy()
         copy_s.expected.remaining_quantities[401] = 999
@@ -434,7 +432,6 @@ class TestScenarioImmutability:
         assert SCENARIO_4_PARTIAL_FILL_BUY_LARGER.expected.remaining_quantities[401] == 60
 
     def test_repeated_engine_load_is_idempotent(self):
-        """Verify loading into different engine instances yields identical state."""
         s = get_scenario("scenario_7_fifo_same_price")
         engine1 = MatchingEngine()
         engine2 = MatchingEngine()
@@ -449,7 +446,7 @@ class TestScenarioImmutability:
 
 
 # ==============================================================================
-# 8. Day 10 Dynamic Scenario Execution and Adapter Matching Tests
+# 8. Dynamic Scenario Execution & MatchingEngine Integration Tests
 # ==============================================================================
 
 class TestTradingScenariosDynamicExecution:
@@ -471,11 +468,9 @@ class TestTradingScenariosDynamicExecution:
             )
             all_trades.extend(trades)
 
-        # 1. Total matched volume
         total_matched = sum(t.executed_quantity for t in all_trades)
         assert total_matched == scenario.expected.total_matched_quantity
 
-        # 2. Trade count and trade fields
         assert len(all_trades) == len(scenario.expected.trades)
         for actual, expected in zip(all_trades, scenario.expected.trades):
             assert actual.buy_order_id == expected.buy_order_id
@@ -483,7 +478,6 @@ class TestTradingScenariosDynamicExecution:
             assert actual.executed_quantity == expected.trade_quantity
             assert actual.execution_price == expected.execution_price
 
-        # 3. Post-execution order book remaining quantities
         bids = {o.order_id: o.remaining_quantity for o in engine.get_prioritized_bids()}
         asks = {o.order_id: o.remaining_quantity for o in engine.get_prioritized_asks()}
         book = {**bids, **asks}
@@ -493,8 +487,6 @@ class TestTradingScenariosDynamicExecution:
     @pytest.mark.parametrize("scenario", ALL_SCENARIOS, ids=lambda s: s.name)
     def test_all_scenarios_adapter_pipeline_match_dispatch(self, scenario: TradingScenario):
         """Verify each scenario executes accurately when dispatched through OrderAdapter in match mode."""
-        from chronos.adapter import OrderAdapter
-
         engine = MatchingEngine()
         adapter = OrderAdapter(engine=engine, dispatch_mode="match")
         for o in scenario.orders:
@@ -503,3 +495,266 @@ class TestTradingScenariosDynamicExecution:
         assert adapter.stats.total_volume_matched == scenario.expected.total_matched_quantity
         assert len(adapter.trades) == len(scenario.expected.trades)
 
+
+# ==============================================================================
+# 9. Scenario Categorization & Filtering Tests (Week 3 Day 5)
+# ==============================================================================
+
+class TestScenarioCategorization:
+    """Verifies that all required categories exist and scenarios are properly indexed."""
+
+    def test_all_five_required_categories_defined(self):
+        """Verify the 5 required scenario categories are defined."""
+        assert CATEGORY_SUCCESSFUL_MATCHING == "successful_matching"
+        assert CATEGORY_PARTIAL_FILLS == "partial_fills"
+        assert CATEGORY_MULTIPLE_PRICE_LEVELS == "multiple_price_levels"
+        assert CATEGORY_NON_CROSSING == "non_crossing"
+        assert CATEGORY_UNMATCHED_ORDERS == "unmatched_orders"
+        assert len(ALL_CATEGORIES) == 5
+
+    def test_every_scenario_has_at_least_one_category(self):
+        """Verify every registered scenario specifies at least one category tag."""
+        for s in ALL_SCENARIOS:
+            assert len(s.categories) > 0, f"Scenario {s.name} missing categories"
+            for cat in s.categories:
+                assert cat in ALL_CATEGORIES, f"Scenario {s.name} has invalid category {cat}"
+
+    def test_successful_matching_scenarios_filter(self):
+        """Verify successful matching scenarios filter returns expected set."""
+        matches = get_successful_matching_scenarios()
+        names = {s.name for s in matches}
+        assert "scenario_1_exact_match" in names
+        assert "scenario_2_crossed_market" in names
+        assert "scenario_6_exact_full_fill" in names
+        assert len(matches) >= 3
+
+    def test_partial_fill_scenarios_filter(self):
+        """Verify partial fill scenarios filter returns expected set."""
+        partials = get_partial_fill_scenarios()
+        names = {s.name for s in partials}
+        assert "scenario_4_partial_fill_buy_larger" in names
+        assert "scenario_5_partial_fill_sell_larger" in names
+        assert len(partials) >= 2
+
+    def test_multiple_price_levels_scenarios_filter(self):
+        """Verify multiple price levels scenarios filter returns expected set."""
+        multi_level = get_multiple_price_levels_scenarios()
+        names = {s.name for s in multi_level}
+        assert "scenario_8_price_priority_buy" in names
+        assert "scenario_9_price_priority_sell" in names
+        assert len(multi_level) >= 2
+
+    def test_non_crossing_scenarios_filter(self):
+        """Verify non-crossing scenarios filter returns expected set."""
+        non_crossing = get_non_crossing_scenarios()
+        names = {s.name for s in non_crossing}
+        assert "scenario_3_no_trade_wide_spread" in names
+        assert "scenario_10_empty_order_book" in names
+        assert len(non_crossing) >= 2
+
+    def test_unmatched_scenarios_filter(self):
+        """Verify unmatched orders scenarios filter returns expected set."""
+        unmatched = get_unmatched_scenarios()
+        names = {s.name for s in unmatched}
+        assert "scenario_3_no_trade_wide_spread" in names
+        assert "scenario_10_empty_order_book" in names
+        assert len(unmatched) >= 2
+
+    def test_get_scenarios_by_category_invalid_returns_empty(self):
+        """Verify querying a non-existent category returns empty list."""
+        assert get_scenarios_by_category("invalid_non_existent_category") == []
+
+
+# ==============================================================================
+# 10. Scenario Execution Helpers & Outcome Verification Tests (Week 3 Day 5)
+# ==============================================================================
+
+class TestScenarioExecutionHelpers:
+    """Verifies execute_in_engine, execute_in_adapter, and verify_execution methods."""
+
+    @pytest.mark.parametrize("scenario", ALL_SCENARIOS, ids=lambda s: s.name)
+    def test_execute_in_engine_and_verify_execution(self, scenario: TradingScenario):
+        """Verify execute_in_engine executes and passes verify_execution for all scenarios."""
+        engine = MatchingEngine()
+        trades = scenario.execute_in_engine(engine)
+        assert scenario.verify_execution(trades, engine) is True
+
+    @pytest.mark.parametrize("scenario", ALL_SCENARIOS, ids=lambda s: s.name)
+    def test_execute_in_adapter_and_verify_execution(self, scenario: TradingScenario):
+        """Verify execute_in_adapter executes and matches expected trade details."""
+        engine = MatchingEngine()
+        adapter = OrderAdapter(engine=engine, dispatch_mode="match")
+        trades = scenario.execute_in_adapter(adapter)
+        assert scenario.verify_execution(trades, engine) is True
+
+    def test_expected_trade_matches_trade_result_success(self):
+        """Verify ExpectedTrade.matches_trade_result returns True on matching attributes."""
+        expected = ExpectedTrade(buy_order_id=1, sell_order_id=2, execution_price=100.0, trade_quantity=50)
+        trade = TradeResult(
+            buy_order_id=1,
+            sell_order_id=2,
+            executed_quantity=50,
+            execution_price_cents=10000,
+            buy_remaining_quantity=0,
+            sell_remaining_quantity=0,
+        )
+        assert expected.matches_trade_result(trade) is True
+
+    def test_expected_trade_matches_trade_result_mismatch_detection(self):
+        """Verify ExpectedTrade.matches_trade_result returns False on mismatched attributes."""
+        expected = ExpectedTrade(buy_order_id=1, sell_order_id=2, execution_price=100.0, trade_quantity=50)
+        # Wrong quantity
+        t_wrong_qty = TradeResult(1, 2, 40, 10000, 0, 0)
+        assert expected.matches_trade_result(t_wrong_qty) is False
+        # Wrong buy_order_id
+        t_wrong_buy = TradeResult(99, 2, 50, 10000, 0, 0)
+        assert expected.matches_trade_result(t_wrong_buy) is False
+        # Wrong execution_price
+        t_wrong_price = TradeResult(1, 2, 50, 10500, 0, 0)
+        assert expected.matches_trade_result(t_wrong_price) is False
+
+    def test_verify_execution_detects_volume_discrepancy(self):
+        """Verify verify_execution raises AssertionError if total executed volume does not match."""
+        s = SCENARIO_1_EXACT_MATCH
+        # Provide wrong trade with executed_quantity=40 instead of 50
+        fake_trade = TradeResult(101, 102, 40, 10000, 0, 0)
+        with pytest.raises(AssertionError, match="expected total matched 50, got 40"):
+            s.verify_execution([fake_trade])
+
+    def test_verify_execution_detects_trade_count_discrepancy(self):
+        """Verify verify_execution raises AssertionError if trade count differs."""
+        s = SCENARIO_1_EXACT_MATCH
+        # Two trades summing to 50 shares (matches volume 50, but count 2 != expected 1)
+        fake_trades = [
+            TradeResult(101, 102, 25, 10000, 0, 0),
+            TradeResult(101, 102, 25, 10000, 0, 0),
+        ]
+        with pytest.raises(AssertionError, match="expected 1 trades, got 2"):
+            s.verify_execution(fake_trades)
+
+    def test_verify_execution_detects_price_discrepancy(self):
+        """Verify verify_execution raises AssertionError if trade execution price differs."""
+        s = SCENARIO_1_EXACT_MATCH
+        fake_trade = TradeResult(101, 102, 50, 10500, 0, 0)  # $105.00 instead of $100.00
+        with pytest.raises(AssertionError, match="expected price=100.0, got 105.0"):
+            s.verify_execution([fake_trade])
+
+    def test_verify_execution_detects_remaining_quantity_discrepancy(self):
+        """Verify verify_execution raises AssertionError if engine order book residue differs."""
+        s = SCENARIO_4_PARTIAL_FILL_BUY_LARGER
+        engine = MatchingEngine()
+        trades = s.execute_in_engine(engine)
+        # Tamper with engine book by modifying order quantity
+        engine.get_best_buy_order().remaining_quantity = 999
+        with pytest.raises(AssertionError, match="expected remaining 60, got 999"):
+            s.verify_execution(trades, engine)
+
+
+# ==============================================================================
+# 11. Dedicated Category Behavior Verification (Week 3 Day 5)
+# ==============================================================================
+
+class TestCategoryBehaviorRequirements:
+    """Explicitly tests behaviors required by Week 3 Day 5 curriculum."""
+
+    def test_successful_matching_generates_positive_matched_volume(self):
+        """Verify that every successful matching scenario executes >0 shares."""
+        for s in get_successful_matching_scenarios():
+            engine = MatchingEngine()
+            trades = s.execute_in_engine(engine)
+            assert len(trades) > 0
+            assert s.expected.total_matched_quantity > 0
+            assert sum(t.executed_quantity for t in trades) == s.expected.total_matched_quantity
+
+    def test_partial_fills_leave_exact_residual_quantities(self):
+        """Verify that partial fill scenarios leave exact expected resting residue in the book."""
+        for s in get_partial_fill_scenarios():
+            engine = MatchingEngine()
+            s.execute_in_engine(engine)
+            # Must have at least one order with remaining > 0 and at least one order with remaining == 0
+            rems = list(s.expected.remaining_quantities.values())
+            assert any(r > 0 for r in rems), f"Scenario {s.name} should have resting residue"
+            assert any(r == 0 for r in rems), f"Scenario {s.name} should have fully filled orders"
+
+    def test_multiple_price_levels_sweep_correct_maker_prices(self):
+        """Verify multiple price level scenarios sweep multiple levels using resting maker prices."""
+        for s in get_multiple_price_levels_scenarios():
+            engine = MatchingEngine()
+            trades = s.execute_in_engine(engine)
+            assert len(trades) >= 2, f"Scenario {s.name} must generate >=2 fills across levels"
+            # Execution prices of fills must differ (reflecting multiple price tiers)
+            prices = [t.execution_price for t in trades]
+            assert len(set(prices)) > 1, f"Scenario {s.name} fills should execute at distinct price tiers"
+
+    def test_non_crossing_orders_produce_zero_trades(self):
+        """Verify that non-crossing scenarios result in zero trades and zero volume."""
+        for s in get_non_crossing_scenarios():
+            engine = MatchingEngine()
+            trades = s.execute_in_engine(engine)
+            assert len(trades) == 0
+            assert s.expected.total_matched_quantity == 0
+
+    def test_unmatched_orders_rest_on_book_without_execution(self):
+        """Verify unmatched orders remain resting in the book with initial quantities intact."""
+        for s in get_unmatched_scenarios():
+            engine = MatchingEngine()
+            trades = s.execute_in_engine(engine)
+            assert len(trades) == 0
+            # If orders were submitted, their initial quantities must equal remaining quantities
+            for o in s.orders:
+                assert s.expected.remaining_quantities[o.order_id] == o.quantity
+
+
+# ==============================================================================
+# 12. Week 3 Nanosecond Timestamp & Latency Tracking Integration
+# ==============================================================================
+
+class TestTradingScenariosLatencyIntegration:
+    """Verifies that scenario execution through OrderAdapter integrates with Week 3 nanosecond latency."""
+
+    @pytest.mark.parametrize("scenario", ALL_SCENARIOS, ids=lambda s: s.name)
+    def test_scenario_execution_via_adapter_latency_tracking(self, scenario: TradingScenario):
+        """Verify that adapter execution accurately tracks trade latency and nanosecond timestamps."""
+        engine = MatchingEngine()
+        adapter = OrderAdapter(engine=engine, dispatch_mode="match")
+        trades = scenario.execute_in_adapter(adapter)
+
+        # 1. Total volume & trade count
+        assert len(trades) == len(scenario.expected.trades)
+        assert adapter.stats.total_volume_matched == scenario.expected.total_matched_quantity
+
+        # 2. Nanosecond timestamps on all generated trades
+        for trade in trades:
+            assert trade.entry_timestamp_ns > 0
+            assert trade.exit_timestamp_ns >= trade.entry_timestamp_ns
+            assert trade.latency_ns >= 0
+            assert trade.latency_us == trade.latency_ns / 1000.0
+
+        # 3. Trade latency tracker metrics
+        snap = adapter.get_trade_latency_snapshot()
+        assert snap.trade_count == len(scenario.expected.trades)
+        if len(trades) > 0:
+            assert snap.avg_latency_ns >= 0.0
+            assert snap.min_latency_ns <= snap.max_latency_ns
+        else:
+            assert snap.avg_latency_ns == 0.0
+            assert snap.min_latency_ns == 0
+            assert snap.max_latency_ns == 0
+
+    def test_non_crossing_scenarios_record_execution_events_without_trades(self):
+        """Verify non-crossing orders record execution events with zero trades."""
+        s = SCENARIO_3_NO_TRADE
+        engine = MatchingEngine()
+        adapter = OrderAdapter(engine=engine, dispatch_mode="match")
+        s.execute_in_adapter(adapter)
+
+        assert len(adapter.execution_events) == 2
+        for ev in adapter.execution_events:
+            assert ev.matched is False
+            assert ev.volume_matched == 0
+            assert ev.trades == []
+            assert ev.latency_ns >= 0
+            assert ev.entry_timestamp_ns > 0
+            assert ev.exit_timestamp_ns >= ev.entry_timestamp_ns
+        assert adapter.trade_latency.trade_count == 0
+        assert adapter.stats.non_crossing_orders == 2

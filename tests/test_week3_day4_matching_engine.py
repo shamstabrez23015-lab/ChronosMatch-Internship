@@ -740,4 +740,3 @@ class TestBookIntegrityOnInvalidAndUnmatchedOrders:
         assert engine.is_ready() is True
         assert engine.get_best_bid() is None
         assert engine.get_best_ask() is None
-
