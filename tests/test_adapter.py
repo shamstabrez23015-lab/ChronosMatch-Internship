@@ -20,6 +20,7 @@ from typing import Generator
 import pytest
 
 from chronos.adapter import AdapterStats, OrderAdapter
+from chronos.audit import AuditRecordType, SQLiteAuditWorker
 from chronos.consumer import ZeroCopyConsumer
 from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL, price_to_cents
 from chronos.protocol import (
@@ -324,3 +325,37 @@ class TestOrderAdapterConsumerIntegration:
         assert len(adapter.trades) == 1
         assert engine.ask_count() == 0
         assert engine.bid_count() == 0
+
+
+class TestOrderAdapterAuditWorkerIntegration:
+    """Verifies optional SQLiteAuditWorker integration with OrderAdapter."""
+
+    def test_adapter_attaches_and_uses_audit_worker(self, engine: MatchingEngine):
+        """Adapter enqueues execution events to audit worker without impacting matching."""
+        worker = SQLiteAuditWorker(db_path=":memory:", batch_size=5, auto_start=True)
+        adapter = OrderAdapter(engine=engine, audit_worker=worker)
+
+        try:
+            order1 = Order(1, 1000, 100.0, 10, SYMBOLS["AAPL"], int(Side.SELL), int(OrderType.LIMIT))
+            order2 = Order(2, 2000, 100.0, 10, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT))
+
+            adapter.dispatch_order(order1)
+            adapter.dispatch_order(order2)
+
+            worker.flush()
+
+            records = worker.query_records()
+            assert len(records) == 2
+            assert records[0].order_id == 1
+            assert records[1].order_id == 2
+            assert records[1].executed_quantity == 10
+        finally:
+            worker.shutdown()
+
+    def test_adapter_audit_worker_none_by_default(self, engine: MatchingEngine):
+        """Adapter defaults to audit_worker=None without breaking existing behavior."""
+        adapter = OrderAdapter(engine=engine)
+        assert adapter.audit_worker is None
+        order = Order(10, 1000, 50.0, 5, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT))
+        adapter.dispatch_order(order)
+        assert len(adapter.execution_events) == 1

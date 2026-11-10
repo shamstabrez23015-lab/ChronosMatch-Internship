@@ -22,8 +22,9 @@ from typing import Generator, List, Tuple
 
 import pytest
 
-from chronos.adapter import AdapterStats, OrderAdapter
+from chronos.adapter import AdapterStats, OrderAdapter, TradeExecutionEvent
 from chronos.consumer import ConsumerStats, ZeroCopyConsumer
+from chronos.firehose import FastOrderGenerator
 from chronos.matching_engine import (
     COrder,
     MatchingEngine,
@@ -44,11 +45,21 @@ from chronos.protocol import (
 )
 from chronos.ring_buffer import MmapRingBuffer
 from tests.trading_scenarios import (
+    ALL_SCENARIOS,
     SCENARIO_1_EXACT_MATCH,
+    SCENARIO_2_CROSSED_MARKET,
     SCENARIO_3_NO_TRADE,
     SCENARIO_4_PARTIAL_FILL_BUY_LARGER,
+    SCENARIO_5_PARTIAL_FILL_SELL_LARGER,
+    SCENARIO_6_EXACT_FULL_FILL,
     SCENARIO_7_FIFO_SAME_PRICE,
+    SCENARIO_8_PRICE_PRIORITY_BUY,
+    SCENARIO_9_PRICE_PRIORITY_SELL,
+    SCENARIO_10_EMPTY_ORDER_BOOK,
     ScenarioOrder,
+    TradingScenario,
+    get_all_scenarios,
+    get_scenario,
 )
 
 
@@ -739,3 +750,554 @@ class TestBoundaryHandlingAndResourceCleanup:
                 os.remove(path)
 
         assert not os.path.exists(path)
+
+
+# ==============================================================================
+# Week 3 Day 7: End-to-End Pipeline Extensions
+# ==============================================================================
+
+class TestProducerFirehoseToEngineEndToEndFlow:
+    """Full pipeline flow: Market Firehose/Producer -> Protocol -> Ring Buffer -> Consumer -> Adapter -> Engine."""
+
+    def test_fast_order_generator_batch_to_ring_buffer_to_engine(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        matching_engine: MatchingEngine,
+        order_adapter: OrderAdapter,
+    ):
+        """Verify FastOrderGenerator batch transfers into ring buffer, is drained by consumer,
+        and dispatched into MatchingEngine via OrderAdapter."""
+        generator = FastOrderGenerator(initial_order_id=5000)
+        batch = generator.generate_batch(batch_size=100)
+        assert len(batch) == 100
+
+        # Write to isolated ring buffer
+        written = isolated_ring_buffer.write_batch(batch)
+        assert written == 100
+        assert isolated_ring_buffer.available_to_read() == 100
+
+        # Run consumer connected to adapter to drain all 100 orders
+        consumer = ZeroCopyConsumer(
+            ring_buffer=isolated_ring_buffer,
+            batch_size=25,
+            order_handler=order_adapter.dispatch_raw_order,
+        )
+        stats = consumer.run(total_orders=100, print_progress=False)
+
+        assert stats.total_orders_read == 100
+        assert isolated_ring_buffer.is_empty() is True
+        assert isolated_ring_buffer.available_to_read() == 0
+
+        # Adapter stats reflect all orders
+        # Note: FastOrderGenerator produces LIMIT (~90%) and MARKET (~10%) orders
+        adapter_stats = order_adapter.stats
+        assert (
+            adapter_stats.total_orders_dispatched + adapter_stats.unhandled_order_types == 100
+        )
+        # Latency metrics recorded for all dispatched LIMIT orders
+        assert len(adapter_stats.execution_latencies_ns) == adapter_stats.total_orders_dispatched
+        if adapter_stats.total_orders_dispatched > 0:
+            assert adapter_stats.avg_execution_latency_ns >= 0.0
+            assert adapter_stats.min_execution_latency_ns >= 0
+
+    def test_controlled_producer_crossing_pairs_strict_execution(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        matching_engine: MatchingEngine,
+        order_adapter: OrderAdapter,
+    ):
+        """Controlled producer writes crossing BUY and SELL pairs, producing exact match results."""
+        sym_id = SYMBOLS["AAPL"]
+        base_ts = 1_700_000_000_000_000_000
+
+        # Producer emits 2 matching pairs:
+        # Pair 1: SELL #6001 (100 @ $150.00), then BUY #6002 (100 @ $150.00) -> exact match
+        # Pair 2: BUY  #6003 (50 @ $155.00), then SELL #6004 (50 @ $155.00) -> exact match
+        orders = [
+            (6001, base_ts + 1000, 150.00, 100, sym_id, int(Side.SELL), int(OrderType.LIMIT)),
+            (6002, base_ts + 2000, 150.00, 100, sym_id, int(Side.BUY), int(OrderType.LIMIT)),
+            (6003, base_ts + 3000, 155.00, 50, sym_id, int(Side.BUY), int(OrderType.LIMIT)),
+            (6004, base_ts + 4000, 155.00, 50, sym_id, int(Side.SELL), int(OrderType.LIMIT)),
+        ]
+
+        written = isolated_ring_buffer.write_batch(orders)
+        assert written == 4
+
+        trades = order_adapter.drain_all()
+        assert len(trades) == 2
+
+        # Trade 1
+        t1 = trades[0]
+        assert t1.buy_order_id == 6002
+        assert t1.sell_order_id == 6001
+        assert t1.executed_quantity == 100
+        assert t1.execution_price_cents == 15000
+        assert t1.buy_remaining_quantity == 0
+        assert t1.sell_remaining_quantity == 0
+
+        # Trade 2
+        t2 = trades[1]
+        assert t2.buy_order_id == 6003
+        assert t2.sell_order_id == 6004
+        assert t2.executed_quantity == 50
+        assert t2.execution_price_cents == 15500
+        assert t2.buy_remaining_quantity == 0
+        assert t2.sell_remaining_quantity == 0
+
+        # Engine book is completely clean
+        assert matching_engine.bid_count() == 0
+        assert matching_engine.ask_count() == 0
+        assert order_adapter.stats.total_volume_matched == 150
+        assert order_adapter.stats.total_trades_generated == 2
+        assert order_adapter.stats.non_crossing_orders == 2  # #6001 and #6003 arrived as makers
+
+    def test_controlled_producer_unmatched_and_non_crossing_orders_zero_trades(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        matching_engine: MatchingEngine,
+        order_adapter: OrderAdapter,
+    ):
+        """Controlled producer writes only non-crossing orders; verifies zero false executions occur."""
+        sym_id = SYMBOLS["MSFT"]
+        base_ts = 2_000_000_000_000_000_000
+
+        # 5 BUYs ($390..$394) and 5 SELLs ($405..$409) -> spread of $11.00, no crossing possible
+        orders = []
+        for i in range(5):
+            orders.append(
+                (7000 + i, base_ts + i * 1000, 390.0 + i, 20, sym_id, int(Side.BUY), int(OrderType.LIMIT))
+            )
+        for i in range(5):
+            orders.append(
+                (7010 + i, base_ts + (i + 5) * 1000, 405.0 + i, 30, sym_id, int(Side.SELL), int(OrderType.LIMIT))
+            )
+
+        isolated_ring_buffer.write_batch(orders)
+        assert isolated_ring_buffer.available_to_read() == 10
+
+        trades = order_adapter.drain_all()
+
+        # Invariants:
+        assert len(trades) == 0
+        assert order_adapter.stats.total_trades_generated == 0
+        assert order_adapter.stats.total_volume_matched == 0
+        assert order_adapter.stats.non_crossing_orders == 10
+        assert order_adapter.stats.total_orders_dispatched == 10
+
+        # Engine book depth verified
+        assert matching_engine.bid_count() == 5
+        assert matching_engine.ask_count() == 5
+        assert matching_engine.get_best_bid_price() == 394.00
+        assert matching_engine.get_best_ask_price() == 405.00
+        assert matching_engine.has_crossing_prices() is False
+
+    def test_empty_ring_buffer_clean_drain_no_op(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        matching_engine: MatchingEngine,
+        order_adapter: OrderAdapter,
+    ):
+        """Verifies behavior when the ring buffer is empty: zero reads, zero trades, no crash."""
+        assert isolated_ring_buffer.is_empty() is True
+        assert isolated_ring_buffer.available_to_read() == 0
+
+        # Single process_next call
+        raw, trades = order_adapter.process_next()
+        assert raw is None
+        assert len(trades) == 0
+
+        # Drain all call
+        all_trades = order_adapter.drain_all()
+        assert len(all_trades) == 0
+
+        # Consumer execution on empty buffer with exit_when_empty
+        consumer_stats = order_adapter.run_consumer(exit_when_empty=True)
+        assert consumer_stats.total_orders_read == 0
+        assert order_adapter.stats.total_orders_dispatched == 0
+        assert matching_engine.bid_count() == 0
+        assert matching_engine.ask_count() == 0
+
+    def test_queued_burst_orders_preserves_buffer_and_book_state(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        matching_engine: MatchingEngine,
+        order_adapter: OrderAdapter,
+    ):
+        """Queue a burst of 256 orders in the ring buffer before consumption, verifying pointer integrity."""
+        sym_id = SYMBOLS["AAPL"]
+        base_ts = 3_000_000_000_000_000_000
+
+        # 128 BUY orders at 100.00 followed by 128 SELL orders at 100.00
+        orders = []
+        for i in range(128):
+            orders.append(
+                (8000 + i, base_ts + i * 10, 100.00, 10, sym_id, int(Side.BUY), int(OrderType.LIMIT))
+            )
+        for i in range(128):
+            orders.append(
+                (9000 + i, base_ts + 2000 + i * 10, 100.00, 10, sym_id, int(Side.SELL), int(OrderType.LIMIT))
+            )
+
+        written = isolated_ring_buffer.write_batch(orders)
+        assert written == 256
+        assert isolated_ring_buffer.available_to_read() == 256
+
+        # Consume in small chunks (batch_size=16)
+        consumer = ZeroCopyConsumer(
+            ring_buffer=isolated_ring_buffer,
+            batch_size=16,
+            order_handler=order_adapter.dispatch_raw_order,
+        )
+        c_stats = consumer.run(total_orders=256, print_progress=False)
+
+        assert c_stats.total_orders_read == 256
+        assert isolated_ring_buffer.is_empty() is True
+        assert isolated_ring_buffer.available_to_read() == 0
+
+        # All 128 BUYs matched 1-to-1 against all 128 SELLs
+        assert order_adapter.stats.total_orders_dispatched == 256
+        assert order_adapter.stats.total_trades_generated == 128
+        assert order_adapter.stats.total_volume_matched == 1280  # 128 * 10
+        assert matching_engine.bid_count() == 0
+        assert matching_engine.ask_count() == 0
+
+
+class TestFieldEncodingDecodingFidelityEndToEnd:
+    """Verifies binary protocol fidelity: cents conversion, timestamps, and symbol routing."""
+
+    def test_precise_fractional_prices_through_pipeline(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        matching_engine: MatchingEngine,
+        order_adapter: OrderAdapter,
+    ):
+        """Orders with fractional penny prices pack and unpack to exact integer cents in engine."""
+        test_prices = [0.01, 10.05, 49.99, 125.75, 999.95]
+        expected_cents = [1, 1005, 4999, 12575, 99995]
+        sym_id = SYMBOLS["NVDA"]
+
+        for idx, (px, exp_cents) in enumerate(zip(test_prices, expected_cents)):
+            order = Order(
+                order_id=10_000 + idx,
+                timestamp_ns=1_000_000 + idx,
+                price=px,
+                quantity=10,
+                symbol_id=sym_id,
+                side=int(Side.BUY),
+                order_type=int(OrderType.LIMIT),
+            )
+            isolated_ring_buffer.write_order(order)
+
+        order_adapter.drain_all()
+
+        assert matching_engine.bid_count() == 5
+        bids = matching_engine.get_prioritized_bids()
+        cents_in_book = [b.price_cents for b in bids]
+        for exp in expected_cents:
+            assert exp in cents_in_book
+
+    def test_nanosecond_timestamps_and_latency_fidelity(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        matching_engine: MatchingEngine,
+        order_adapter: OrderAdapter,
+    ):
+        """Nanosecond timestamps are faithfully preserved and latency is non-negative."""
+        order = Order(
+            order_id=11_001,
+            timestamp_ns=1_700_000_000_123_456_789,
+            price=200.00,
+            quantity=50,
+            symbol_id=SYMBOLS["AAPL"],
+            side=int(Side.BUY),
+            order_type=int(OrderType.LIMIT),
+        )
+        isolated_ring_buffer.write_order(order)
+        order_adapter.drain_all()
+
+        assert len(order_adapter.execution_events) == 1
+        event = order_adapter.execution_events[0]
+        assert event.order_id == 11_001
+        assert event.entry_timestamp_ns <= event.exit_timestamp_ns
+        assert event.latency_ns >= 0
+        assert event.latency_us == event.latency_ns / 1000.0
+        assert event.matched is False
+
+    def test_symbol_isolation_prevents_cross_symbol_matching(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+    ):
+        """Cross-symbol orders with overlapping prices route to isolated engines without matching."""
+        engine_aapl = MatchingEngine()
+        engine_msft = MatchingEngine()
+
+        adapter = OrderAdapter(
+            ring_buffer=isolated_ring_buffer,
+            symbol_engines={
+                SYMBOLS["AAPL"]: engine_aapl,
+                SYMBOLS["MSFT"]: engine_msft,
+            },
+            dispatch_mode="match",
+        )
+
+        # AAPL BUY @ 200.00 and MSFT SELL @ 190.00 (prices would cross if same book!)
+        orders = [
+            Order(12001, 1000, 200.00, 50, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT)),
+            Order(12002, 2000, 190.00, 50, SYMBOLS["MSFT"], int(Side.SELL), int(OrderType.LIMIT)),
+        ]
+        for o in orders:
+            isolated_ring_buffer.write_order(o)
+
+        trades = adapter.drain_all()
+
+        # Invariants:
+        assert len(trades) == 0  # Zero cross-symbol trades
+        assert adapter.stats.total_trades_generated == 0
+        assert engine_aapl.bid_count() == 1
+        assert engine_aapl.ask_count() == 0
+        assert engine_msft.bid_count() == 0
+        assert engine_msft.ask_count() == 1
+
+
+class TestAllDay5TradingScenariosE2E:
+    """Verifies all Day 5 trading scenarios run end-to-end through ring buffer and adapter."""
+
+    def test_scenario_2_crossed_market_e2e(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        matching_engine: MatchingEngine,
+        order_adapter: OrderAdapter,
+    ):
+        """Scenario 2 (Crossed Market): 50 BUY @ 505.00 vs 50 SELL @ 500.00 -> trade at maker 500.00."""
+        scenario = SCENARIO_2_CROSSED_MARKET
+        for o in scenario.orders:
+            isolated_ring_buffer.write_order(o.to_protocol_order())
+
+        trades = order_adapter.drain_all()
+        assert len(trades) == len(scenario.expected.trades)
+        assert trades[0].executed_quantity == scenario.expected.total_matched_quantity
+        assert trades[0].execution_price_cents == scenario.expected.trades[0].execution_price_cents
+        assert matching_engine.bid_count() == 0
+        assert matching_engine.ask_count() == 0
+
+    def test_scenario_5_partial_fill_sell_larger_e2e(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        matching_engine: MatchingEngine,
+        order_adapter: OrderAdapter,
+    ):
+        """Scenario 5 (Partial Fill: Sell Larger): 30 BUY @ 250.00 vs 80 SELL @ 250.00."""
+        scenario = SCENARIO_5_PARTIAL_FILL_SELL_LARGER
+        for o in scenario.orders:
+            isolated_ring_buffer.write_order(o.to_protocol_order())
+
+        trades = order_adapter.drain_all()
+        assert len(trades) == 1
+        assert trades[0].executed_quantity == 30
+        assert trades[0].sell_remaining_quantity == 50
+        assert matching_engine.ask_count() == 1
+        assert matching_engine.bid_count() == 0
+        assert matching_engine.get_best_sell_order().remaining_quantity == 50
+
+    def test_scenario_6_exact_full_fill_e2e(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        matching_engine: MatchingEngine,
+        order_adapter: OrderAdapter,
+    ):
+        """Scenario 6 (Exact Full Fill): 75 BUY @ 300.00 vs 75 SELL @ 300.00."""
+        scenario = SCENARIO_6_EXACT_FULL_FILL
+        for o in scenario.orders:
+            isolated_ring_buffer.write_order(o.to_protocol_order())
+
+        trades = order_adapter.drain_all()
+        assert len(trades) == 1
+        assert trades[0].executed_quantity == 75
+        assert matching_engine.bid_count() == 0
+        assert matching_engine.ask_count() == 0
+
+    def test_scenario_8_price_priority_buy_e2e(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        matching_engine: MatchingEngine,
+        order_adapter: OrderAdapter,
+    ):
+        """Scenario 8 (Price Priority Buy): Higher bid receives execution priority over lower bid."""
+        scenario = SCENARIO_8_PRICE_PRIORITY_BUY
+        for o in scenario.orders:
+            isolated_ring_buffer.write_order(o.to_protocol_order())
+
+        trades = order_adapter.drain_all()
+        assert len(trades) == len(scenario.expected.trades)
+        assert sum(t.executed_quantity for t in trades) == scenario.expected.total_matched_quantity
+
+    def test_scenario_9_price_priority_sell_e2e(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        matching_engine: MatchingEngine,
+        order_adapter: OrderAdapter,
+    ):
+        """Scenario 9 (Price Priority Sell): Lower ask receives execution priority over higher ask."""
+        scenario = SCENARIO_9_PRICE_PRIORITY_SELL
+        for o in scenario.orders:
+            isolated_ring_buffer.write_order(o.to_protocol_order())
+
+        trades = order_adapter.drain_all()
+        assert len(trades) == len(scenario.expected.trades)
+        assert sum(t.executed_quantity for t in trades) == scenario.expected.total_matched_quantity
+
+    def test_scenario_10_empty_order_book_e2e(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        matching_engine: MatchingEngine,
+        order_adapter: OrderAdapter,
+    ):
+        """Scenario 10 (Empty Order Book): Single order rests cleanly without trade."""
+        scenario = SCENARIO_10_EMPTY_ORDER_BOOK
+        for o in scenario.orders:
+            isolated_ring_buffer.write_order(o.to_protocol_order())
+
+        trades = order_adapter.drain_all()
+        assert len(trades) == 0
+        assert matching_engine.bid_count() == 0
+        assert matching_engine.ask_count() == 0
+
+    @pytest.mark.parametrize("scenario", ALL_SCENARIOS, ids=lambda s: s.name)
+    def test_all_10_day5_scenarios_comprehensive_e2e_runner(
+        self,
+        scenario: TradingScenario,
+    ):
+        """Verifies each registered Day 5 scenario executed through ring buffer and adapter passes verify_execution."""
+        fd, path = tempfile.mkstemp(prefix="chronos_sc_e2e_", suffix=".bin")
+        os.close(fd)
+        buf = MmapRingBuffer(filepath=path, capacity=128, slot_size=ORDER_SIZE, create=True)
+        engine = MatchingEngine()
+        adapter = OrderAdapter(ring_buffer=buf, engine=engine, dispatch_mode="match")
+
+        try:
+            for sc_order in scenario.orders:
+                buf.write_order(sc_order.to_protocol_order())
+
+            trades = adapter.drain_all()
+            assert scenario.verify_execution(trades, engine) is True
+        finally:
+            buf.close()
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
+class TestPipelineErrorResilienceAndEdgeCases:
+    """Verifies pipeline behavior under unhandled order types, capacity bounds, and buffer states."""
+
+    def test_interleaved_valid_and_unsupported_orders_in_single_stream(
+        self,
+        isolated_ring_buffer: MmapRingBuffer,
+        matching_engine: MatchingEngine,
+        order_adapter: OrderAdapter,
+    ):
+        """Interleaved stream with LIMIT, MARKET, CANCEL, and unrouted symbols processes cleanly."""
+        sym_aapl = SYMBOLS["AAPL"]
+        base_ts = 5_000_000
+
+        # Stream sequence:
+        # 1. LIMIT BUY AAPL (100 @ 150.00)
+        # 2. MARKET BUY AAPL (50 @ 0.0) -> unhandled, should not corrupt book
+        # 3. CANCEL order (order_id 999) -> unhandled
+        # 4. LIMIT SELL AAPL (100 @ 150.00) -> crosses with #1
+        stream = [
+            (13001, base_ts + 100, 150.00, 100, sym_aapl, int(Side.BUY), int(OrderType.LIMIT)),
+            (13002, base_ts + 200, 0.0, 50, sym_aapl, int(Side.BUY), int(OrderType.MARKET)),
+            (13003, base_ts + 300, 0.0, 0, sym_aapl, int(Side.BUY), int(OrderType.CANCEL)),
+            (13004, base_ts + 400, 150.00, 100, sym_aapl, int(Side.SELL), int(OrderType.LIMIT)),
+        ]
+
+        isolated_ring_buffer.write_batch(stream)
+        trades = order_adapter.drain_all()
+
+        # Invariant checks:
+        assert len(trades) == 1
+        assert trades[0].buy_order_id == 13001
+        assert trades[0].sell_order_id == 13004
+        assert trades[0].executed_quantity == 100
+        assert trades[0].execution_price_cents == 15000
+
+        # Book ends clean
+        assert matching_engine.bid_count() == 0
+        assert matching_engine.ask_count() == 0
+
+        # Unhandled orders truthfully tracked
+        assert order_adapter.stats.unhandled_order_types == 2
+        assert len(order_adapter.unhandled_orders) == 2
+        assert order_adapter.stats.total_orders_dispatched == 2  # 2 LIMIT orders dispatched
+
+    def test_ring_buffer_full_behavior_without_overwrite_preserves_orders(self):
+        """Writing to a full buffer without overwrite returns False and preserves unconsumed items."""
+        fd, path = tempfile.mkstemp(prefix="chronos_full_test_", suffix=".bin")
+        os.close(fd)
+        buf = MmapRingBuffer(filepath=path, capacity=16, slot_size=ORDER_SIZE, create=True)
+        engine = MatchingEngine()
+        adapter = OrderAdapter(ring_buffer=buf, engine=engine, dispatch_mode="match")
+
+        try:
+            # Fill buffer with 16 orders
+            for i in range(16):
+                written = buf.write(
+                    order_id=14000 + i,
+                    timestamp_ns=1000 + i,
+                    price=100.0,
+                    quantity=10,
+                    symbol_id=SYMBOLS["AAPL"],
+                    side=int(Side.BUY),
+                    order_type=int(OrderType.LIMIT),
+                    overwrite_on_full=False,
+                )
+                assert written is True
+
+            assert buf.is_full() is True
+            assert buf.available_to_read() == 16
+            assert buf.available_to_write() == 0
+
+            # 17th write fails safely
+            extra = buf.write(
+                order_id=99999,
+                timestamp_ns=9999,
+                price=100.0,
+                quantity=10,
+                symbol_id=SYMBOLS["AAPL"],
+                side=int(Side.BUY),
+                order_type=int(OrderType.LIMIT),
+                overwrite_on_full=False,
+            )
+            assert extra is False
+
+            # Drain first 8 orders
+            drained_8 = adapter.process_available(max_orders=8)
+            assert adapter.stats.total_orders_read == 8
+            assert buf.available_to_read() == 8
+            assert buf.available_to_write() == 8
+
+            # Now write succeeds for 8 new orders
+            for i in range(8):
+                written = buf.write(
+                    order_id=15000 + i,
+                    timestamp_ns=2000 + i,
+                    price=100.0,
+                    quantity=10,
+                    symbol_id=SYMBOLS["AAPL"],
+                    side=int(Side.BUY),
+                    order_type=int(OrderType.LIMIT),
+                    overwrite_on_full=False,
+                )
+                assert written is True
+
+            # Drain remainder
+            adapter.drain_all()
+            assert adapter.stats.total_orders_read == 24
+            assert buf.is_empty() is True
+        finally:
+            buf.close()
+            if os.path.exists(path):
+                os.remove(path)

@@ -170,8 +170,18 @@ class LiveFeedBridge:
         self.dashboard.set_sell_orders(asks, is_sample=False)
         self.dashboard.is_sample_data = False
 
-        if self.adapter is not None and hasattr(self.dashboard, "update_trades_processed"):
-            self.dashboard.update_trades_processed(self.adapter.stats.total_trades_generated)
+        if self.adapter is not None:
+            if hasattr(self.dashboard, "update_trades_processed"):
+                try:
+                    self.dashboard.update_trades_processed(self.adapter.stats.total_trades_generated)
+                except Exception:
+                    pass
+            try:
+                self.dashboard.update_trade_latency(
+                    self.adapter.get_trade_latency_snapshot()
+                )
+            except Exception:
+                pass
 
     def poll_once(self) -> int:
         """Drain and process currently available orders from ring buffer.
