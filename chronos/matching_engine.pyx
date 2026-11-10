@@ -38,6 +38,10 @@ Week 2, Day 6:
   compatible resting orders using strict price-time priority.
 
 Week 2, Day 7:
+- Best Bid/Ask and Spread: Foundational API for top-of-book price inspection
+  (covered fully in Week 3, Day 3 and Day 7 revisions).
+
+Week 3, Day 3:
 - Best Bid / Best Ask Access and Order-Book State Management:
   * Best bid: Highest remaining BUY price and available quantity.
   * Best ask: Lowest remaining SELL price and available quantity.
@@ -46,6 +50,63 @@ Week 2, Day 7:
   * Top-of-book telemetry snapshot: ``get_top_of_book()``, ``top_of_book()``.
   * Order-book state consistency guarantees: FIFO preservation, zero-remaining-quantity active order exclusion.
   * 100% non-mutating inspection leaving book state and arrival sequence intact.
+
+Week 3, Day 5:
+- Partial Order Matching Enhancements:
+  * Robust BUY and SELL partial order matching across single and multiple price levels.
+  * Preservation of remaining unfilled quantities in the order book.
+  * Deterministic removal of orders when remaining quantity reaches zero.
+  * Strict Price-Time Priority preservation for partially filled resting and residual orders.
+  * Quantity conservation and prevention of negative quantities or invalid trade volumes.
+  * Added COrder helper properties (filled_quantity, is_filled, is_partially_filled).
+  * Added TradeResult helper properties (price, trade_quantity, is_full_fill, is_partial_fill).
+
+Week 3, Day 6:
+- Multi-Order Matching Extensions:
+  * One incoming order executes against multiple eligible resting orders in strict price-time priority.
+  * Sweeps across same-price FIFO queue and across multiple price levels in a single pass.
+  * Correctly handles partial fills mid-sweep and complete fills across N resting orders.
+  * Updates remaining_quantity on each resting order after every individual execution step.
+  * Removes fully filled resting orders from the order book immediately after each execution.
+  * Preserves residual incoming quantity as a resting order when not fully executed.
+  * Guarantees total executed quantity never exceeds incoming or any individual resting order quantity.
+  * Guarantees no negative quantities in any TradeResult or any order remaining_quantity field.
+
+Week 3, Day 7:
+- Best Bid/Ask Management & Order-Book Snapshots:
+  * Maintain the best bid as the highest available BUY price.
+  * Maintain the best ask as the lowest available SELL price.
+  * Dynamically update best bid and best ask upon order arrival, partial fills, and complete fills.
+  * Eager removal of exhausted price levels with immediate best bid/ask reassignment.
+  * Order-Book Snapshot API (get_order_book_snapshot, get_snapshot, snapshot, order_book_snapshot).
+  * Strict Price-Time Priority order: Bids descending (highest first), Asks ascending (lowest first).
+  * 100% mutation isolation via independent COrder clones preventing external state corruption.
+  * Safe handling of empty books, one-sided books, multi-level books, and fully consumed levels.
+
+Week 3, Day 8:
+- Matched-Trade Record Generation & TradeResult Validation:
+  * Comprehensive validation of TradeResult records for full and partial fills.
+  * Precise tracking of buy_order_id, sell_order_id, executed_quantity, and maker execution_price.
+  * Correct multi-level trade record generation with decremented buy/sell remaining quantities.
+  * Strict quantity conservation (no lost or duplicated execution volume).
+  * Price-time priority verification in generated trade sequence.
+  * Order book state, depth, and best bid/ask consistency post-execution.
+
+Week 4, Day 9:
+- Benchmarking & Safe Performance Optimisations:
+  * High-resolution monotonic benchmark harness (time.perf_counter_ns).
+  * Fast non-crossing bypass in match_order: if the opposite book is empty or
+    best opposite price does not cross the incoming limit, the order is inserted
+    passively without sorting or buffer allocation.
+  * Hybrid stack/heap fill buffer: uses a 64-slot C stack buffer for typical
+    fills to avoid per-call malloc overhead; falls back to heap only when
+    more than 64 resting orders can be filled in one sweep.
+  * Eligible-candidate filtering in _c_match_loop: only resting orders whose
+    price crosses the incoming limit are gathered and sorted, eliminating
+    unnecessary work on deep one-sided books.
+  * Self-identity bypass in comparison helpers (_compare_buy_orders,
+    _compare_sell_orders): instant return when comparing an order to itself.
+
 
 Price Representation
 --------------------
@@ -68,11 +129,27 @@ Reuses the Week 1 ``Side`` convention:
 # ---------------------------------------------------------------------------
 # C-level and Python-level constants
 # ---------------------------------------------------------------------------
+from libc.math cimport round as c_round, isnan as c_isnan, isinf as c_isinf
+from libc.stdlib cimport malloc, free
+
 DEF _SIDE_BUY  = 1
 DEF _SIDE_SELL = 2
 
 SIDE_BUY = 1
 SIDE_SELL = 2
+
+
+# ---------------------------------------------------------------------------
+# C-level fill record struct (zero-Python hot-path buffer)
+# ---------------------------------------------------------------------------
+# CTradeRecord: plain C struct; no Python heap allocation per fill event.
+cdef struct CTradeRecord:
+    unsigned long long buy_order_id
+    unsigned long long sell_order_id
+    unsigned int executed_quantity
+    long long execution_price_cents
+    unsigned int buy_remaining_quantity
+    unsigned int sell_remaining_quantity
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +225,21 @@ cdef class COrder:
         """Return the dollar price as a float."""
         return self.price_cents / 100.0
 
+    @property
+    def filled_quantity(self):
+        """Return the number of shares already filled."""
+        return self.quantity - self.remaining_quantity
+
+    @property
+    def is_filled(self):
+        """Return True if the order has been completely filled."""
+        return self.remaining_quantity == 0
+
+    @property
+    def is_partially_filled(self):
+        """Return True if the order has been partially filled but still has remaining quantity."""
+        return 0 < self.remaining_quantity < self.quantity
+
     def __repr__(self):
         side_str = "BUY" if self.side == _SIDE_BUY else "SELL"
         return (
@@ -167,6 +259,91 @@ cdef class COrder:
             "remaining_quantity": self.remaining_quantity,
             "timestamp_ns": self.timestamp_ns,
         }
+
+    cpdef COrder copy(self):
+        """Return an independent copy of this order."""
+        cdef COrder clone = _create_corder(
+            self.order_id,
+            self.side,
+            self.price_cents,
+            self.quantity,
+            self.remaining_quantity,
+            self.timestamp_ns,
+            self.sequence_num,
+        )
+        return clone
+
+    def __getitem__(self, str key):
+        if key == "order_id" or key == "id":
+            return self.order_id
+        elif key == "side":
+            return self.side
+        elif key == "price":
+            return self.price
+        elif key == "price_cents":
+            return self.price_cents
+        elif key == "quantity" or key == "qty":
+            return self.quantity
+        elif key == "remaining_quantity" or key == "rem":
+            return self.remaining_quantity
+        elif key == "timestamp_ns" or key == "ts":
+            return self.timestamp_ns
+        elif key == "sequence_num" or key == "seq":
+            return self.sequence_num
+        elif key == "filled_quantity":
+            return self.filled_quantity
+        elif key == "is_filled":
+            return self.is_filled
+        elif key == "is_partially_filled":
+            return self.is_partially_filled
+        raise KeyError(key)
+
+    def get(self, str key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, str key):
+        return key in (
+            "order_id", "id", "side", "price", "price_cents",
+            "quantity", "qty", "remaining_quantity", "rem",
+            "timestamp_ns", "ts", "sequence_num", "seq",
+            "filled_quantity", "is_filled", "is_partially_filled"
+        )
+
+    def keys(self):
+        return [
+            "order_id", "side", "price_cents",
+            "quantity", "remaining_quantity", "timestamp_ns"
+        ]
+
+    def items(self):
+        return [(k, self[k]) for k in self.keys()]
+
+    def values(self):
+        return [self[k] for k in self.keys()]
+
+
+cdef inline COrder _create_corder(
+    unsigned long long order_id,
+    int side,
+    long long price_cents,
+    unsigned int quantity,
+    unsigned int remaining_quantity,
+    unsigned long long timestamp_ns,
+    unsigned long long sequence_num,
+):
+    """Fast C-level factory for COrder bypassing Python __init__ and argument boxing."""
+    cdef COrder o = COrder.__new__(COrder)
+    o.order_id = order_id
+    o.side = side
+    o.price_cents = price_cents
+    o.quantity = quantity
+    o.remaining_quantity = remaining_quantity
+    o.timestamp_ns = timestamp_ns
+    o.sequence_num = sequence_num
+    return o
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +437,26 @@ cdef class TradeResult:
         """Return the execution price as a float dollar amount."""
         return self.execution_price_cents / 100.0
 
+    @property
+    def price(self):
+        """Return the execution price as a float (alias for execution_price)."""
+        return self.execution_price_cents / 100.0
+
+    @property
+    def trade_quantity(self):
+        """Return the executed quantity (alias for executed_quantity)."""
+        return self.executed_quantity
+
+    @property
+    def is_full_fill(self):
+        """Return True if both buy and sell sides were completely filled."""
+        return self.buy_remaining_quantity == 0 and self.sell_remaining_quantity == 0
+
+    @property
+    def is_partial_fill(self):
+        """Return True if at least one side has remaining unfilled quantity."""
+        return self.buy_remaining_quantity > 0 or self.sell_remaining_quantity > 0
+
     def __repr__(self):
         if self.latency_ns > 0:
             return (
@@ -297,10 +494,85 @@ cdef class TradeResult:
             res["latency_ns"] = self.latency_ns
         return res
 
+    def __getitem__(self, str key):
+        if key == "buy_order_id":
+            return self.buy_order_id
+        elif key == "sell_order_id":
+            return self.sell_order_id
+        elif key == "executed_quantity" or key == "trade_quantity" or key == "quantity" or key == "qty":
+            return self.executed_quantity
+        elif key == "execution_price_cents" or key == "price_cents":
+            return self.execution_price_cents
+        elif key == "execution_price" or key == "price":
+            return self.execution_price
+        elif key == "buy_remaining_quantity":
+            return self.buy_remaining_quantity
+        elif key == "sell_remaining_quantity":
+            return self.sell_remaining_quantity
+        elif key == "is_full_fill":
+            return self.is_full_fill
+        elif key == "is_partial_fill":
+            return self.is_partial_fill
+        raise KeyError(key)
+
+    def get(self, str key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, str key):
+        return key in (
+            "buy_order_id", "sell_order_id", "executed_quantity", "trade_quantity",
+            "quantity", "qty", "execution_price_cents", "price_cents",
+            "execution_price", "price", "buy_remaining_quantity", "sell_remaining_quantity",
+            "is_full_fill", "is_partial_fill"
+        )
+
+    def keys(self):
+        return [
+            "buy_order_id", "sell_order_id", "executed_quantity",
+            "execution_price_cents", "execution_price",
+            "buy_remaining_quantity", "sell_remaining_quantity"
+        ]
+
+    def items(self):
+        return [(k, self[k]) for k in self.keys()]
+
+    def values(self):
+        return [self[k] for k in self.keys()]
+
+
+cdef inline TradeResult _create_trade_result(
+    unsigned long long buy_order_id,
+    unsigned long long sell_order_id,
+    unsigned int executed_quantity,
+    long long execution_price_cents,
+    unsigned int buy_remaining_quantity,
+    unsigned int sell_remaining_quantity,
+):
+    """Fast C-level factory for TradeResult bypassing Python __init__ and argument boxing."""
+    cdef TradeResult tr = TradeResult.__new__(TradeResult)
+    tr.buy_order_id = buy_order_id
+    tr.sell_order_id = sell_order_id
+    tr.executed_quantity = executed_quantity
+    tr.execution_price_cents = execution_price_cents
+    tr.buy_remaining_quantity = buy_remaining_quantity
+    tr.sell_remaining_quantity = sell_remaining_quantity
+    return tr
+
 
 # ---------------------------------------------------------------------------
 # Helper: convert protocol float price -> integer cents
 # ---------------------------------------------------------------------------
+cdef inline long long _price_to_cents_c(double price) noexcept nogil:
+    """C-level price conversion: dollar float -> integer cents.
+    Uses libc c_round() with no Python object involvement.
+    Called from the hot matching path to avoid cpdef dispatch overhead.
+    """
+    return <long long>c_round(price * 100.0)
+
+
 cpdef long long price_to_cents(double price):
     """Convert a floating-point dollar price to integer cents.
 
@@ -319,7 +591,7 @@ cpdef long long price_to_cents(double price):
     >>> price_to_cents(225.50)
     22550
     """
-    return <long long>round(price * 100.0)
+    return _price_to_cents_c(price)
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +628,8 @@ cdef inline int _compare_buy_orders(COrder a, COrder b):
       -1 if `b` has higher priority than `a`
        0 if identical priority
     """
+    if a is b:
+        return 0
     if a.price_cents > b.price_cents:
         return 1
     elif a.price_cents < b.price_cents:
@@ -378,6 +652,8 @@ cdef inline int _compare_sell_orders(COrder a, COrder b):
       -1 if `b` has higher priority than `a`
        0 if identical priority
     """
+    if a is b:
+        return 0
     if a.price_cents < b.price_cents:
         return 1
     elif a.price_cents > b.price_cents:
@@ -407,6 +683,109 @@ _SELL_PRIORITY_KEY = cmp_to_key(_sell_cmp)
 
 
 # ---------------------------------------------------------------------------
+# C-level sorting helpers (eliminating cmp_to_key overhead inside engine)
+# ---------------------------------------------------------------------------
+cdef void _insertion_sort_buy(list orders, Py_ssize_t low, Py_ssize_t high):
+    cdef Py_ssize_t i, j
+    cdef COrder key
+    for i in range(low + 1, high + 1):
+        key = <COrder>orders[i]
+        j = i - 1
+        while j >= low and _compare_buy_orders(key, <COrder>orders[j]) > 0:
+            orders[j + 1] = orders[j]
+            j -= 1
+        orders[j + 1] = key
+
+
+cdef void _quicksort_buy(list orders, Py_ssize_t low, Py_ssize_t high):
+    if low >= high:
+        return
+    if high - low < 16:
+        _insertion_sort_buy(orders, low, high)
+        return
+    cdef COrder pivot = <COrder>orders[(low + high) // 2]
+    cdef Py_ssize_t i = low
+    cdef Py_ssize_t j = high
+    cdef COrder temp
+    while i <= j:
+        while _compare_buy_orders(<COrder>orders[i], pivot) > 0:
+            i += 1
+        while _compare_buy_orders(<COrder>orders[j], pivot) < 0:
+            j -= 1
+        if i <= j:
+            temp = <COrder>orders[i]
+            orders[i] = orders[j]
+            orders[j] = temp
+            i += 1
+            j -= 1
+    if low < j:
+        _quicksort_buy(orders, low, j)
+    if i < high:
+        _quicksort_buy(orders, i, high)
+
+
+cdef void _c_sort_buy_orders(list orders):
+    """Sort a list of BUY orders in-place by Price-Time Priority using C comparisons."""
+    cdef Py_ssize_t n = len(orders)
+    if n <= 1:
+        return
+    if n < 32:
+        _insertion_sort_buy(orders, 0, n - 1)
+    else:
+        _quicksort_buy(orders, 0, n - 1)
+
+
+cdef void _insertion_sort_sell(list orders, Py_ssize_t low, Py_ssize_t high):
+    cdef Py_ssize_t i, j
+    cdef COrder key
+    for i in range(low + 1, high + 1):
+        key = <COrder>orders[i]
+        j = i - 1
+        while j >= low and _compare_sell_orders(key, <COrder>orders[j]) > 0:
+            orders[j + 1] = orders[j]
+            j -= 1
+        orders[j + 1] = key
+
+
+cdef void _quicksort_sell(list orders, Py_ssize_t low, Py_ssize_t high):
+    if low >= high:
+        return
+    if high - low < 16:
+        _insertion_sort_sell(orders, low, high)
+        return
+    cdef COrder pivot = <COrder>orders[(low + high) // 2]
+    cdef Py_ssize_t i = low
+    cdef Py_ssize_t j = high
+    cdef COrder temp
+    while i <= j:
+        while _compare_sell_orders(<COrder>orders[i], pivot) > 0:
+            i += 1
+        while _compare_sell_orders(<COrder>orders[j], pivot) < 0:
+            j -= 1
+        if i <= j:
+            temp = <COrder>orders[i]
+            orders[i] = orders[j]
+            orders[j] = temp
+            i += 1
+            j -= 1
+    if low < j:
+        _quicksort_sell(orders, low, j)
+    if i < high:
+        _quicksort_sell(orders, i, high)
+
+
+cdef void _c_sort_sell_orders(list orders):
+    """Sort a list of SELL orders in-place by Price-Time Priority using C comparisons."""
+    cdef Py_ssize_t n = len(orders)
+    if n <= 1:
+        return
+    if n < 32:
+        _insertion_sort_sell(orders, 0, n - 1)
+    else:
+        _quicksort_sell(orders, 0, n - 1)
+
+
+# ---------------------------------------------------------------------------
 # Limit Order Book & Matching Engine
 # ---------------------------------------------------------------------------
 cdef class MatchingEngine:
@@ -429,10 +808,11 @@ cdef class MatchingEngine:
     * **Day 6**: Multi-order matching via ``match_order()``.  A single incoming
       order sweeps across multiple compatible resting orders using strict
       price-time priority, producing one ``TradeResult`` per fill.
+    * **Day 7**: Best bid/ask inspection and order-book snapshots.
+    * **Day 8**: Matched-trade execution record generation and validation.
+    * **Day 9**: High-resolution performance benchmarking and non-crossing bypass.
 
     Not yet implemented (scheduled for later working days)
-    ------------------------------------------------------
-    * Ring-buffer zero-copy IPC integration.
     """
 
     cdef public unsigned long long _order_count
@@ -568,10 +948,18 @@ cdef class MatchingEngine:
         cdef Py_ssize_t n = len(self._bids)
         if n == 0:
             return []
-        cdef list active = [o for o in self._bids if (<COrder>o).remaining_quantity > 0]
-        if len(active) <= 1:
-            return list(active)
-        return sorted(active, key=_BUY_PRIORITY_KEY)
+        cdef list active = []
+        cdef Py_ssize_t i
+        cdef COrder ord_item
+        for i in range(n):
+            ord_item = <COrder>self._bids[i]
+            if ord_item.remaining_quantity > 0:
+                active.append(ord_item)
+        cdef Py_ssize_t active_len = len(active)
+        if active_len <= 1:
+            return active
+        _c_sort_buy_orders(active)
+        return active
 
     cpdef list get_prioritized_asks(self):
         """Return a new list copy of SELL orders sorted in Price-Time Priority order.
@@ -584,10 +972,18 @@ cdef class MatchingEngine:
         cdef Py_ssize_t n = len(self._asks)
         if n == 0:
             return []
-        cdef list active = [o for o in self._asks if (<COrder>o).remaining_quantity > 0]
-        if len(active) <= 1:
-            return list(active)
-        return sorted(active, key=_SELL_PRIORITY_KEY)
+        cdef list active = []
+        cdef Py_ssize_t i
+        cdef COrder ord_item
+        for i in range(n):
+            ord_item = <COrder>self._asks[i]
+            if ord_item.remaining_quantity > 0:
+                active.append(ord_item)
+        cdef Py_ssize_t active_len = len(active)
+        if active_len <= 1:
+            return active
+        _c_sort_sell_orders(active)
+        return active
 
     cpdef list get_bids_by_priority(self):
         """Alias for ``get_prioritized_bids()``."""
@@ -631,17 +1027,20 @@ cdef class MatchingEngine:
         Only considers active resting orders with remaining_quantity > 0.
         Returns ``None`` if the BUY book is empty or has no active orders.
         """
-        if not self._bids:
+        cdef Py_ssize_t n = len(self._bids)
+        if n == 0:
             return None
         cdef COrder best = None
         cdef COrder current
-        cdef Py_ssize_t i, n = len(self._bids)
+        cdef bint has_best = False
+        cdef Py_ssize_t i
         for i in range(n):
             current = <COrder>self._bids[i]
             if current.remaining_quantity == 0:
                 continue
-            if best is None or _compare_buy_orders(current, best) > 0:
+            if not has_best or _compare_buy_orders(current, best) > 0:
                 best = current
+                has_best = True
         return best
 
     cpdef COrder get_best_sell_order(self):
@@ -652,17 +1051,20 @@ cdef class MatchingEngine:
         Only considers active resting orders with remaining_quantity > 0.
         Returns ``None`` if the SELL book is empty or has no active orders.
         """
-        if not self._asks:
+        cdef Py_ssize_t n = len(self._asks)
+        if n == 0:
             return None
         cdef COrder best = None
         cdef COrder current
-        cdef Py_ssize_t i, n = len(self._asks)
+        cdef bint has_best = False
+        cdef Py_ssize_t i
         for i in range(n):
             current = <COrder>self._asks[i]
             if current.remaining_quantity == 0:
                 continue
-            if best is None or _compare_sell_orders(current, best) > 0:
+            if not has_best or _compare_sell_orders(current, best) > 0:
                 best = current
+                has_best = True
         return best
 
     # Aliases for best order retrieval
@@ -868,19 +1270,21 @@ cdef class MatchingEngine:
     # Spread inspection (Day 7)
     cpdef object get_spread(self):
         """Return the bid-ask spread (best ask price - best bid price) as a float, or None if either side is empty."""
-        cdef object best_buy = self.get_best_buy_price()
-        cdef object best_sell = self.get_best_sell_price()
+        cdef COrder best_buy = self.get_best_buy_order()
+        cdef COrder best_sell = self.get_best_sell_order()
         if best_buy is None or best_sell is None:
             return None
-        return round(best_sell - best_buy, 6)
+        cdef long long spread_cents = best_sell.price_cents - best_buy.price_cents
+        return round(spread_cents / 100.0, 6)
 
     cpdef object get_spread_cents(self):
         """Return the bid-ask spread in integer cents, or None if either side is empty."""
-        cdef object best_buy = self.get_best_buy_price_cents()
-        cdef object best_sell = self.get_best_sell_price_cents()
+        cdef COrder best_buy = self.get_best_buy_order()
+        cdef COrder best_sell = self.get_best_sell_order()
         if best_buy is None or best_sell is None:
             return None
-        return best_sell - best_buy
+        cdef long long spread_cents = best_sell.price_cents - best_buy.price_cents
+        return spread_cents
 
     cpdef object spread(self):
         """Alias for ``get_spread()``."""
@@ -893,9 +1297,11 @@ cdef class MatchingEngine:
         cdef COrder ba = self.get_best_sell_order()
         cdef object bid_price = bb.price if bb is not None else None
         cdef object ask_price = ba.price if ba is not None else None
-        cdef unsigned int bid_qty = self.get_best_bid_quantity(aggregate=True) if bb is not None else 0
-        cdef unsigned int ask_qty = self.get_best_ask_quantity(aggregate=True) if ba is not None else 0
-        cdef object sp = self.get_spread()
+        cdef unsigned int bid_qty = self.get_best_buy_quantity(aggregate=True) if bb is not None else 0
+        cdef unsigned int ask_qty = self.get_best_sell_quantity(aggregate=True) if ba is not None else 0
+        cdef object sp = None
+        if bb is not None and ba is not None:
+            sp = round((ba.price_cents - bb.price_cents) / 100.0, 6)
         return {
             "best_bid_price": bid_price,
             "best_bid_quantity": bid_qty,
@@ -908,13 +1314,164 @@ cdef class MatchingEngine:
         """Alias for ``get_top_of_book()``."""
         return self.get_top_of_book()
 
+    # Order-Book Snapshot interface (Week 3, Day 7)
+    cpdef dict get_order_book_snapshot(self, bint as_dict=False):
+        """Return a complete snapshot of the limit order book.
+
+        The snapshot accurately represents active BUY (bids) and SELL (asks)
+        orders in strict price-time priority:
+        - Bids are ordered from highest price to lowest price (FIFO on tie).
+        - Asks are ordered from lowest price to highest price (FIFO on tie).
+
+        To ensure mutation isolation, all orders returned in the snapshot
+        are independent copies (or plain dictionaries if ``as_dict=True``);
+        external callers cannot modify the internal state of the order book.
+
+        Parameters
+        ----------
+        as_dict : bint, default False
+            If True, order representations in 'bids' and 'asks' are plain dicts.
+            If False, they are independent COrder clone instances.
+
+        Returns
+        -------
+        dict
+            Order book snapshot dictionary with keys:
+            - 'bids': list of active BUY orders (highest to lowest price)
+            - 'asks': list of active SELL orders (lowest to highest price)
+            - 'buy_orders': alias to 'bids'
+            - 'sell_orders': alias to 'asks'
+            - 'bid_levels': aggregated [(price, quantity), ...] from highest to lowest
+            - 'ask_levels': aggregated [(price, quantity), ...] from lowest to highest
+            - 'best_bid': best BUY order copy or None if empty
+            - 'best_ask': best SELL order copy or None if empty
+            - 'best_bid_price': best BUY price (float) or None
+            - 'best_ask_price': best SELL price (float) or None
+            - 'best_bid_quantity': aggregate quantity at best bid (0 if empty)
+            - 'best_ask_quantity': aggregate quantity at best ask (0 if empty)
+            - 'spread': best_ask_price - best_bid_price (float) or None
+            - 'spread_cents': best_ask_cents - best_bid_cents (int) or None
+            - 'order_count': total orders accepted by engine
+            - 'bid_count': number of active resting BUY orders
+            - 'ask_count': number of active resting SELL orders
+        """
+        cdef list prioritized_bids = self.get_prioritized_bids()
+        cdef list prioritized_asks = self.get_prioritized_asks()
+        cdef list snap_bids = []
+        cdef list snap_asks = []
+        cdef list bid_levels = []
+        cdef list ask_levels = []
+        cdef Py_ssize_t i
+        cdef COrder o
+        cdef long long cur_cents = -1
+        cdef unsigned int cur_qty = 0
+
+        # Build bids snapshot and aggregated levels
+        for i in range(len(prioritized_bids)):
+            o = <COrder>prioritized_bids[i]
+            if as_dict:
+                snap_bids.append(o.as_dict())
+            else:
+                snap_bids.append(o.copy())
+            if o.price_cents == cur_cents:
+                cur_qty += o.remaining_quantity
+            else:
+                if cur_cents != -1:
+                    bid_levels.append((cur_cents / 100.0, cur_qty))
+                cur_cents = o.price_cents
+                cur_qty = o.remaining_quantity
+        if cur_cents != -1:
+            bid_levels.append((cur_cents / 100.0, cur_qty))
+
+        # Build asks snapshot and aggregated levels
+        cur_cents = -1
+        cur_qty = 0
+        for i in range(len(prioritized_asks)):
+            o = <COrder>prioritized_asks[i]
+            if as_dict:
+                snap_asks.append(o.as_dict())
+            else:
+                snap_asks.append(o.copy())
+            if o.price_cents == cur_cents:
+                cur_qty += o.remaining_quantity
+            else:
+                if cur_cents != -1:
+                    ask_levels.append((cur_cents / 100.0, cur_qty))
+                cur_cents = o.price_cents
+                cur_qty = o.remaining_quantity
+        if cur_cents != -1:
+            ask_levels.append((cur_cents / 100.0, cur_qty))
+
+        cdef COrder bb = self.get_best_buy_order()
+        cdef COrder ba = self.get_best_sell_order()
+        cdef object best_bid_obj = None
+        cdef object best_ask_obj = None
+        cdef object bid_price = None
+        cdef object ask_price = None
+        cdef unsigned int bid_qty = 0
+        cdef unsigned int ask_qty = 0
+        cdef object sp = None
+        cdef object sp_cents = None
+
+        if bb is not None:
+            bid_price = bb.price
+            bid_qty = self.get_best_buy_quantity(aggregate=True)
+            best_bid_obj = bb.as_dict() if as_dict else bb.copy()
+
+        if ba is not None:
+            ask_price = ba.price
+            ask_qty = self.get_best_sell_quantity(aggregate=True)
+            best_ask_obj = ba.as_dict() if as_dict else ba.copy()
+
+        if bb is not None and ba is not None:
+            sp_cents = ba.price_cents - bb.price_cents
+            sp = round((<long long>sp_cents) / 100.0, 6)
+
+        return {
+            "bids": snap_bids,
+            "asks": snap_asks,
+            "buy_orders": snap_bids,
+            "sell_orders": snap_asks,
+            "bid_levels": bid_levels,
+            "ask_levels": ask_levels,
+            "best_bid": best_bid_obj,
+            "best_ask": best_ask_obj,
+            "best_bid_price": bid_price,
+            "best_ask_price": ask_price,
+            "best_bid_quantity": bid_qty,
+            "best_ask_quantity": ask_qty,
+            "spread": sp,
+            "spread_cents": sp_cents,
+            "order_count": self._order_count,
+            "bid_count": len(snap_bids),
+            "ask_count": len(snap_asks),
+        }
+
+    cpdef dict get_snapshot(self, bint as_dict=False):
+        """Alias for ``get_order_book_snapshot(as_dict=as_dict)``."""
+        return self.get_order_book_snapshot(as_dict=as_dict)
+
+    cpdef dict snapshot(self, bint as_dict=False):
+        """Alias for ``get_order_book_snapshot(as_dict=as_dict)``."""
+        return self.get_order_book_snapshot(as_dict=as_dict)
+
+    cpdef dict get_book_snapshot(self, bint as_dict=False):
+        """Alias for ``get_order_book_snapshot(as_dict=as_dict)``."""
+        return self.get_order_book_snapshot(as_dict=as_dict)
+
+    cpdef dict order_book_snapshot(self, bint as_dict=False):
+        """Alias for ``get_order_book_snapshot(as_dict=as_dict)``."""
+        return self.get_order_book_snapshot(as_dict=as_dict)
+
     # Crossing price detection
     cpdef bint has_crossing_prices(self):
         """Return True if highest BUY price >= lowest SELL price.
 
         Returns False if either book side is empty, or if best BUY < best SELL.
         """
-        if not self._bids or not self._asks:
+        cdef Py_ssize_t n_bids = len(self._bids)
+        cdef Py_ssize_t n_asks = len(self._asks)
+        if n_bids == 0 or n_asks == 0:
             return False
         cdef COrder best_buy = self.get_best_buy_order()
         cdef COrder best_sell = self.get_best_sell_order()
@@ -979,7 +1536,7 @@ cdef class MatchingEngine:
                 f"Invalid side {side}: must be {_SIDE_BUY} (BUY) or {_SIDE_SELL} (SELL)"
             )
 
-        if price <= 0.0:
+        if price <= 0.0 or c_isnan(price) or c_isinf(price):
             raise ValueError(
                 f"Invalid price {price}: must be positive"
             )
@@ -989,16 +1546,17 @@ cdef class MatchingEngine:
                 "Invalid quantity 0: must be positive"
             )
 
-        cdef long long cents = price_to_cents(price)
+        cdef long long cents = _price_to_cents_c(price)
         self._sequence_counter += 1
 
-        cdef COrder order = COrder(
-            order_id=order_id,
-            side=side,
-            price_cents=cents,
-            quantity=quantity,
-            timestamp_ns=timestamp_ns,
-            sequence_num=self._sequence_counter,
+        cdef COrder order = _create_corder(
+            order_id,
+            side,
+            cents,
+            quantity,
+            quantity,
+            timestamp_ns,
+            self._sequence_counter,
         )
 
         if side == _SIDE_BUY:
@@ -1031,6 +1589,11 @@ cdef class MatchingEngine:
                 raise ValueError("Invalid quantity 0: must be positive")
             if ord_obj.remaining_quantity == 0:
                 raise ValueError("Invalid remaining_quantity 0: order is already fully filled")
+            if ord_obj.remaining_quantity > ord_obj.quantity:
+                raise ValueError(
+                    f"Invalid remaining_quantity {ord_obj.remaining_quantity}: "
+                    f"cannot exceed quantity {ord_obj.quantity}"
+                )
             self._sequence_counter += 1
             ord_obj.sequence_num = self._sequence_counter
             self._bids.append(ord_obj)
@@ -1094,6 +1657,11 @@ cdef class MatchingEngine:
                 raise ValueError("Invalid quantity 0: must be positive")
             if ord_obj.remaining_quantity == 0:
                 raise ValueError("Invalid remaining_quantity 0: order is already fully filled")
+            if ord_obj.remaining_quantity > ord_obj.quantity:
+                raise ValueError(
+                    f"Invalid remaining_quantity {ord_obj.remaining_quantity}: "
+                    f"cannot exceed quantity {ord_obj.quantity}"
+                )
             self._sequence_counter += 1
             ord_obj.sequence_num = self._sequence_counter
             self._asks.append(ord_obj)
@@ -1185,7 +1753,9 @@ cdef class MatchingEngine:
             If either book side is empty or prices do not cross.
         """
         # Guard: both sides must be non-empty
-        if not self._bids or not self._asks:
+        cdef Py_ssize_t n_bids = len(self._bids)
+        cdef Py_ssize_t n_asks = len(self._asks)
+        if n_bids == 0 or n_asks == 0:
             return None
 
         cdef unsigned long long t_entry = 0
@@ -1211,6 +1781,9 @@ cdef class MatchingEngine:
         else:
             exec_qty = best_sell.remaining_quantity
 
+        if exec_qty == 0:
+            return None
+
         # Execution price: resting SELL order's price (lowest ask / maker price)
         cdef long long exec_price_cents = best_sell.price_cents
 
@@ -1221,32 +1794,229 @@ cdef class MatchingEngine:
         # Capture post-fill remaining quantities for the trade result
         cdef unsigned int buy_rem = best_buy.remaining_quantity
         cdef unsigned int sell_rem = best_sell.remaining_quantity
+        cdef unsigned long long buy_id = best_buy.order_id
+        cdef unsigned long long sell_id = best_sell.order_id
 
-        # Remove fully filled orders from the book; leave partial fills in place
-        if best_buy.remaining_quantity == 0:
-            self._bids.remove(best_buy)
+        # Remove fully filled orders via compaction scan
+        # (eliminates O(N) linear-search + memmove of list.remove)
+        cdef Py_ssize_t _pm_j, _pm_n
+        cdef list _pm_remaining
+        cdef COrder _pm_scan
+        if buy_rem == 0:
+            _pm_n = len(self._bids)
+            _pm_remaining = []
+            for _pm_j in range(_pm_n):
+                _pm_scan = <COrder>self._bids[_pm_j]
+                if _pm_scan.remaining_quantity > 0:
+                    _pm_remaining.append(_pm_scan)
+            self._bids[:] = _pm_remaining
 
-        if best_sell.remaining_quantity == 0:
-            self._asks.remove(best_sell)
+        if sell_rem == 0:
+            _pm_n = len(self._asks)
+            _pm_remaining = []
+            for _pm_j in range(_pm_n):
+                _pm_scan = <COrder>self._asks[_pm_j]
+                if _pm_scan.remaining_quantity > 0:
+                    _pm_remaining.append(_pm_scan)
+            self._asks[:] = _pm_remaining
 
-        cdef TradeResult res_trade = TradeResult(
-            buy_order_id=best_buy.order_id,
-            sell_order_id=best_sell.order_id,
-            executed_quantity=exec_qty,
-            execution_price_cents=exec_price_cents,
-            buy_remaining_quantity=buy_rem,
-            sell_remaining_quantity=sell_rem,
-            entry_timestamp_ns=t_entry,
+        cdef TradeResult res_trade = _create_trade_result(
+            buy_id,
+            sell_id,
+            exec_qty,
+            exec_price_cents,
+            buy_rem,
+            sell_rem,
         )
+
         if self.track_timestamps:
             t_exit = time.perf_counter_ns()
             res_trade.set_timestamps(t_entry, t_exit)
             self.last_latency_ns = res_trade.latency_ns
             self.total_matching_latency_ns += res_trade.latency_ns
             self.matching_events_count += 1
+
         return res_trade
 
-    # ---- multi-order matching (Week 2, Day 6) -----------------------------
+    # ---- multi-order matching (Week 2 Day 6 / Week 3 Day 3 refactor) ------
+
+    cdef int _c_match_loop(
+        self,
+        unsigned long long order_id,
+        int side,
+        long long incoming_price_cents,
+        unsigned int quantity,
+        unsigned long long timestamp_ns,
+        unsigned long long incoming_seq,
+        CTradeRecord *out_buf,
+        Py_ssize_t buf_capacity,
+        unsigned int *out_remaining,
+    ) except -1:
+        """C-level matching loop: zero Python object allocation inside the loop.
+
+        Week 3 Day 3 optimisation
+        -------------------------
+        Replaces the former inline loop inside match_order.  Writes fill
+        records directly into a pre-allocated CTradeRecord C array supplied
+        by the caller.  Returns the number of fills recorded.
+
+        All arithmetic is on statically typed C integers:
+        * remaining_quantity decremented via unsigned C subtraction.
+        * price crossing tested with integer cent comparison.
+        * No TradeResult / COrder heap allocation in the inner loop.
+
+        Book compaction (removing zero-quantity resting orders) is deferred
+        to after the loop and is done in a single O(N) compaction pass.
+
+        Parameters
+        ----------
+        order_id            : id of the incoming order
+        side                : _SIDE_BUY or _SIDE_SELL
+        incoming_price_cents: already-converted integer price
+        quantity            : original order quantity
+        timestamp_ns        : arrival timestamp
+        incoming_seq        : engine sequence number assigned before call
+        out_buf             : caller-allocated CTradeRecord array
+        buf_capacity        : max fills that fit in out_buf
+        out_remaining       : written with remaining qty after matching
+
+        Returns
+        -------
+        int : number of fills written into out_buf  (-1 on exception)
+        """
+        cdef unsigned int incoming_remaining = quantity
+        cdef list opposite_sorted
+        cdef COrder resting
+        cdef COrder new_order
+        cdef COrder scan_ord
+        cdef unsigned int exec_qty
+        cdef long long exec_price_cents
+        cdef Py_ssize_t i, n, j, total_orders, num_filled
+        cdef list remaining_orders
+        cdef int fill_count = 0
+
+        if side == _SIDE_BUY:
+            # ---- Incoming BUY sweeps resting SELLs (ascending price) ----
+            if self._asks:
+                opposite_sorted = []
+                total_orders = len(self._asks)
+                for i in range(total_orders):
+                    resting = <COrder>self._asks[i]
+                    if resting.remaining_quantity > 0 and incoming_price_cents >= resting.price_cents:
+                        opposite_sorted.append(resting)
+                n = len(opposite_sorted)
+                if n > 1:
+                    _c_sort_sell_orders(opposite_sorted)
+                num_filled = 0
+                for i in range(n):
+                    if incoming_remaining == 0:
+                        break
+                    if fill_count >= buf_capacity:
+                        break
+                    resting = <COrder>opposite_sorted[i]
+                    # Fill quantity: min of remaining quantities
+                    if incoming_remaining <= resting.remaining_quantity:
+                        exec_qty = incoming_remaining
+                    else:
+                        exec_qty = resting.remaining_quantity
+                    if exec_qty == 0:
+                        continue
+                    exec_price_cents = resting.price_cents  # maker price
+                    # Decrement – pure C unsigned arithmetic, no underflow
+                    incoming_remaining = incoming_remaining - exec_qty
+                    resting.remaining_quantity = resting.remaining_quantity - exec_qty
+                    # Write fill record directly into C buffer (no Python alloc)
+                    out_buf[fill_count].buy_order_id = order_id
+                    out_buf[fill_count].sell_order_id = resting.order_id
+                    out_buf[fill_count].executed_quantity = exec_qty
+                    out_buf[fill_count].execution_price_cents = exec_price_cents
+                    out_buf[fill_count].buy_remaining_quantity = incoming_remaining
+                    out_buf[fill_count].sell_remaining_quantity = resting.remaining_quantity
+                    fill_count += 1
+                    if resting.remaining_quantity == 0:
+                        num_filled += 1
+
+                # Single-pass compaction: remove fully filled SELL resting orders
+                if num_filled > 0:
+                    total_orders = len(self._asks)
+                    remaining_orders = []
+                    for j in range(total_orders):
+                        scan_ord = <COrder>self._asks[j]
+                        if scan_ord.remaining_quantity > 0:
+                            remaining_orders.append(scan_ord)
+                    self._asks[:] = remaining_orders
+
+            # Residual incoming BUY rests in the bid book
+            if incoming_remaining > 0:
+                new_order = _create_corder(
+                    order_id, _SIDE_BUY, incoming_price_cents,
+                    quantity, incoming_remaining, timestamp_ns, incoming_seq,
+                )
+                self._bids.append(new_order)
+                self._order_count += 1
+
+        else:
+            # ---- Incoming SELL sweeps resting BUYs (descending price) ---
+            if self._bids:
+                opposite_sorted = []
+                total_orders = len(self._bids)
+                for i in range(total_orders):
+                    resting = <COrder>self._bids[i]
+                    if resting.remaining_quantity > 0 and incoming_price_cents <= resting.price_cents:
+                        opposite_sorted.append(resting)
+                n = len(opposite_sorted)
+                if n > 1:
+                    _c_sort_buy_orders(opposite_sorted)
+                num_filled = 0
+                for i in range(n):
+                    if incoming_remaining == 0:
+                        break
+                    if fill_count >= buf_capacity:
+                        break
+                    resting = <COrder>opposite_sorted[i]
+                    # Fill quantity
+                    if incoming_remaining <= resting.remaining_quantity:
+                        exec_qty = incoming_remaining
+                    else:
+                        exec_qty = resting.remaining_quantity
+                    if exec_qty == 0:
+                        continue
+                    exec_price_cents = resting.price_cents  # maker price
+                    incoming_remaining = incoming_remaining - exec_qty
+                    resting.remaining_quantity = resting.remaining_quantity - exec_qty
+                    # Write fill record directly into C buffer
+                    out_buf[fill_count].buy_order_id = resting.order_id
+                    out_buf[fill_count].sell_order_id = order_id
+                    out_buf[fill_count].executed_quantity = exec_qty
+                    out_buf[fill_count].execution_price_cents = exec_price_cents
+                    out_buf[fill_count].buy_remaining_quantity = resting.remaining_quantity
+                    out_buf[fill_count].sell_remaining_quantity = incoming_remaining
+                    fill_count += 1
+                    if resting.remaining_quantity == 0:
+                        num_filled += 1
+
+                # Single-pass compaction: remove fully filled BUY resting orders
+                if num_filled > 0:
+                    total_orders = len(self._bids)
+                    remaining_orders = []
+                    for j in range(total_orders):
+                        scan_ord = <COrder>self._bids[j]
+                        if scan_ord.remaining_quantity > 0:
+                            remaining_orders.append(scan_ord)
+                    self._bids[:] = remaining_orders
+
+            # Residual incoming SELL rests in the ask book
+            if incoming_remaining > 0:
+                new_order = _create_corder(
+                    order_id, _SIDE_SELL, incoming_price_cents,
+                    quantity, incoming_remaining, timestamp_ns, incoming_seq,
+                )
+                self._asks.append(new_order)
+                self._order_count += 1
+
+        out_remaining[0] = incoming_remaining
+        return fill_count
+
 
     cpdef list match_order(
         self,
@@ -1258,206 +2028,155 @@ cdef class MatchingEngine:
     ):
         """Match a single incoming order against multiple compatible resting orders.
 
-        Multi-order matching algorithm (Day 6)
-        ---------------------------------------
+        Multi-order matching algorithm (Day 6 / Week 3 Day 3 / Day 9 optimised)
+        -------------------------------------------------------------------------
         1. Validate the incoming order (side, price, quantity).
-        2. Convert the incoming price to integer cents.
-        3. Sort the opposite-side book by price-time priority (one sort per call).
-        4. Iterate through the sorted opposite-side orders in priority order:
-           a. Check price compatibility:
-              - Incoming BUY: ``incoming_price_cents >= resting_sell.price_cents``
-              - Incoming SELL: ``incoming_price_cents <= resting_buy.price_cents``
-           b. Compute ``exec_qty = min(incoming_remaining, resting.remaining_quantity)``.
-           c. Decrement both remaining quantities by ``exec_qty``.
-           d. Execution price = resting order's ``price_cents`` (maker price).
-           e. Produce a ``TradeResult`` for this fill.
-           f. If the resting order is fully filled, mark it for removal.
-           g. If the incoming order is fully filled, stop.
-        5. Remove all fully filled resting orders from the book.
-        6. If the incoming order has remaining quantity, add it to the
-           appropriate book side with its original arrival priority.
+        2. Convert the incoming float price to integer cents via C-level helper.
+        3. Fast non-crossing bypass: if the opposite book is empty or the best
+           opposite price does not cross the incoming limit, insert the order
+           passively with zero allocation and return an empty list.
+        4. Filter and sort eligible resting orders by price-time priority (only
+           orders whose price crosses the incoming limit are considered).
+        5. Delegate the hot matching loop to ``_c_match_loop``, which writes
+           fill records directly into a stack or heap C buffer with no Python
+           object allocation inside the loop.
+        6. Convert C fill records to TradeResult PyObjects in a single pass
+           after the loop (boundary conversion).
         7. Return the list of ``TradeResult`` records in execution order.
 
         Execution price policy
         ----------------------
-        Each fill uses the **resting order's price** (maker price), which is the
-        standard exchange convention.  When an incoming BUY sweeps across SELL
-        orders at different price levels, each fill records the SELL order's price.
-        When an incoming SELL sweeps across BUY orders, each fill records the
-        BUY order's price.
+        Each fill uses the **resting order's price** (maker price):
+        * Incoming BUY sweeping SELL orders -> each fill uses the SELL price.
+        * Incoming SELL sweeping BUY orders -> each fill uses the BUY price.
 
         Parameters
         ----------
         order_id : unsigned long long
-            Unique order identifier for the incoming order.
-        side : int
-            ``1`` (BUY) or ``2`` (SELL).
+        side : int  (``1`` BUY, ``2`` SELL)
         price : double
-            Dollar price of the incoming order.
-        quantity : unsigned int
-            Number of shares/contracts. Must be > 0.
+        quantity : unsigned int  (must be > 0)
         timestamp_ns : unsigned long long
-            Arrival timestamp in nanoseconds.
 
         Returns
         -------
         list[TradeResult]
-            A list of ``TradeResult`` objects, one per fill, in execution order.
-            Empty list if no fills occurred (opposite book empty or no
-            compatible prices).
 
         Raises
         ------
-        ValueError
-            If side, price, or quantity is invalid.
+        ValueError  if side, price, or quantity is invalid.
         """
-        # --- validation (same rules as submit_order) ---
+        # ---- validation ------------------------------------------------
         if side != _SIDE_BUY and side != _SIDE_SELL:
             raise ValueError(
                 f"Invalid side {side}: must be {_SIDE_BUY} (BUY) or {_SIDE_SELL} (SELL)"
             )
-        if price <= 0.0:
-            raise ValueError(
-                f"Invalid price {price}: must be positive"
-            )
+        if price <= 0.0 or c_isnan(price) or c_isinf(price):
+            raise ValueError(f"Invalid price {price}: must be positive")
         if quantity == 0:
-            raise ValueError(
-                "Invalid quantity 0: must be positive"
-            )
+            raise ValueError("Invalid quantity 0: must be positive")
 
-        cdef long long incoming_price_cents = price_to_cents(price)
+        # C-level price conversion (no Python round() call)
+        cdef long long incoming_price_cents = _price_to_cents_c(price)
         cdef unsigned int incoming_remaining = quantity
         cdef unsigned long long t_entry = 0
         cdef unsigned long long t_exit = 0
         cdef unsigned long long t_lat = 0
+
         if self.track_timestamps:
             t_entry = time.perf_counter_ns()
 
-        # Assign a sequence number to the incoming order now so that if it
-        # ends up resting in the book it preserves its original arrival order.
+        # Sequence number assigned before the loop so residual orders
+        # preserve their original arrival priority (no re-queue).
         self._sequence_counter += 1
         cdef unsigned long long incoming_seq = self._sequence_counter
 
-        cdef list trades = []
-        cdef list opposite_sorted
-        cdef list to_remove = []
-        cdef COrder resting
+        # Fast non-crossing bypass (Week 4, Day 9 optimisation):
+        # If the opposite book is empty, or the best opposite price does not cross
+        # the incoming limit price, no match is possible. Insert the order directly
+        # without sorting or buffer allocation.
+        cdef COrder best_opp
         cdef COrder new_order
-        cdef unsigned int exec_qty
-        cdef long long exec_price_cents
-        cdef Py_ssize_t i, n
-
         if side == _SIDE_BUY:
-            # Incoming BUY matches against resting SELLs (lowest price first)
             if not self._asks:
-                # No resting sells; add incoming to bids
-                pass
-            else:
-                opposite_sorted = self.get_prioritized_asks()
-                n = len(opposite_sorted)
-                for i in range(n):
-                    if incoming_remaining == 0:
-                        break
-                    resting = <COrder>opposite_sorted[i]
-                    # Price compatibility: BUY price >= SELL price
-                    if incoming_price_cents < resting.price_cents:
-                        break  # sorted by price asc; no further matches possible
-                    # Compute fill quantity
-                    if incoming_remaining <= resting.remaining_quantity:
-                        exec_qty = incoming_remaining
-                    else:
-                        exec_qty = resting.remaining_quantity
-                    # Execution price: resting SELL's price (maker price)
-                    exec_price_cents = resting.price_cents
-                    # Update quantities
-                    incoming_remaining = incoming_remaining - exec_qty
-                    resting.remaining_quantity = resting.remaining_quantity - exec_qty
-                    # Record trade
-                    trades.append(TradeResult(
-                        buy_order_id=order_id,
-                        sell_order_id=resting.order_id,
-                        executed_quantity=exec_qty,
-                        execution_price_cents=exec_price_cents,
-                        buy_remaining_quantity=incoming_remaining,
-                        sell_remaining_quantity=resting.remaining_quantity,
-                    ))
-                    # Mark fully filled resting orders for removal
-                    if resting.remaining_quantity == 0:
-                        to_remove.append(resting)
-
-                # Remove fully filled resting SELL orders from the book
-                for i in range(len(to_remove)):
-                    self._asks.remove(<COrder>to_remove[i])
-
-            # If incoming BUY has remaining quantity, add to bids book
-            if incoming_remaining > 0:
-                new_order = COrder(
-                    order_id=order_id,
-                    side=_SIDE_BUY,
-                    price_cents=incoming_price_cents,
-                    quantity=quantity,
-                    timestamp_ns=timestamp_ns,
-                    sequence_num=incoming_seq,
+                new_order = _create_corder(
+                    order_id, _SIDE_BUY, incoming_price_cents,
+                    quantity, quantity, timestamp_ns, incoming_seq,
                 )
-                new_order.remaining_quantity = incoming_remaining
                 self._bids.append(new_order)
                 self._order_count += 1
-
-        else:
-            # Incoming SELL matches against resting BUYs (highest price first)
-            if not self._bids:
-                # No resting buys; add incoming to asks
-                pass
-            else:
-                opposite_sorted = self.get_prioritized_bids()
-                n = len(opposite_sorted)
-                for i in range(n):
-                    if incoming_remaining == 0:
-                        break
-                    resting = <COrder>opposite_sorted[i]
-                    # Price compatibility: SELL price <= BUY price
-                    if incoming_price_cents > resting.price_cents:
-                        break  # sorted by price desc; no further matches possible
-                    # Compute fill quantity
-                    if incoming_remaining <= resting.remaining_quantity:
-                        exec_qty = incoming_remaining
-                    else:
-                        exec_qty = resting.remaining_quantity
-                    # Execution price: resting BUY's price (maker price)
-                    exec_price_cents = resting.price_cents
-                    # Update quantities
-                    incoming_remaining = incoming_remaining - exec_qty
-                    resting.remaining_quantity = resting.remaining_quantity - exec_qty
-                    # Record trade
-                    trades.append(TradeResult(
-                        buy_order_id=resting.order_id,
-                        sell_order_id=order_id,
-                        executed_quantity=exec_qty,
-                        execution_price_cents=exec_price_cents,
-                        buy_remaining_quantity=resting.remaining_quantity,
-                        sell_remaining_quantity=incoming_remaining,
-                    ))
-                    # Mark fully filled resting orders for removal
-                    if resting.remaining_quantity == 0:
-                        to_remove.append(resting)
-
-                # Remove fully filled resting BUY orders from the book
-                for i in range(len(to_remove)):
-                    self._bids.remove(<COrder>to_remove[i])
-
-            # If incoming SELL has remaining quantity, add to asks book
-            if incoming_remaining > 0:
-                new_order = COrder(
-                    order_id=order_id,
-                    side=_SIDE_SELL,
-                    price_cents=incoming_price_cents,
-                    quantity=quantity,
-                    timestamp_ns=timestamp_ns,
-                    sequence_num=incoming_seq,
+                return []
+            best_opp = self.get_best_sell_order()
+            if best_opp is None or incoming_price_cents < best_opp.price_cents:
+                new_order = _create_corder(
+                    order_id, _SIDE_BUY, incoming_price_cents,
+                    quantity, quantity, timestamp_ns, incoming_seq,
                 )
-                new_order.remaining_quantity = incoming_remaining
+                self._bids.append(new_order)
+                self._order_count += 1
+                return []
+        else:
+            if not self._bids:
+                new_order = _create_corder(
+                    order_id, _SIDE_SELL, incoming_price_cents,
+                    quantity, quantity, timestamp_ns, incoming_seq,
+                )
                 self._asks.append(new_order)
                 self._order_count += 1
+                return []
+            best_opp = self.get_best_buy_order()
+            if best_opp is None or incoming_price_cents > best_opp.price_cents:
+                new_order = _create_corder(
+                    order_id, _SIDE_SELL, incoming_price_cents,
+                    quantity, quantity, timestamp_ns, incoming_seq,
+                )
+                self._asks.append(new_order)
+                self._order_count += 1
+                return []
+
+        # ---- delegate to C-level matching loop -------------------------
+        # Hybrid stack / heap allocation: use a fast stack buffer for up to 64
+        # fills to avoid malloc overhead on typical crossing orders.
+        cdef CTradeRecord stack_buf[64]
+        cdef CTradeRecord *fill_buf = stack_buf
+        cdef bint heap_allocated = False
+        cdef Py_ssize_t MAX_FILLS = max(len(self._bids), len(self._asks), 1) + 1
+        if MAX_FILLS > 64:
+            fill_buf = <CTradeRecord *>malloc(MAX_FILLS * sizeof(CTradeRecord))
+            if fill_buf == NULL:
+                raise MemoryError("Failed to allocate fill buffer")
+            heap_allocated = True
+
+        cdef unsigned int remaining_after = 0
+        cdef int fill_count = 0
+        cdef list trades = []
+        cdef Py_ssize_t k
+        try:
+            fill_count = self._c_match_loop(
+                order_id,
+                side,
+                incoming_price_cents,
+                quantity,
+                timestamp_ns,
+                incoming_seq,
+                fill_buf,
+                MAX_FILLS,
+                &remaining_after,
+            )
+
+            # ---- boundary: convert C records -> Python TradeResult objects
+            for k in range(fill_count):
+                trades.append(_create_trade_result(
+                    fill_buf[k].buy_order_id,
+                    fill_buf[k].sell_order_id,
+                    fill_buf[k].executed_quantity,
+                    fill_buf[k].execution_price_cents,
+                    fill_buf[k].buy_remaining_quantity,
+                    fill_buf[k].sell_remaining_quantity,
+                ))
+        finally:
+            if heap_allocated and fill_buf != NULL:
+                free(fill_buf)
 
         if self.track_timestamps:
             t_exit = time.perf_counter_ns()
