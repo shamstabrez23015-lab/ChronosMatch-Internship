@@ -359,4 +359,3 @@ class TestOrderAdapterAuditWorkerIntegration:
         order = Order(10, 1000, 50.0, 5, SYMBOLS["AAPL"], int(Side.BUY), int(OrderType.LIMIT))
         adapter.dispatch_order(order)
         assert len(adapter.execution_events) == 1
-

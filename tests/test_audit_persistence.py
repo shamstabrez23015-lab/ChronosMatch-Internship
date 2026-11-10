@@ -638,4 +638,3 @@ class TestAuditPersistenceReliabilityAndRecovery:
         assert records[0].order_id == 9502
 
         worker.shutdown()
-

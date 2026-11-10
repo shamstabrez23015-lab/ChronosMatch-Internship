@@ -1606,4 +1606,3 @@ class TestEndToEndOrderFlowFirehoseToEngineBoundary:
         assert ev.quantity == 100
         assert ev.latency_ns >= 0
         assert ev.entry_timestamp_ns <= ev.exit_timestamp_ns
-

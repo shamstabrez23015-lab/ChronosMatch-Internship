@@ -28,14 +28,34 @@ def main() -> None:
         help="Dashboard refresh interval in milliseconds (default: 100ms)",
     )
     parser.add_argument(
+        "--trade-latency-unit",
+        type=str,
+        choices=["us", "ns"],
+        default="us",
+        help="Trade execution latency display unit: 'us' or 'ns' (default: 'us')",
+    )
+    parser.add_argument(
+        "--whale-threshold",
+        type=int,
+        default=2,
+        help="Whale order minimum price levels sweep threshold (default: 2)",
+    )
+    parser.add_argument(
         "--non-interactive",
         action="store_true",
         help="Print dashboard frame to stdout without curses (useful for headless/CI environments)",
     )
     args = parser.parse_args()
 
-    config = DashboardConfig(refresh_interval_ms=args.refresh_ms)
-    dashboard = TerminalDashboard(config=config)
+    config = DashboardConfig(
+        refresh_interval_ms=args.refresh_ms,
+        trade_latency_unit=args.trade_latency_unit,
+        whale_min_levels=args.whale_threshold,
+    )
+    dashboard = TerminalDashboard(
+        config=config,
+        trade_latency_unit=args.trade_latency_unit,
+    )
 
     if args.non_interactive:
         for line in dashboard.get_display_lines(rows=40, cols=100):

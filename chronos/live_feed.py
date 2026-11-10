@@ -14,7 +14,7 @@ from chronos.matching_engine import MatchingEngine
 from chronos.ring_buffer import MmapRingBuffer
 from chronos.adapter import OrderAdapter
 from chronos.consumer import ZeroCopyConsumer
-from chronos.dashboard import TerminalDashboard, _extract_order_id
+from chronos.dashboard import TerminalDashboard, _extract_order_id, detect_whale_order, WhaleOrderEvent
 
 
 class LiveFeedBridge:
@@ -103,18 +103,56 @@ class LiveFeedBridge:
             else:
                 self._seen_order_ids.add(order_id)
 
+        trades = []
+        match_duration_ns = None
         if not is_duplicate:
             if self.adapter is not None:
                 try:
                     self.adapter.stats.total_orders_read += 1
-                    self.adapter.dispatch_raw_order(raw_order)
+                    t_start = self.ns_clock()
+                    trades = self.adapter.dispatch_raw_order(raw_order)
+                    t_end = self.ns_clock()
+                    match_duration_ns = max(0, t_end - t_start)
                 except Exception:
-                    pass
+                    trades = []
+                    match_duration_ns = None
             elif self.engine is not None:
                 pass
 
         if self.dashboard is not None:
             self.dashboard.record_order_processed(raw_order)
+            if trades and hasattr(self.dashboard, "record_trade_execution"):
+                lat_us = (match_duration_ns / 1000.0) if match_duration_ns is not None else None
+                for trade in trades:
+                    # Support Faizan's future timestamp fields if present on trade objects
+                    t_lat = getattr(trade, "execution_latency_us", None)
+                    if t_lat is None and hasattr(trade, "latency_us"):
+                        t_lat = getattr(trade, "latency_us")
+                    if t_lat is None and hasattr(trade, "latency_ns"):
+                        t_lat = getattr(trade, "latency_ns") / 1000.0
+                    if t_lat is None:
+                        t_lat = lat_us
+                    self.dashboard.record_trade_execution(latency_us=t_lat)
+
+        # ---- Whale order detection ----
+        if self.dashboard is not None and trades:
+            _raw_side = None
+            try:
+                if isinstance(raw_order, dict):
+                    _raw_side = raw_order.get("side")
+                elif hasattr(raw_order, "side"):
+                    _raw_side = raw_order.side
+                elif isinstance(raw_order, (tuple, list)) and len(raw_order) >= 6:
+                    _raw_side = raw_order[5]
+            except Exception:
+                _raw_side = None
+            _whale = detect_whale_order(
+                order_id=order_id if order_id is not None else 0,
+                trades=trades,
+                side=_raw_side,
+            )
+            if _whale is not None and hasattr(self.dashboard, "record_whale_order"):
+                self.dashboard.record_whale_order(_whale)
 
     def sync_to_dashboard(self) -> None:
         """Synchronize engine order book state into the dashboard."""
@@ -133,6 +171,11 @@ class LiveFeedBridge:
         self.dashboard.is_sample_data = False
 
         if self.adapter is not None:
+            if hasattr(self.dashboard, "update_trades_processed"):
+                try:
+                    self.dashboard.update_trades_processed(self.adapter.stats.total_trades_generated)
+                except Exception:
+                    pass
             try:
                 self.dashboard.update_trade_latency(
                     self.adapter.get_trade_latency_snapshot()
@@ -168,10 +211,12 @@ class LiveFeedBridge:
         eng_bid_cnt = self.engine.bid_count() if self.engine is not None else 0
         eng_ask_cnt = self.engine.ask_count() if self.engine is not None else 0
 
+        trades_cnt = self.adapter.stats.total_trades_generated if self.adapter is not None else 0
         return {
             "is_connected": self.is_connected,
             "is_running": self.is_running,
             "orders_processed": self._orders_processed,
+            "trades_processed": trades_cnt,
             "unique_orders_seen": len(self._seen_order_ids),
             "engine_order_count": eng_order_cnt,
             "engine_bid_count": eng_bid_cnt,

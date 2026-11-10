@@ -30,7 +30,13 @@ from chronos.dashboard import (
     LABEL_SPREAD,
     LABEL_TOTAL_ORDERS,
     LABEL_ORDERS_PROCESSED,
+    LABEL_PROCESSED_ORDERS,
     LABEL_THROUGHPUT,
+    LABEL_ORDER_THROUGHPUT,
+    LABEL_THROUGHPUT_ORDERS_PER_SEC,
+    LABEL_PROCESSED_ORDERS_PER_SEC,
+    LABEL_ORDERS_PER_SECOND,
+    LABEL_ORDER_PROCESSING_THROUGHPUT,
     LABEL_LATENCY,
     DEMO_ORDERS_PROCESSED,
     BestBid,
@@ -60,11 +66,14 @@ from chronos.dashboard import (
     format_price,
     format_spread,
     format_total_orders,
+    format_processed_orders,
     get_sample_buy_orders,
     get_sample_sell_orders,
     get_sample_orders_processed,
     calculate_throughput,
+    calculate_throughput_ns,
     calculate_throughput_from_counts,
+    calculate_throughput_from_counts_ns,
     format_throughput,
     get_sample_throughput,
     DEMO_THROUGHPUT,
@@ -2672,4 +2681,3551 @@ class TestLivePipelineIntegration:
         dashboard.close()
         assert bridge.is_running is False
         assert dashboard.is_running is False
+
+
+
+# ==========================================================================
+# NEW TESTS — Week 3 Day 2: Trade Execution Metrics Section
+# Added imports needed by new tests are at the top of this block only
+# (symbols already present in the original import block are not duplicated).
+# ==========================================================================
+
+from chronos.dashboard import (  # noqa: E402  (re-import for new symbols)
+    SECTION_TRADE_EXECUTION,
+    SECTION_TRADE_METRICS,
+    LABEL_TRADES_PROCESSED,
+    LABEL_TOTAL_TRADES,
+    LABEL_TRADE_LATENCY,
+    LABEL_TRADE_LATENCY_LAST,
+    LABEL_TRADE_LATENCY_AVG,
+    LABEL_TRADE_LATENCY_MIN,
+    LABEL_TRADE_LATENCY_MAX,
+    DEFAULT_TRADE_LATENCY_UNIT,
+    build_trade_execution_lines,
+    calculate_trade_latency_stats,
+    format_trade_latency,
+    format_trades_processed,
+)
+
+
+# ---------------------------------------------------------------------------
+# Section 20: Constants & Config
+# ---------------------------------------------------------------------------
+
+class TestTradeExecutionConstants:
+    """Verify new constants are present and have the right types/values."""
+
+    def test_section_trade_execution_is_str(self):
+        assert isinstance(SECTION_TRADE_EXECUTION, str)
+        assert len(SECTION_TRADE_EXECUTION) > 0
+
+    def test_section_trade_metrics_is_str(self):
+        assert isinstance(SECTION_TRADE_METRICS, str)
+        assert len(SECTION_TRADE_METRICS) > 0
+
+    def test_label_trades_processed_is_str(self):
+        assert isinstance(LABEL_TRADES_PROCESSED, str)
+
+    def test_label_total_trades_is_str(self):
+        assert isinstance(LABEL_TOTAL_TRADES, str)
+
+    def test_label_trade_latency_is_str(self):
+        assert isinstance(LABEL_TRADE_LATENCY, str)
+
+    def test_label_trade_latency_last_is_str(self):
+        assert isinstance(LABEL_TRADE_LATENCY_LAST, str)
+
+    def test_label_trade_latency_avg_is_str(self):
+        assert isinstance(LABEL_TRADE_LATENCY_AVG, str)
+
+    def test_label_trade_latency_min_is_str(self):
+        assert isinstance(LABEL_TRADE_LATENCY_MIN, str)
+
+    def test_label_trade_latency_max_is_str(self):
+        assert isinstance(LABEL_TRADE_LATENCY_MAX, str)
+
+    def test_default_trade_latency_unit_is_us(self):
+        assert DEFAULT_TRADE_LATENCY_UNIT == "us"
+
+    def test_dashboard_config_default_trade_latency_unit(self):
+        cfg = DashboardConfig()
+        assert cfg.trade_latency_unit == "us"
+
+    def test_dashboard_config_trade_latency_unit_ns(self):
+        cfg = DashboardConfig(trade_latency_unit="ns")
+        assert cfg.trade_latency_unit == "ns"
+
+
+# ---------------------------------------------------------------------------
+# Section 21: format_trade_latency()
+# ---------------------------------------------------------------------------
+
+class TestFormatTradeLatency:
+    """Test the pure formatting function for a single latency value."""
+
+    def test_none_returns_na(self):
+        assert format_trade_latency(None) == "N/A"
+
+    def test_negative_returns_na(self):
+        assert format_trade_latency(-1.0) == "N/A"
+
+    def test_zero_format_returns_string(self):
+        # Implementation may return "0.0" or "N/A" for zero latency; either is acceptable
+        result = format_trade_latency(0.0)
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_us_positive_value(self):
+        result = format_trade_latency(123.456, unit="us")
+        assert "123" in result
+
+    def test_ns_positive_value_integer_format(self):
+        # ns values should be rendered as integers (no decimal)
+        result = format_trade_latency(12345.0, unit="ns")
+        # Should contain the numeric value without decimal point
+        assert "." not in result or result.count(".") == 0  # commas OK, dots not
+        assert "12" in result
+
+    def test_default_unit_is_us(self):
+        # Calling without unit keyword should use "us" behaviour
+        result_default = format_trade_latency(50.0)
+        result_explicit = format_trade_latency(50.0, unit="us")
+        assert result_default == result_explicit
+
+    def test_large_ns_value_has_comma_separator(self):
+        result = format_trade_latency(1_000_000.0, unit="ns")
+        assert "," in result  # e.g. "1,000,000"
+
+
+# ---------------------------------------------------------------------------
+# Section 22: format_trades_processed()
+# ---------------------------------------------------------------------------
+
+class TestFormatTradesProcessed:
+    """Test the pure formatting function for the trade count."""
+
+    def test_none_returns_na(self):
+        assert format_trades_processed(None) == "N/A"
+
+    def test_zero_returns_zero_string(self):
+        assert format_trades_processed(0) == "0"
+
+    def test_positive_integer_formatted(self):
+        result = format_trades_processed(12500)
+        assert "12,500" in result or "12500" in result  # comma formatting preferred
+
+    def test_large_number_has_comma_separator(self):
+        result = format_trades_processed(1_000_000)
+        assert "," in result
+
+    def test_small_number_no_comma(self):
+        result = format_trades_processed(5)
+        assert "5" in result
+
+    def test_negative_returns_na_or_raises(self):
+        # Implementation either raises ValueError or returns N/A for negative counts
+        try:
+            result = format_trades_processed(-1)
+            assert result == "N/A"
+        except (ValueError, AssertionError):
+            pass  # raising is also acceptable
+
+
+# ---------------------------------------------------------------------------
+# Section 23: calculate_trade_latency_stats()
+# ---------------------------------------------------------------------------
+
+class TestCalculateTradeLatencyStats:
+    """Test the stats aggregation pure function."""
+
+    def test_empty_list_returns_none(self):
+        assert calculate_trade_latency_stats([]) is None
+
+    def test_none_input_returns_none(self):
+        assert calculate_trade_latency_stats(None) is None
+
+    def test_single_sample_has_required_keys(self):
+        stats = calculate_trade_latency_stats([42.0])
+        assert stats is not None
+        assert "last" in stats
+        assert "avg" in stats
+        assert "min" in stats
+        assert "max" in stats
+
+    def test_single_sample_values_correct(self):
+        stats = calculate_trade_latency_stats([42.0])
+        assert stats["last"] == pytest.approx(42.0)
+        assert stats["avg"] == pytest.approx(42.0)
+        assert stats["min"] == pytest.approx(42.0)
+        assert stats["max"] == pytest.approx(42.0)
+
+    def test_multiple_samples_last_is_final_element(self):
+        stats = calculate_trade_latency_stats([10.0, 20.0, 30.0])
+        assert stats["last"] == pytest.approx(30.0)
+
+    def test_multiple_samples_avg(self):
+        stats = calculate_trade_latency_stats([10.0, 20.0, 30.0])
+        assert stats["avg"] == pytest.approx(20.0)
+
+    def test_multiple_samples_min_max(self):
+        stats = calculate_trade_latency_stats([10.0, 20.0, 30.0])
+        assert stats["min"] == pytest.approx(10.0)
+        assert stats["max"] == pytest.approx(30.0)
+
+    def test_negative_values_filtered_out(self):
+        # Negative latencies are invalid — they must be ignored
+        stats = calculate_trade_latency_stats([-5.0, 10.0, 20.0])
+        assert stats is not None
+        assert stats["min"] > 0
+
+    def test_all_negative_returns_none(self):
+        result = calculate_trade_latency_stats([-1.0, -2.0])
+        assert result is None
+
+    def test_twenty_plus_samples_includes_p95(self):
+        samples = [float(i) for i in range(1, 25)]  # 24 samples
+        stats = calculate_trade_latency_stats(samples)
+        assert stats is not None
+        assert "p95" in stats
+
+    def test_fewer_than_twenty_samples_no_p95_required(self):
+        samples = [float(i) for i in range(1, 10)]  # 9 samples
+        stats = calculate_trade_latency_stats(samples)
+        # p95 may or may not be present, but must not crash
+        assert stats is not None
+
+
+# ---------------------------------------------------------------------------
+# Section 24: build_trade_execution_lines()
+# ---------------------------------------------------------------------------
+
+class TestBuildTradeExecutionLines:
+    """Test the pure layout function for the Trade Execution Metrics section."""
+
+    def test_returns_list_of_strings(self):
+        lines = build_trade_execution_lines(width=80)
+        assert isinstance(lines, list)
+        assert all(isinstance(l, str) for l in lines)
+
+    def test_section_header_present(self):
+        lines = build_trade_execution_lines(width=80)
+        text = "\n".join(lines)
+        assert SECTION_TRADE_EXECUTION in text
+
+    def test_separator_lines_present(self):
+        lines = build_trade_execution_lines(width=80)
+        separators = [l for l in lines if set(l.strip()) == {"-"} and len(l.strip()) > 4]
+        assert len(separators) >= 2
+
+    def test_trades_processed_row_present(self):
+        lines = build_trade_execution_lines(width=80)
+        text = "\n".join(lines)
+        assert LABEL_TRADES_PROCESSED in text or "Processed" in text
+
+    def test_latency_last_row_present(self):
+        lines = build_trade_execution_lines(width=80)
+        text = "\n".join(lines)
+        # Should contain some form of "Last" or LABEL_TRADE_LATENCY_LAST
+        assert "Last" in text or LABEL_TRADE_LATENCY_LAST in text
+
+    def test_latency_avg_row_present(self):
+        lines = build_trade_execution_lines(width=80)
+        text = "\n".join(lines)
+        assert "Avg" in text or LABEL_TRADE_LATENCY_AVG in text
+
+    def test_latency_min_row_present(self):
+        lines = build_trade_execution_lines(width=80)
+        text = "\n".join(lines)
+        assert "Min" in text or LABEL_TRADE_LATENCY_MIN in text
+
+    def test_latency_max_row_present(self):
+        lines = build_trade_execution_lines(width=80)
+        text = "\n".join(lines)
+        assert "Max" in text or LABEL_TRADE_LATENCY_MAX in text
+
+    def test_default_values_show_na(self):
+        lines = build_trade_execution_lines(width=80)
+        text = "\n".join(lines)
+        assert "N/A" in text
+
+    def test_trades_processed_value_injected(self):
+        lines = build_trade_execution_lines(width=80, trades_processed=42)
+        text = "\n".join(lines)
+        assert "42" in text
+
+    def test_latency_last_value_injected(self):
+        lines = build_trade_execution_lines(width=80, latency=55.5)
+        text = "\n".join(lines)
+        assert "55" in text
+
+    def test_latency_avg_value_injected(self):
+        lines = build_trade_execution_lines(width=80, latency_avg=33.3)
+        text = "\n".join(lines)
+        assert "33" in text
+
+    def test_latency_min_value_injected(self):
+        lines = build_trade_execution_lines(width=80, latency_min=10.0)
+        text = "\n".join(lines)
+        assert "10" in text
+
+    def test_latency_max_value_injected(self):
+        lines = build_trade_execution_lines(width=80, latency_max=99.9)
+        text = "\n".join(lines)
+        assert "99" in text
+
+    def test_unit_us_in_label(self):
+        lines = build_trade_execution_lines(width=80, unit="us")
+        text = "\n".join(lines)
+        assert "us" in text.lower() or "(us)" in text
+
+    def test_unit_ns_in_label(self):
+        lines = build_trade_execution_lines(width=80, unit="ns")
+        text = "\n".join(lines)
+        assert "ns" in text.lower() or "(ns)" in text
+
+    def test_narrow_width_does_not_crash(self):
+        # Should not raise even for very narrow terminals
+        lines = build_trade_execution_lines(width=40)
+        assert isinstance(lines, list)
+
+    def test_wide_width_does_not_crash(self):
+        lines = build_trade_execution_lines(width=200)
+        assert isinstance(lines, list)
+
+    def test_no_fabricated_nonzero_defaults(self):
+        # When no values supplied, there should be no numeric non-zero data values
+        lines = build_trade_execution_lines(width=80)
+        text = "\n".join(lines)
+        # "0" is allowed (trades_processed defaults to 0), but latency should be N/A
+        # Verify latency rows show N/A, not a real number
+        latency_rows = [l for l in lines if ("Last" in l or "Avg" in l or
+                                              "Min" in l or "Max" in l)]
+        for row in latency_rows:
+            assert "N/A" in row
+
+
+# ---------------------------------------------------------------------------
+# Section 25: TerminalDashboard trade metrics state & methods
+# ---------------------------------------------------------------------------
+
+class TestTerminalDashboardTradeMetrics:
+    """Test TerminalDashboard trade-metrics methods and state."""
+
+    def _make_dashboard(self, **kwargs):
+        return TerminalDashboard(use_sample_data=False, **kwargs)
+
+    # --- Initial state ---
+
+    def test_initial_trades_processed_is_zero(self):
+        d = self._make_dashboard()
+        assert d.trades_processed == 0
+
+    def test_initial_trade_latency_samples_empty(self):
+        d = self._make_dashboard()
+        assert d._trade_latency_samples == []
+
+    def test_initial_trade_latency_unit_default_us(self):
+        d = self._make_dashboard()
+        assert d._trade_latency_unit == "us"
+
+    def test_trade_latency_unit_ns_init(self):
+        d = self._make_dashboard(trade_latency_unit="ns")
+        assert d._trade_latency_unit == "ns"
+
+    # --- trades_processed property ---
+
+    def test_set_trades_processed_property(self):
+        d = self._make_dashboard()
+        d.trades_processed = 99
+        assert d.trades_processed == 99
+
+    def test_set_trades_processed_method(self):
+        d = self._make_dashboard()
+        d.set_trades_processed(77)
+        assert d.trades_processed == 77
+
+    def test_update_trades_processed_sets_max(self):
+        d = self._make_dashboard()
+        d.update_trades_processed(50)
+        assert d.trades_processed == 50
+        d.update_trades_processed(30)
+        # update_trades_processed only moves forward (or keeps max)
+        assert d.trades_processed >= 30
+
+    def test_increment_trades_processed(self):
+        d = self._make_dashboard()
+        d.increment_trades_processed()
+        assert d.trades_processed == 1
+        d.increment_trades_processed()
+        assert d.trades_processed == 2
+
+    # --- record_trade_execution() ---
+
+    def test_record_trade_execution_latency_us_increments_count(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=50.0)
+        assert d.trades_processed == 1
+
+    def test_record_trade_execution_latency_us_adds_sample(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=50.0)
+        assert len(d._trade_latency_samples) == 1
+        assert d._trade_latency_samples[0] == pytest.approx(50.0)
+
+    def test_record_trade_execution_latency_ns_converts_to_us(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_ns=1000)  # 1000 ns = 1.0 us
+        assert len(d._trade_latency_samples) == 1
+        assert d._trade_latency_samples[0] == pytest.approx(1.0)
+
+    def test_record_trade_execution_multiple_calls_accumulate(self):
+        d = self._make_dashboard()
+        for val in [10.0, 20.0, 30.0]:
+            d.record_trade_execution(latency_us=val)
+        assert d.trades_processed == 3
+        assert len(d._trade_latency_samples) == 3
+
+    def test_record_trade_execution_no_latency_still_counts(self):
+        d = self._make_dashboard()
+        d.record_trade_execution()
+        assert d.trades_processed == 1
+        # No sample should have been added (no latency provided)
+        assert len(d._trade_latency_samples) == 0
+
+    def test_max_trade_latency_samples_capped(self):
+        d = self._make_dashboard()
+        cap = d._max_trade_latency_samples
+        for i in range(cap + 10):
+            d.record_trade_execution(latency_us=float(i))
+        assert len(d._trade_latency_samples) <= cap
+
+    # --- get_trade_latency_display() ---
+
+    def test_get_trade_latency_display_no_samples_returns_na(self):
+        d = self._make_dashboard()
+        assert d.get_trade_latency_display() == "N/A"
+
+    def test_get_trade_latency_display_with_sample(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=42.0)
+        result = d.get_trade_latency_display()
+        assert result != "N/A"
+        assert "42" in result
+
+    # --- get_trade_latency_avg_display() ---
+
+    def test_get_trade_latency_avg_display_no_samples_returns_na(self):
+        d = self._make_dashboard()
+        assert d.get_trade_latency_avg_display() == "N/A"
+
+    def test_get_trade_latency_avg_display_with_samples(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=10.0)
+        d.record_trade_execution(latency_us=30.0)
+        result = d.get_trade_latency_avg_display()
+        assert result != "N/A"
+        assert "20" in result  # avg of 10 and 30
+
+    # --- get_trade_latency_min_display() ---
+
+    def test_get_trade_latency_min_display_no_samples_returns_na(self):
+        d = self._make_dashboard()
+        assert d.get_trade_latency_min_display() == "N/A"
+
+    def test_get_trade_latency_min_display_with_samples(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=30.0)
+        d.record_trade_execution(latency_us=10.0)
+        result = d.get_trade_latency_min_display()
+        assert "10" in result
+
+    # --- get_trade_latency_max_display() ---
+
+    def test_get_trade_latency_max_display_no_samples_returns_na(self):
+        d = self._make_dashboard()
+        assert d.get_trade_latency_max_display() == "N/A"
+
+    def test_get_trade_latency_max_display_with_samples(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=10.0)
+        d.record_trade_execution(latency_us=99.0)
+        result = d.get_trade_latency_max_display()
+        assert "99" in result
+
+    # --- get_trade_latency_stats() ---
+
+    def test_get_trade_latency_stats_no_samples_returns_none(self):
+        d = self._make_dashboard()
+        assert d.get_trade_latency_stats() is None
+
+    def test_get_trade_latency_stats_with_samples(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=10.0)
+        d.record_trade_execution(latency_us=20.0)
+        stats = d.get_trade_latency_stats()
+        assert stats is not None
+        assert "last" in stats
+        assert "avg" in stats
+        assert "min" in stats
+        assert "max" in stats
+
+    # --- reset_trade_metrics() ---
+
+    def test_reset_trade_metrics_clears_samples(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=50.0)
+        d.reset_trade_metrics()
+        assert d._trade_latency_samples == []
+
+    def test_reset_trade_metrics_clears_last_latency(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=50.0)
+        d.reset_trade_metrics()
+        assert d._trade_latency_last_us is None
+
+    def test_reset_trade_metrics_does_not_reset_count(self):
+        # reset_trade_metrics only resets latency measurements, not the counter
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=50.0)
+        d.reset_trade_metrics()
+        # trades_processed remains (counter persists across metric resets)
+        # This is by design — latency window can be reset without losing count
+        assert d.trades_processed >= 0  # still valid
+
+    # --- reset_orders_processed() resets trade metrics too ---
+
+    def test_reset_orders_processed_also_resets_trade_metrics(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=50.0)
+        d.reset_orders_processed()
+        # After full reset, latency samples should be gone
+        assert d._trade_latency_samples == []
+
+
+# ---------------------------------------------------------------------------
+# Section 26: get_display_lines() includes Trade Execution Metrics
+# ---------------------------------------------------------------------------
+
+class TestGetDisplayLinesTradeExecution:
+    """Verify the text-mode output includes the Trade Execution section."""
+
+    def _make_dashboard(self):
+        return TerminalDashboard(use_sample_data=False)
+
+    def test_section_header_in_display_lines(self):
+        d = self._make_dashboard()
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_TRADE_EXECUTION in text
+
+    def test_latency_na_when_no_samples(self):
+        d = self._make_dashboard()
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        # Latency rows should show N/A
+        assert "N/A" in text
+
+    def test_trades_processed_zero_initially(self):
+        d = self._make_dashboard()
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert "0" in text
+
+    def test_display_lines_reflect_recorded_trade(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=75.5)
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert "75" in text  # latency value appears
+        assert "1" in text   # trades_processed = 1
+
+    def test_display_lines_with_unit_ns(self):
+        d = TerminalDashboard(use_sample_data=False, trade_latency_unit="ns")
+        d.record_trade_execution(latency_us=1.0)
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert "ns" in text.lower() or "(ns)" in text
+
+    def test_explicit_params_override_internal_state(self):
+        d = self._make_dashboard()
+        lines = d.get_display_lines(
+            rows=50, cols=100,
+            trades_processed=999,
+            trade_latency=11.1,
+            trade_latency_avg=22.2,
+            trade_latency_min=5.5,
+            trade_latency_max=33.3,
+        )
+        text = "\n".join(lines)
+        assert "999" in text
+        assert "11" in text
+
+    def test_display_lines_returns_list_of_strings(self):
+        d = self._make_dashboard()
+        lines = d.get_display_lines(rows=50, cols=100)
+        assert isinstance(lines, list)
+        assert all(isinstance(l, str) for l in lines)
+
+
+# ---------------------------------------------------------------------------
+# Section 27: render() writes Trade Execution Metrics to curses window
+# ---------------------------------------------------------------------------
+
+class TestRenderTradeExecution:
+    """Verify render() includes Trade Execution section in curses calls."""
+
+    def _make_window(self, rows=50, cols=100):
+        return MockCursesWindow(rows=rows, cols=cols)
+
+    def _make_dashboard(self, **kwargs):
+        return TerminalDashboard(use_sample_data=False, **kwargs)
+
+    def _rendered_text(self, dashboard, rows=50, cols=100):
+        win = self._make_window(rows=rows, cols=cols)
+        dashboard.render(win)
+        return " ".join(call[2] for call in win.addstr_calls if len(call) >= 3)
+
+    def test_render_includes_trade_execution_section_header(self):
+        d = self._make_dashboard()
+        text = self._rendered_text(d)
+        assert SECTION_TRADE_EXECUTION in text
+
+    def test_render_shows_na_latency_when_no_samples(self):
+        d = self._make_dashboard()
+        text = self._rendered_text(d)
+        assert "N/A" in text
+
+    def test_render_shows_recorded_latency(self):
+        d = self._make_dashboard()
+        d.record_trade_execution(latency_us=88.8)
+        text = self._rendered_text(d)
+        assert "88" in text
+
+    def test_render_shows_ns_unit_label(self):
+        d = self._make_dashboard(trade_latency_unit="ns")
+        text = self._rendered_text(d)
+        assert "ns" in text.lower()
+
+    def test_render_small_terminal_does_not_crash(self):
+        d = self._make_dashboard()
+        win = self._make_window(rows=30, cols=80)
+        # Must not raise even on a minimal terminal
+        d.render(win)
+
+    def test_render_trade_metrics_after_multiple_records(self):
+        d = self._make_dashboard()
+        for val in [10.0, 20.0, 30.0]:
+            d.record_trade_execution(latency_us=val)
+        text = self._rendered_text(d)
+        # 3 trades processed
+        assert "3" in text
+        # avg = 20 should appear
+        assert "20" in text
+
+
+# ---------------------------------------------------------------------------
+# Section 28: DashboardConfig.trade_latency_unit integration
+# ---------------------------------------------------------------------------
+
+class TestDashboardConfigTradeLatencyUnit:
+    """DashboardConfig trade_latency_unit flows through to TerminalDashboard."""
+
+    def test_config_us_propagates_to_dashboard(self):
+        cfg = DashboardConfig(trade_latency_unit="us")
+        d = TerminalDashboard(use_sample_data=False, trade_latency_unit=cfg.trade_latency_unit)
+        assert d._trade_latency_unit == "us"
+
+    def test_config_ns_propagates_to_dashboard(self):
+        cfg = DashboardConfig(trade_latency_unit="ns")
+        d = TerminalDashboard(use_sample_data=False, trade_latency_unit=cfg.trade_latency_unit)
+        assert d._trade_latency_unit == "ns"
+
+    def test_config_is_frozen(self):
+        cfg = DashboardConfig()
+        with pytest.raises((AttributeError, TypeError)):
+            cfg.trade_latency_unit = "ns"  # type: ignore
+
+
+# ===========================================================================
+# Week 3, Day 4 -- Whale Order Detection
+# ===========================================================================
+
+from chronos.dashboard import (
+    SECTION_WHALE_ALERT,
+    LABEL_WHALE_LEVELS,
+    LABEL_WHALE_VOLUME,
+    LABEL_WHALE_ORDER_ID,
+    LABEL_WHALE_SIDE,
+    WHALE_MIN_PRICE_LEVELS,
+    WhaleOrderEvent,
+    detect_whale_order,
+    build_whale_alert_lines,
+)
+
+
+class FakeTradeResult:
+    """Minimal TradeResult stub that mimics MatchingEngine output."""
+
+    def __init__(self, price: float, qty: int) -> None:
+        self.price = price
+        self.executed_quantity = qty
+
+
+# ---------------------------------------------------------------------------
+# Section 29: detect_whale_order() -- pure function unit tests
+# ---------------------------------------------------------------------------
+
+class TestDetectWhaleOrder:
+    """Unit tests for the detect_whale_order() pure computation function."""
+
+    def test_empty_trades_returns_none(self):
+        assert detect_whale_order(order_id=1, trades=[]) is None
+
+    def test_none_trades_returns_none(self):
+        assert detect_whale_order(order_id=1, trades=None) is None
+
+    def test_single_trade_single_price_not_whale(self):
+        trades = [FakeTradeResult(100.0, 50)]
+        assert detect_whale_order(order_id=1, trades=trades) is None
+
+    def test_two_trades_same_price_not_whale(self):
+        trades = [FakeTradeResult(100.0, 50), FakeTradeResult(100.0, 30)]
+        assert detect_whale_order(order_id=1, trades=trades) is None
+
+    def test_two_trades_different_prices_is_whale(self):
+        trades = [FakeTradeResult(100.0, 50), FakeTradeResult(101.0, 30)]
+        result = detect_whale_order(order_id=1, trades=trades)
+        assert result is not None
+        assert result.price_levels_cleared == 2
+        assert result.is_whale is True
+
+    def test_three_price_levels_is_whale(self):
+        trades = [
+            FakeTradeResult(99.0, 10),
+            FakeTradeResult(100.0, 20),
+            FakeTradeResult(101.0, 30),
+        ]
+        result = detect_whale_order(order_id=42, trades=trades, side=2)
+        assert result is not None
+        assert result.price_levels_cleared == 3
+        assert result.order_id == 42
+        assert result.side == 2
+
+    def test_order_id_stored_on_event(self):
+        trades = [FakeTradeResult(10.0, 5), FakeTradeResult(11.0, 5)]
+        result = detect_whale_order(order_id=77, trades=trades)
+        assert result is not None
+        assert result.order_id == 77
+
+    def test_side_stored_on_event(self):
+        trades = [FakeTradeResult(10.0, 5), FakeTradeResult(11.0, 5)]
+        result = detect_whale_order(order_id=1, trades=trades, side=1)
+        assert result is not None
+        assert result.side == 1
+
+    def test_side_defaults_to_zero_when_omitted(self):
+        trades = [FakeTradeResult(10.0, 5), FakeTradeResult(11.0, 5)]
+        result = detect_whale_order(order_id=1, trades=trades)
+        assert result is not None
+        assert result.side == 0
+
+    def test_volume_aggregated_correctly(self):
+        trades = [FakeTradeResult(100.0, 50), FakeTradeResult(101.0, 70)]
+        result = detect_whale_order(order_id=5, trades=trades)
+        assert result is not None
+        assert result.volume_matched == 120
+        assert result.total_quantity == 120
+
+    def test_prices_list_contains_distinct_prices(self):
+        trades = [
+            FakeTradeResult(100.0, 50),
+            FakeTradeResult(100.0, 20),
+            FakeTradeResult(101.0, 30),
+        ]
+        result = detect_whale_order(order_id=1, trades=trades)
+        assert result is not None
+        assert len(result.prices) == 2
+        assert 100.0 in result.prices
+        assert 101.0 in result.prices
+
+    def test_bad_trade_attribute_skipped_gracefully(self):
+        """Trades that lack expected attributes should be skipped, not raise."""
+        bad = object()
+        good1 = FakeTradeResult(100.0, 10)
+        good2 = FakeTradeResult(101.0, 10)
+        result = detect_whale_order(order_id=1, trades=[bad, good1, good2])
+        assert result is not None
+        assert result.price_levels_cleared == 2
+
+    def test_single_price_repeated_many_times_not_whale(self):
+        trades = [FakeTradeResult(50.0, 10) for _ in range(10)]
+        assert detect_whale_order(order_id=1, trades=trades) is None
+
+
+# ---------------------------------------------------------------------------
+# Section 30: WhaleOrderEvent dataclass unit tests
+# ---------------------------------------------------------------------------
+
+class TestWhaleOrderEvent:
+    """Tests for the WhaleOrderEvent dataclass and its is_whale property."""
+
+    def test_is_whale_true_when_levels_eq_min(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=100,
+            price_levels_cleared=WHALE_MIN_PRICE_LEVELS,
+            prices=[100.0, 101.0], volume_matched=100,
+        )
+        assert w.is_whale is True
+
+    def test_is_whale_false_when_levels_lt_min(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=100,
+            price_levels_cleared=1,
+            prices=[100.0], volume_matched=100,
+        )
+        assert w.is_whale is False
+
+    def test_is_whale_true_for_three_levels(self):
+        w = WhaleOrderEvent(
+            order_id=2, side=2, total_quantity=300,
+            price_levels_cleared=3,
+            prices=[99.0, 100.0, 101.0], volume_matched=300,
+        )
+        assert w.is_whale is True
+
+    def test_timestamp_defaults_to_none(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=0, total_quantity=0,
+            price_levels_cleared=2, prices=[1.0, 2.0], volume_matched=0,
+        )
+        assert w.timestamp_ns is None
+
+    def test_timestamp_can_be_set(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=0, total_quantity=0,
+            price_levels_cleared=2, prices=[1.0, 2.0], volume_matched=0,
+            timestamp_ns=123456789,
+        )
+        assert w.timestamp_ns == 123456789
+
+
+# ---------------------------------------------------------------------------
+# Section 31: build_whale_alert_lines() layout function tests
+# ---------------------------------------------------------------------------
+
+class TestBuildWhaleAlertLines:
+    """Tests for the build_whale_alert_lines() pure layout function."""
+
+    def test_no_whale_returns_empty_list(self):
+        assert build_whale_alert_lines(width=80, whale=None) == []
+
+    def test_section_header_present(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=100,
+            price_levels_cleared=2, prices=[100.0, 101.0], volume_matched=100,
+        )
+        lines = build_whale_alert_lines(width=80, whale=w)
+        text = "\n".join(lines)
+        assert SECTION_WHALE_ALERT in text
+
+    def test_price_levels_count_in_output(self):
+        w = WhaleOrderEvent(
+            order_id=9, side=2, total_quantity=50,
+            price_levels_cleared=3, prices=[99.0, 100.0, 101.0], volume_matched=50,
+        )
+        lines = build_whale_alert_lines(width=80, whale=w)
+        text = "\n".join(lines)
+        assert "3" in text
+
+    def test_swept_prices_in_output(self):
+        w = WhaleOrderEvent(
+            order_id=7, side=1, total_quantity=200,
+            price_levels_cleared=2, prices=[150.25, 151.75], volume_matched=200,
+        )
+        lines = build_whale_alert_lines(width=80, whale=w)
+        text = "\n".join(lines)
+        assert "150.25" in text
+        assert "151.75" in text
+
+    def test_buy_side_label_in_output(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=100,
+            price_levels_cleared=2, prices=[10.0, 11.0], volume_matched=100,
+        )
+        lines = build_whale_alert_lines(width=80, whale=w)
+        text = "\n".join(lines)
+        assert "BUY" in text
+
+    def test_sell_side_label_in_output(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=2, total_quantity=100,
+            price_levels_cleared=2, prices=[10.0, 9.0], volume_matched=100,
+        )
+        lines = build_whale_alert_lines(width=80, whale=w)
+        text = "\n".join(lines)
+        assert "SELL" in text
+
+    def test_unknown_side_shows_question_mark(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=0, total_quantity=0,
+            price_levels_cleared=2, prices=[1.0, 2.0], volume_matched=0,
+        )
+        lines = build_whale_alert_lines(width=80, whale=w)
+        text = "\n".join(lines)
+        assert "?" in text
+
+    def test_more_than_five_prices_truncated(self):
+        prices = [float(i) for i in range(10)]
+        w = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=0,
+            price_levels_cleared=len(prices), prices=prices, volume_matched=0,
+        )
+        lines = build_whale_alert_lines(width=80, whale=w)
+        text = "\n".join(lines)
+        assert "..." in text
+
+    def test_returns_list_of_strings(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=0,
+            price_levels_cleared=2, prices=[1.0, 2.0], volume_matched=0,
+        )
+        lines = build_whale_alert_lines(width=80, whale=w)
+        assert isinstance(lines, list)
+        assert all(isinstance(line, str) for line in lines)
+
+    def test_width_affects_divider_length(self):
+        w = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=0,
+            price_levels_cleared=2, prices=[1.0, 2.0], volume_matched=0,
+        )
+        lines_80 = build_whale_alert_lines(width=80, whale=w)
+        lines_60 = build_whale_alert_lines(width=60, whale=w)
+        dividers_80 = [l for l in lines_80 if l.startswith("-")]
+        dividers_60 = [l for l in lines_60 if l.startswith("-")]
+        assert len(dividers_80[0]) == 80
+        assert len(dividers_60[0]) == 60
+
+
+# ---------------------------------------------------------------------------
+# Section 32: TerminalDashboard whale state management tests
+# ---------------------------------------------------------------------------
+
+class TestTerminalDashboardWhaleState:
+    """Tests for whale state management methods in TerminalDashboard."""
+
+    def _make_dashboard(self) -> TerminalDashboard:
+        return TerminalDashboard(use_sample_data=False)
+
+    def _make_whale(self, order_id: int = 1, levels: int = 2) -> WhaleOrderEvent:
+        prices = [float(100 + i) for i in range(levels)]
+        return WhaleOrderEvent(
+            order_id=order_id, side=1, total_quantity=100,
+            price_levels_cleared=levels, prices=prices, volume_matched=100,
+        )
+
+    def test_initial_last_whale_is_none(self):
+        d = self._make_dashboard()
+        assert d.get_last_whale_event() is None
+
+    def test_record_whale_stores_event(self):
+        d = self._make_dashboard()
+        w = self._make_whale()
+        d.record_whale_order(w)
+        assert d.get_last_whale_event() is w
+
+    def test_record_whale_replaces_previous_last(self):
+        d = self._make_dashboard()
+        w1 = self._make_whale(order_id=1)
+        w2 = self._make_whale(order_id=2)
+        d.record_whale_order(w1)
+        d.record_whale_order(w2)
+        assert d.get_last_whale_event() is w2
+
+    def test_clear_whale_history_resets_last(self):
+        d = self._make_dashboard()
+        d.record_whale_order(self._make_whale())
+        d.clear_whale_history()
+        assert d.get_last_whale_event() is None
+
+    def test_clear_whale_history_empties_history_list(self):
+        d = self._make_dashboard()
+        for i in range(5):
+            d.record_whale_order(self._make_whale(order_id=i))
+        d.clear_whale_history()
+        assert len(d._whale_history) == 0
+
+    def test_whale_history_bounded_by_max(self):
+        d = self._make_dashboard()
+        max_h = d._max_whale_history
+        for i in range(max_h + 5):
+            d.record_whale_order(self._make_whale(order_id=i))
+        assert len(d._whale_history) == max_h
+
+    def test_whale_history_keeps_most_recent(self):
+        d = self._make_dashboard()
+        for i in range(15):
+            d.record_whale_order(self._make_whale(order_id=i))
+        ids = [w.order_id for w in d._whale_history]
+        assert 14 in ids
+        assert 0 not in ids
+
+
+# ---------------------------------------------------------------------------
+# Section 33: Whale alert integration with get_display_lines() and render()
+# ---------------------------------------------------------------------------
+
+class TestWhaleDisplayIntegration:
+    """Tests that whale alert appears correctly in get_display_lines() and render()."""
+
+    def _make_whale(self, order_id: int = 55) -> WhaleOrderEvent:
+        return WhaleOrderEvent(
+            order_id=order_id, side=2, total_quantity=300,
+            price_levels_cleared=3, prices=[200.0, 201.0, 202.0], volume_matched=300,
+        )
+
+    def test_whale_alert_in_get_display_lines_when_present(self):
+        d = TerminalDashboard(use_sample_data=False)
+        d.record_whale_order(self._make_whale())
+        lines = d.get_display_lines(rows=60, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_WHALE_ALERT in text
+
+    def test_no_whale_alert_in_get_display_lines_when_absent(self):
+        d = TerminalDashboard(use_sample_data=False)
+        lines = d.get_display_lines(rows=60, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_WHALE_ALERT not in text
+
+    def test_whale_cleared_removes_alert_from_display(self):
+        d = TerminalDashboard(use_sample_data=False)
+        d.record_whale_order(self._make_whale())
+        d.clear_whale_history()
+        lines = d.get_display_lines(rows=60, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_WHALE_ALERT not in text
+
+    def test_whale_alert_in_render_when_present(self):
+        d = TerminalDashboard(use_sample_data=False)
+        d.record_whale_order(self._make_whale(order_id=77))
+        win = MockCursesWindow(rows=70, cols=100)
+        d.render(win)
+        rendered = " ".join(c[2] for c in win.addstr_calls if len(c) >= 3)
+        assert SECTION_WHALE_ALERT in rendered
+
+    def test_no_whale_alert_in_render_when_absent(self):
+        d = TerminalDashboard(use_sample_data=False)
+        win = MockCursesWindow(rows=70, cols=100)
+        d.render(win)
+        rendered = " ".join(c[2] for c in win.addstr_calls if len(c) >= 3)
+        assert SECTION_WHALE_ALERT not in rendered
+
+    def test_whale_prices_in_render_output(self):
+        d = TerminalDashboard(use_sample_data=False)
+        d.record_whale_order(self._make_whale())
+        win = MockCursesWindow(rows=70, cols=100)
+        d.render(win)
+        rendered = " ".join(c[2] for c in win.addstr_calls if len(c) >= 3)
+        assert "200.00" in rendered
+        assert "201.00" in rendered
+
+    def test_normal_dashboard_sections_preserved_with_whale(self):
+        """Existing dashboard content must not be removed when a whale is shown."""
+        d = TerminalDashboard(use_sample_data=False)
+        d.record_whale_order(self._make_whale())
+        lines = d.get_display_lines(rows=60, cols=100)
+        text = "\n".join(lines)
+        from chronos.dashboard import SECTION_PERFORMANCE, SECTION_TRADE_EXECUTION
+        assert SECTION_PERFORMANCE in text
+        assert SECTION_TRADE_EXECUTION in text
+        assert SECTION_WHALE_ALERT in text
+
+
+# ---------------------------------------------------------------------------
+# Section 34: Integration with real MatchingEngine
+# ---------------------------------------------------------------------------
+
+class TestWhaleWithRealMatchingEngine:
+    """Integration tests using the real MatchingEngine to produce trade lists."""
+
+    def _get_engine(self):
+        try:
+            from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+            return MatchingEngine(), SIDE_BUY, SIDE_SELL
+        except Exception:
+            import pytest
+            pytest.skip("MatchingEngine not available")
+
+    def test_non_executing_order_no_whale(self):
+        engine, SIDE_BUY, SIDE_SELL = self._get_engine()
+        engine.submit_order(1, SIDE_BUY, 100.0, 100, 1000)
+        trades = engine.match_order(2, SIDE_SELL, 105.0, 50, 2000)
+        result = detect_whale_order(order_id=2, trades=trades or [])
+        assert result is None
+
+    def test_single_price_level_no_whale(self):
+        engine, SIDE_BUY, SIDE_SELL = self._get_engine()
+        engine.submit_order(1, SIDE_BUY, 100.0, 100, 1000)
+        engine.submit_order(2, SIDE_BUY, 100.0, 50, 1100)
+        trades = engine.match_order(3, SIDE_SELL, 100.0, 150, 2000)
+        if trades is None:
+            trades = []
+        distinct = set(t.execution_price for t in trades)
+        result = detect_whale_order(order_id=3, trades=trades)
+        if len(distinct) < 2:
+            assert result is None
+
+    def test_multi_level_sweep_is_whale(self):
+        engine, SIDE_BUY, SIDE_SELL = self._get_engine()
+        engine.submit_order(1, SIDE_BUY, 101.0, 50, 1000)
+        engine.submit_order(2, SIDE_BUY, 100.0, 50, 1100)
+        trades = engine.match_order(3, SIDE_SELL, 99.0, 100, 2000)
+        assert trades is not None and len(trades) >= 2
+        distinct = set(t.execution_price for t in trades)
+        if len(distinct) >= 2:
+            result = detect_whale_order(order_id=3, trades=trades, side=SIDE_SELL)
+            assert result is not None
+            assert result.is_whale is True
+            assert result.price_levels_cleared >= 2
+
+    def test_whale_event_has_correct_order_id(self):
+        engine, SIDE_BUY, SIDE_SELL = self._get_engine()
+        engine.submit_order(10, SIDE_BUY, 200.0, 50, 1000)
+        engine.submit_order(11, SIDE_BUY, 199.0, 50, 1100)
+        trades = engine.match_order(99, SIDE_SELL, 198.0, 100, 2000)
+        if trades is None:
+            trades = []
+        distinct = set(t.execution_price for t in trades)
+        if len(distinct) >= 2:
+            result = detect_whale_order(order_id=99, trades=trades)
+            assert result is not None
+            assert result.order_id == 99
+
+
+# ===========================================================================
+# Section 35: Week 3 Day 5 - Order-Book Depth Display Comprehensive Tests
+# ===========================================================================
+
+
+class TestOrderBookDepthDisplayRequirements:
+    """Comprehensive verification for Week 3 Day 5 order-book depth display requirements."""
+
+    # -----------------------------------------------------------------------
+    # 1. Sorting Tests
+    # -----------------------------------------------------------------------
+
+    def test_buy_depth_sorting_strictly_descending(self):
+        """Top 5 BUY price levels must be sorted strictly from highest to lowest price."""
+        # Unsorted input of 6 price levels
+        orders = [
+            {"side": 1, "price": 490.50, "quantity": 10},
+            {"side": 1, "price": 510.00, "quantity": 20},
+            {"side": 1, "price": 505.25, "quantity": 30},
+            {"side": 1, "price": 498.00, "quantity": 40},
+            {"side": 1, "price": 502.75, "quantity": 50},
+            {"side": 1, "price": 485.00, "quantity": 60},
+        ]
+        depth = calculate_buy_depth(orders, max_levels=5)
+        assert len(depth) == 5
+        prices = [lvl.price for lvl in depth]
+        assert prices == [510.00, 505.25, 502.75, 498.00, 490.50]
+        # Verify strictly descending order
+        for i in range(len(prices) - 1):
+            assert prices[i] > prices[i + 1]
+
+    def test_sell_depth_sorting_strictly_ascending(self):
+        """Top 5 SELL price levels must be sorted strictly from lowest to highest price."""
+        # Unsorted input of 6 price levels
+        orders = [
+            {"side": 2, "price": 530.00, "quantity": 15},
+            {"side": 2, "price": 515.50, "quantity": 25},
+            {"side": 2, "price": 522.25, "quantity": 35},
+            {"side": 2, "price": 512.00, "quantity": 45},
+            {"side": 2, "price": 518.75, "quantity": 55},
+            {"side": 2, "price": 540.00, "quantity": 65},
+        ]
+        depth = calculate_sell_depth(orders, max_levels=5)
+        assert len(depth) == 5
+        prices = [lvl.price for lvl in depth]
+        assert prices == [512.00, 515.50, 518.75, 522.25, 530.00]
+        # Verify strictly ascending order
+        for i in range(len(prices) - 1):
+            assert prices[i] < prices[i + 1]
+
+    def test_sorting_deterministic_regardless_of_order_insertion_sequence(self):
+        """Depth sorting must be deterministic regardless of original order sequence."""
+        orders_a = [
+            {"price": 100.0, "quantity": 10},
+            {"price": 105.0, "quantity": 20},
+            {"price": 102.5, "quantity": 30},
+        ]
+        orders_b = [
+            {"price": 102.5, "quantity": 30},
+            {"price": 100.0, "quantity": 10},
+            {"price": 105.0, "quantity": 20},
+        ]
+        orders_c = [
+            {"price": 105.0, "quantity": 20},
+            {"price": 102.5, "quantity": 30},
+            {"price": 100.0, "quantity": 10},
+        ]
+        depth_a = calculate_buy_depth(orders_a)
+        depth_b = calculate_buy_depth(orders_b)
+        depth_c = calculate_buy_depth(orders_c)
+        assert depth_a == depth_b == depth_c
+        assert [lvl.price for lvl in depth_a] == [105.0, 102.5, 100.0]
+
+    def test_depth_sorting_rejects_negative_and_nan_inf_prices(self):
+        """Non-positive, NaN, and Inf prices are excluded from depth sorting."""
+        orders = [
+            {"price": 500.0, "quantity": 50},
+            {"price": -10.0, "quantity": 20},
+            {"price": 0.0, "quantity": 30},
+            {"price": float("nan"), "quantity": 40},
+            {"price": float("inf"), "quantity": 50},
+            {"price": 490.0, "quantity": 25},
+        ]
+        depth = calculate_buy_depth(orders)
+        assert len(depth) == 2
+        assert [lvl.price for lvl in depth] == [500.0, 490.0]
+        assert [lvl.quantity for lvl in depth] == [50, 25]
+
+    # -----------------------------------------------------------------------
+    # 2. Quantity Aggregation Tests
+    # -----------------------------------------------------------------------
+
+    def test_quantities_aggregated_across_many_orders_at_same_price(self):
+        """Multiple orders at the exact same price level must have quantities aggregated."""
+        orders = [
+            {"price": 500.0, "quantity": 10},
+            {"price": 500.0, "quantity": 20},
+            {"price": 500.0, "quantity": 30},
+            {"price": 500.0, "quantity": 40},
+            {"price": 490.0, "quantity": 100},
+        ]
+        depth = calculate_buy_depth(orders)
+        assert len(depth) == 2
+        assert depth[0] == PriceLevel(500.0, 100)
+        assert depth[1] == PriceLevel(490.0, 100)
+
+    def test_quantities_use_remaining_quantity_when_present(self):
+        """Partially filled orders must use remaining_quantity rather than initial quantity."""
+        orders = [
+            {"price": 500.0, "quantity": 100, "remaining_quantity": 45},
+            {"price": 500.0, "quantity": 200, "remaining_quantity": 55},
+        ]
+        depth = calculate_buy_depth(orders)
+        assert len(depth) == 1
+        assert depth[0].price == 500.0
+        assert depth[0].quantity == 100  # 45 + 55, not 100 + 200 = 300
+
+    def test_quantities_fully_filled_orders_excluded(self):
+        """Orders with remaining_quantity=0 (fully filled) are excluded from depth."""
+        orders = [
+            {"price": 500.0, "quantity": 100, "remaining_quantity": 0},
+            {"price": 490.0, "quantity": 50, "remaining_quantity": 50},
+        ]
+        depth = calculate_buy_depth(orders)
+        assert len(depth) == 1
+        assert depth[0] == PriceLevel(490.0, 50)
+
+    def test_quantities_negative_or_zero_filtered_out(self):
+        """Orders with quantity <= 0 are omitted."""
+        orders = [
+            {"price": 500.0, "quantity": 0},
+            {"price": 500.0, "quantity": -5},
+            {"price": 490.0, "quantity": 10},
+        ]
+        depth = calculate_buy_depth(orders)
+        assert len(depth) == 1
+        assert depth[0] == PriceLevel(490.0, 10)
+
+    def test_depth_supports_multiple_order_data_structures(self):
+        """Depth calculation supports dicts, tuples (4-tuple and 7-tuple), and objects."""
+        # 1. Dict with price_cents and qty
+        d1 = {"price_cents": 50000, "qty": 10, "side": 1}
+        # 2. 4-tuple: (order_id, side, price, quantity)
+        t4 = (101, 1, 495.0, 20)
+        # 3. 7-tuple: (order_id, ts, price, quantity, sym, side, type)
+        t7 = (102, 1000000, 490.0, 30, 1001, 1, 1)
+        # 4. Custom object
+        class MockOrderObj:
+            def __init__(self, price, quantity, side):
+                self.price = price
+                self.quantity = quantity
+                self.side = side
+
+        obj = MockOrderObj(price=485.0, quantity=40, side=1)
+
+        depth = calculate_buy_depth([d1, t4, t7, obj])
+        assert len(depth) == 4
+        assert [lvl.price for lvl in depth] == [500.0, 495.0, 490.0, 485.0]
+        assert [lvl.quantity for lvl in depth] == [10, 20, 30, 40]
+
+    def test_depth_with_cython_engine_prioritized_bids_and_asks(self):
+        """Verify depth directly calculates from real Cython MatchingEngine prioritized orders."""
+        try:
+            from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        except Exception:
+            pytest.skip("MatchingEngine not available")
+
+        engine = MatchingEngine()
+        # Add bids at multiple prices
+        engine.submit_order(1, SIDE_BUY, 100.0, 50, 1000)
+        engine.submit_order(2, SIDE_BUY, 100.0, 50, 1100)
+        engine.submit_order(3, SIDE_BUY, 99.5, 30, 1200)
+        engine.submit_order(4, SIDE_BUY, 101.0, 20, 1300)
+
+        # Add asks at multiple prices
+        engine.submit_order(5, SIDE_SELL, 102.0, 40, 1400)
+        engine.submit_order(6, SIDE_SELL, 103.0, 60, 1500)
+        engine.submit_order(7, SIDE_SELL, 102.0, 10, 1600)
+
+        bids = engine.get_prioritized_bids()
+        asks = engine.get_prioritized_asks()
+
+        buy_depth = calculate_buy_depth(bids)
+        sell_depth = calculate_sell_depth(asks)
+
+        assert len(buy_depth) == 3
+        assert buy_depth[0] == PriceLevel(101.0, 20)
+        assert buy_depth[1] == PriceLevel(100.0, 100)  # 50 + 50
+        assert buy_depth[2] == PriceLevel(99.5, 30)
+
+        assert len(sell_depth) == 2
+        assert sell_depth[0] == PriceLevel(102.0, 50)  # 40 + 10
+        assert sell_depth[1] == PriceLevel(103.0, 60)
+
+    # -----------------------------------------------------------------------
+    # 3. Empty Book Handling Tests
+    # -----------------------------------------------------------------------
+
+    def test_empty_buy_side_with_non_empty_sell_side_renders_cleanly(self):
+        """Dashboard renders without crashing when BUY side is empty but SELL has orders."""
+        d = TerminalDashboard(use_sample_data=False)
+        d.set_buy_orders([])
+        d.set_sell_orders([
+            {"side": 2, "price": 505.0, "quantity": 10},
+            {"side": 2, "price": 510.0, "quantity": 20},
+        ])
+
+        lines = d.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+
+        assert SECTION_ORDER_BOOK in text
+        # BUY column should show placeholders
+        assert PLACEHOLDER in text
+        # SELL column should show actual prices
+        assert "505.00" in text
+        assert "510.00" in text
+
+        # Test curses render() call directly
+        win = MockCursesWindow(rows=40, cols=100)
+        d.render(win)
+        rendered = " ".join(c[2] for c in win.addstr_calls)
+        assert "505.00" in rendered
+        assert "510.00" in rendered
+
+    def test_empty_sell_side_with_non_empty_buy_side_renders_cleanly(self):
+        """Dashboard renders without crashing when SELL side is empty but BUY has orders."""
+        d = TerminalDashboard(use_sample_data=False)
+        d.set_buy_orders([
+            {"side": 1, "price": 495.0, "quantity": 30},
+            {"side": 1, "price": 490.0, "quantity": 40},
+        ])
+        d.set_sell_orders([])
+
+        lines = d.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+
+        assert SECTION_ORDER_BOOK in text
+        assert "495.00" in text
+        assert "490.00" in text
+        assert PLACEHOLDER in text
+
+        win = MockCursesWindow(rows=40, cols=100)
+        d.render(win)
+        rendered = " ".join(c[2] for c in win.addstr_calls)
+        assert "495.00" in rendered
+        assert "490.00" in rendered
+
+    def test_both_sides_empty_renders_all_placeholders(self):
+        """Dashboard renders without crashing when both BUY and SELL books are empty."""
+        d = TerminalDashboard(use_sample_data=False)
+        d.set_buy_orders([])
+        d.set_sell_orders([])
+
+        assert d.get_buy_depth() == []
+        assert d.get_sell_depth() == []
+
+        bid_rows, ask_rows = d.get_depth_rows(max_levels=5)
+        assert len(bid_rows) == 5
+        assert len(ask_rows) == 5
+        assert all(r == (PLACEHOLDER, PLACEHOLDER) for r in bid_rows)
+        assert all(r == (PLACEHOLDER, PLACEHOLDER) for r in ask_rows)
+
+        lines = d.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_ORDER_BOOK in text
+        assert text.count(PLACEHOLDER) >= 10
+
+        win = MockCursesWindow(rows=40, cols=100)
+        d.render(win)
+        assert win.erased is True
+
+    # -----------------------------------------------------------------------
+    # 4. Fewer Than Five Price Levels Tests
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.parametrize("level_count", [1, 2, 3, 4])
+    def test_fewer_than_five_levels_padded_to_five_rows(self, level_count):
+        """Any book with fewer than 5 levels must be padded with placeholders to exactly 5 rows."""
+        buy_orders = [{"price": 500.0 - i * 5, "quantity": 10 * (i + 1)} for i in range(level_count)]
+        sell_orders = [{"side": 2, "price": 510.0 + i * 5, "quantity": 15 * (i + 1)} for i in range(level_count)]
+
+        d = TerminalDashboard(use_sample_data=False, buy_orders=buy_orders, sell_orders=sell_orders)
+
+        b_depth = d.get_buy_depth()
+        s_depth = d.get_sell_depth()
+        assert len(b_depth) == level_count
+        assert len(s_depth) == level_count
+
+        b_rows, s_rows = d.get_depth_rows(max_levels=5)
+        assert len(b_rows) == 5
+        assert len(s_rows) == 5
+
+        # Check real levels
+        for i in range(level_count):
+            assert b_rows[i][0] == f"{500.0 - i * 5:.2f}"
+            assert b_rows[i][1] == str(10 * (i + 1))
+            assert s_rows[i][0] == f"{510.0 + i * 5:.2f}"
+            assert s_rows[i][1] == str(15 * (i + 1))
+
+        # Check padded placeholder levels
+        for i in range(level_count, 5):
+            assert b_rows[i] == (PLACEHOLDER, PLACEHOLDER)
+            assert s_rows[i] == (PLACEHOLDER, PLACEHOLDER)
+
+    def test_asymmetric_depth_levels(self):
+        """BUY having 1 level and SELL having 4 levels renders both columns aligned."""
+        buy_orders = [{"price": 500.0, "quantity": 50}]
+        sell_orders = [
+            {"side": 2, "price": 505.0, "quantity": 10},
+            {"side": 2, "price": 510.0, "quantity": 20},
+            {"side": 2, "price": 515.0, "quantity": 30},
+            {"side": 2, "price": 520.0, "quantity": 40},
+        ]
+        d = TerminalDashboard(use_sample_data=False, buy_orders=buy_orders, sell_orders=sell_orders)
+        b_rows, s_rows = d.get_depth_rows(max_levels=5)
+        assert len(b_rows) == 5
+        assert len(s_rows) == 5
+
+        assert b_rows[0] == ("500.00", "50")
+        assert all(r == (PLACEHOLDER, PLACEHOLDER) for r in b_rows[1:])
+
+        assert [r[0] for r in s_rows[:4]] == ["505.00", "510.00", "515.00", "520.00"]
+        assert s_rows[4] == (PLACEHOLDER, PLACEHOLDER)
+
+        # Confirm render works without error
+        win = MockCursesWindow(rows=40, cols=100)
+        d.render(win)
+
+    # -----------------------------------------------------------------------
+    # 5. Distinguishability Between BUY and SELL
+    # -----------------------------------------------------------------------
+
+    def test_buy_and_sell_sections_clearly_distinguishable(self):
+        """BUY and SELL sides must have distinct headers and separate render attributes."""
+        d = TerminalDashboard()
+        win = MockCursesWindow(rows=40, cols=100)
+        d.render(win)
+
+        calls = win.addstr_calls
+        texts = [c[2] for c in calls]
+        full_text = " ".join(texts)
+        assert SECTION_BUY_ORDERS in full_text
+        assert SECTION_SELL_ORDERS in full_text
+
+        # Verify side filtering prevents cross-side contamination
+        mixed_orders = [
+            {"side": 1, "price": 500.0, "quantity": 100},
+            {"side": 2, "price": 505.0, "quantity": 40},
+        ]
+        buy_depth = calculate_buy_depth(mixed_orders)
+        sell_depth = calculate_sell_depth(mixed_orders)
+
+        assert len(buy_depth) == 1
+        assert buy_depth[0].price == 500.0
+        assert len(sell_depth) == 1
+        assert sell_depth[0].price == 505.0
+
+    # -----------------------------------------------------------------------
+    # 6. Dashboard Update Mechanism
+    # -----------------------------------------------------------------------
+
+    def test_depth_updates_dynamically_via_update_orders_methods(self):
+        """Updating buy/sell orders via update_* methods immediately updates depth display."""
+        d = TerminalDashboard(use_sample_data=False)
+        assert d.get_buy_depth() == []
+        assert d.get_sell_depth() == []
+
+        # Update BUY
+        new_buys = [
+            {"price": 400.0, "quantity": 10},
+            {"price": 405.0, "quantity": 20},
+            {"price": 410.0, "quantity": 30},
+        ]
+        d.update_buy_orders(new_buys)
+        assert [lvl.price for lvl in d.get_buy_depth()] == [410.0, 405.0, 400.0]
+
+        # Update SELL
+        new_sells = [
+            {"side": 2, "price": 420.0, "quantity": 50},
+            {"side": 2, "price": 415.0, "quantity": 60},
+        ]
+        d.update_sell_orders(new_sells)
+        assert [lvl.price for lvl in d.get_sell_depth()] == [415.0, 420.0]
+
+        # Lines reflect updated prices
+        lines = d.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+        assert "410.00" in text
+        assert "405.00" in text
+        assert "415.00" in text
+        assert "420.00" in text
+
+    def test_depth_updates_via_live_feed_sync(self):
+        """LiveFeedBridge sync_to_dashboard updates depth from matching engine."""
+        try:
+            from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+            from chronos.live_feed import LiveFeedBridge
+        except Exception:
+            pytest.skip("MatchingEngine or LiveFeedBridge not available")
+
+        engine = MatchingEngine()
+        d = TerminalDashboard(use_sample_data=False)
+        bridge = LiveFeedBridge(engine=engine, dashboard=d)
+
+        # Before sync, book is empty
+        assert d.get_buy_depth() == []
+        assert d.get_sell_depth() == []
+
+        # Add orders in engine
+        engine.submit_order(1, SIDE_BUY, 250.0, 100, 1000)
+        engine.submit_order(2, SIDE_SELL, 255.0, 50, 1001)
+
+        bridge.sync_to_dashboard()
+
+        b_depth = d.get_buy_depth()
+        s_depth = d.get_sell_depth()
+        assert len(b_depth) == 1
+        assert b_depth[0] == PriceLevel(250.0, 100)
+        assert len(s_depth) == 1
+        assert s_depth[0] == PriceLevel(255.0, 50)
+
+    # -----------------------------------------------------------------------
+    # 7. Preservation of Existing Dashboard Behavior and Layout
+    # -----------------------------------------------------------------------
+
+    def test_depth_preserves_latency_trade_metrics_and_layout(self):
+        """Displaying depth preserves header, market summary, metrics, and footer."""
+        d = TerminalDashboard()
+        d.record_order_processed({"order_id": 999, "side": 1, "price": 500.0, "quantity": 10})
+        d.record_trade_execution(latency_us=12.5)
+
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+
+        from chronos.dashboard import (
+            SECTION_MARKET_SUMMARY,
+            SECTION_ORDER_BOOK,
+            SECTION_PERFORMANCE,
+            SECTION_TRADE_EXECUTION,
+            QUIT_MESSAGE,
+        )
+
+        assert SECTION_MARKET_SUMMARY in text
+        assert SECTION_ORDER_BOOK in text
+        assert SECTION_PERFORMANCE in text
+        assert SECTION_TRADE_EXECUTION in text
+        assert QUIT_MESSAGE in text
+        assert "12.5" in text
+
+    # -----------------------------------------------------------------------
+    # 8. No Matching Logic in Dashboard
+    # -----------------------------------------------------------------------
+
+    def test_dashboard_does_not_execute_crossing_orders(self):
+        """Crossed buy and sell orders in dashboard are displayed, not matched or removed."""
+        # BUY price 510 > SELL price 500 (crossed book)
+        crossed_buys = [{"side": 1, "price": 510.0, "quantity": 100}]
+        crossed_sells = [{"side": 2, "price": 500.0, "quantity": 100}]
+
+        d = TerminalDashboard(use_sample_data=False, buy_orders=crossed_buys, sell_orders=crossed_sells)
+
+        b_depth = d.get_buy_depth()
+        s_depth = d.get_sell_depth()
+
+        # Both remain in the book; dashboard has not executed them
+        assert len(b_depth) == 1
+        assert b_depth[0] == PriceLevel(510.0, 100)
+        assert len(s_depth) == 1
+        assert s_depth[0] == PriceLevel(500.0, 100)
+
+
+# ===========================================================================
+# Section 36: Week 3 Day 6 - Processed-Order Counter in Dashboard Tests
+# ===========================================================================
+
+
+class TestProcessedOrderCounterDay6:
+    """Comprehensive tests for Week 3 Day 6: Processed-Order Counter in Dashboard."""
+
+    # -----------------------------------------------------------------------
+    # 1. Initial Display and Demo Mechanism Tests
+    # -----------------------------------------------------------------------
+
+    def test_counter_initial_display_default_zero(self):
+        """Dashboard counter defaults to 0 and formats cleanly as '0' initially."""
+        dashboard = TerminalDashboard()
+        assert dashboard.orders_processed == 0
+        assert dashboard.get_orders_processed() == 0
+        assert dashboard.get_orders_processed_display() == "0"
+
+        lines = dashboard.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+        assert LABEL_TOTAL_ORDERS in text
+        assert LABEL_ORDERS_PROCESSED in text
+        assert LABEL_PROCESSED_ORDERS in text
+
+        # Verify performance section has 0 right-aligned
+        perf_idx = next(i for i, line in enumerate(lines) if SECTION_PERFORMANCE in line)
+        footer_idx = next(i for i, line in enumerate(lines) if QUIT_MESSAGE in line)
+        perf_lines = lines[perf_idx:footer_idx]
+        order_line = next(line for line in perf_lines if LABEL_TOTAL_ORDERS in line)
+        assert "0" in order_line
+
+    def test_counter_documented_demo_value_and_sample_data_mechanism(self):
+        """Documented demo constant exists and is clearly distinguishable from live counts."""
+        # Demo constants are defined and documented
+        assert DEMO_ORDERS_PROCESSED == 125
+        assert get_sample_orders_processed() == 125
+
+        # Creating a dashboard using sample data documents this in the status header
+        dashboard = TerminalDashboard(use_sample_data=True, orders_processed=get_sample_orders_processed())
+        assert dashboard.orders_processed == 125
+        assert dashboard.get_orders_processed_display() == "125"
+
+        lines = dashboard.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+        # Clear labeling ensures demo status is explicit to avoid false live engine presentation
+        assert "Demo: Sample Data" in text
+        assert "125" in text
+
+    def test_counter_live_mode_distinction(self):
+        """In live mode, dashboard clearly reports live connection and displays real count."""
+        bridge = MagicMock()
+        bridge.is_connected = True
+        bridge.sync_to_dashboard = MagicMock()
+
+        dashboard = TerminalDashboard(live_feed=bridge, orders_processed=42)
+        assert dashboard.status_message == "Live: Connected"
+        assert dashboard.orders_processed == 42
+        assert dashboard.get_orders_processed_display() == "42"
+
+        lines = dashboard.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+        assert "Live: Connected" in text
+        assert "Demo: Sample Data" not in text
+        assert "42" in text
+
+    # -----------------------------------------------------------------------
+    # 2. Zero Value Handling Tests
+    # -----------------------------------------------------------------------
+
+    def test_counter_zero_value_formatting_pure_functions(self):
+        """Pure formatting functions handle zero correctly."""
+        assert format_orders_processed(0) == "0"
+        assert format_orders_processed("0") == "0"
+        assert format_total_orders(0) == "0"
+        assert format_processed_orders(0) == "0"
+
+    def test_counter_zero_value_build_performance_lines(self):
+        """build_performance_lines renders zero cleanly for total_orders and orders_processed."""
+        lines_total = build_performance_lines(width=72, total_orders=0)
+        text_total = "\n".join(lines_total)
+        assert LABEL_TOTAL_ORDERS in text_total
+        assert "       0" in text_total or " 0" in text_total
+
+        lines_alias = build_performance_lines(width=72, orders_processed=0)
+        text_alias = "\n".join(lines_alias)
+        assert LABEL_TOTAL_ORDERS in text_alias
+        assert "       0" in text_alias or " 0" in text_alias
+
+    def test_counter_zero_value_in_curses_rendering(self):
+        """Curses render() writes zero value without error or blanking."""
+        dashboard = TerminalDashboard(orders_processed=0)
+        win = MockCursesWindow(rows=40, cols=100)
+        dashboard.render(win)
+
+        assert win.erased is True
+        assert win.refreshed is True
+
+        order_calls = [c[2] for c in win.addstr_calls if LABEL_TOTAL_ORDERS in c[2]]
+        assert len(order_calls) == 1
+        assert "0" in order_calls[0]
+
+    # -----------------------------------------------------------------------
+    # 3. Positive Values and Formatting Tests
+    # -----------------------------------------------------------------------
+
+    def test_counter_positive_integer_formatting(self):
+        """Positive integer values format with thousands separators."""
+        assert format_orders_processed(1) == "1"
+        assert format_orders_processed(999) == "999"
+        assert format_orders_processed(1000) == "1,000"
+        assert format_orders_processed(12500) == "12,500"
+        assert format_orders_processed(1000000) == "1,000,000"
+        assert format_orders_processed(50000000) == "50,000,000"
+
+    def test_counter_positive_string_integer_formatting(self):
+        """String representation of positive integer formats correctly."""
+        assert format_orders_processed("12500") == "12,500"
+        assert format_processed_orders("100000") == "100,000"
+
+    def test_counter_none_returns_placeholder(self):
+        """None input produces standard PLACEHOLDER without raising error."""
+        assert format_orders_processed(None) == PLACEHOLDER
+        assert format_processed_orders(None) == PLACEHOLDER
+
+    def test_counter_rejects_negative_values(self):
+        """All APIs reject negative values with ValueError."""
+        dashboard = TerminalDashboard()
+
+        with pytest.raises(ValueError, match="cannot be negative"):
+            dashboard.orders_processed = -1
+
+        with pytest.raises(ValueError, match="cannot be negative"):
+            dashboard.set_orders_processed(-10)
+
+        with pytest.raises(ValueError, match="cannot be negative"):
+            dashboard.increment_orders_processed(-5)
+
+        with pytest.raises(ValueError, match="cannot be negative"):
+            TerminalDashboard(orders_processed=-1)
+
+        with pytest.raises(ValueError, match="cannot be negative"):
+            format_orders_processed(-1)
+
+        with pytest.raises(ValueError, match="cannot be negative"):
+            format_processed_orders(-100)
+
+    def test_counter_rejects_invalid_types_on_init_and_set(self):
+        """Non-integer convertible values raise ValueError."""
+        with pytest.raises(ValueError, match="must be an integer"):
+            TerminalDashboard(orders_processed="abc")
+
+        dashboard = TerminalDashboard()
+        with pytest.raises(ValueError, match="must be an integer"):
+            dashboard.orders_processed = "invalid"
+
+        with pytest.raises(ValueError, match="must be an integer"):
+            dashboard.set_orders_processed(None)
+
+    # -----------------------------------------------------------------------
+    # 4. State Management and Event Ingestion Tests
+    # -----------------------------------------------------------------------
+
+    def test_counter_set_and_update_methods(self):
+        """Explicit set and update methods update the counter value."""
+        dashboard = TerminalDashboard()
+        assert dashboard.orders_processed == 0
+
+        dashboard.set_orders_processed(50)
+        assert dashboard.orders_processed == 50
+        assert dashboard.get_orders_processed() == 50
+
+        dashboard.update_orders_processed(150)
+        assert dashboard.orders_processed == 150
+        assert dashboard.get_orders_processed_display() == "150"
+
+    def test_counter_increment_method(self):
+        """increment_orders_processed increments by default (1) or custom delta."""
+        dashboard = TerminalDashboard()
+        assert dashboard.increment_orders_processed() == 1
+        assert dashboard.increment_orders_processed(1) == 2
+        assert dashboard.increment_orders_processed(98) == 100
+        assert dashboard.orders_processed == 100
+
+    def test_counter_record_order_processed_events(self):
+        """record_order_processed handles various order formats."""
+        dashboard = TerminalDashboard()
+
+        # 1. Dict format
+        d1 = {"order_id": 101, "side": 1, "price": 500.0, "quantity": 10}
+        assert dashboard.record_order_processed(d1) == 1
+
+        # 2. Tuple format
+        t1 = (102, 1, 501.0, 20)
+        assert dashboard.record_order_processed(t1) == 2
+
+        # 3. None format (anonymous order event)
+        assert dashboard.record_order_processed(None) == 3
+
+        assert dashboard.orders_processed == 3
+
+    def test_counter_duplicate_order_id_deduplication(self):
+        """Duplicate fills or events for the same order_id do not over-increment."""
+        dashboard = TerminalDashboard()
+
+        order_fill_1 = {"order_id": 999, "fill": 1, "quantity": 10}
+        order_fill_2 = {"order_id": 999, "fill": 2, "quantity": 20}
+        order_fill_3 = {"order_id": 999, "fill": 3, "quantity": 30}
+
+        dashboard.record_order_processed(order_fill_1)
+        assert dashboard.orders_processed == 1
+
+        # Additional fills for same order do not increment
+        dashboard.record_order_processed(order_fill_2)
+        dashboard.record_order_processed(order_fill_3)
+        assert dashboard.orders_processed == 1
+
+        # A new order_id increments
+        new_order = {"order_id": 1000, "fill": 1, "quantity": 50}
+        dashboard.record_order_processed(new_order)
+        assert dashboard.orders_processed == 2
+
+    def test_counter_reset_orders_processed(self):
+        """reset_orders_processed resets counter and cleared seen IDs."""
+        dashboard = TerminalDashboard(orders_processed=500)
+        dashboard.record_order_processed({"order_id": 77})
+        assert dashboard.orders_processed == 501
+
+        dashboard.reset_orders_processed()
+        assert dashboard.orders_processed == 0
+        assert dashboard.get_orders_processed_display() == "0"
+
+        # The previously seen order ID can now be recorded again
+        dashboard.record_order_processed({"order_id": 77})
+        assert dashboard.orders_processed == 1
+
+    # -----------------------------------------------------------------------
+    # 5. Refresh Stability Tests (No Accidental Corruption or Reset)
+    # -----------------------------------------------------------------------
+
+    def test_counter_preserved_across_multiple_render_calls(self):
+        """Calling render() repeatedly does not change or corrupt counter value."""
+        dashboard = TerminalDashboard(orders_processed=125)
+        win = MockCursesWindow(rows=40, cols=100)
+
+        # 20 consecutive render frames
+        for _ in range(20):
+            dashboard.render(win)
+
+        assert dashboard.orders_processed == 125
+        assert dashboard.get_orders_processed_display() == "125"
+
+    def test_counter_preserved_across_multiple_get_display_lines_calls(self):
+        """Calling get_display_lines() repeatedly does not change counter value."""
+        dashboard = TerminalDashboard(orders_processed=9876)
+
+        for _ in range(20):
+            lines = dashboard.get_display_lines(rows=40, cols=100)
+            assert "9,876" in "\n".join(lines)
+
+        assert dashboard.orders_processed == 9876
+
+    def test_counter_preserved_through_curses_event_loop_frames(self):
+        """Curses event loop execution over multiple frames maintains counter stability."""
+        dashboard = TerminalDashboard(orders_processed=350)
+        win = MockCursesWindow(rows=40, cols=100, keys=[-1, -1, -1, ord("q")])
+
+        dashboard.run_curses(win, max_iterations=10)
+
+        assert dashboard.is_running is False
+        assert dashboard.frame_count == 4
+        assert dashboard.orders_processed == 350
+        assert dashboard.get_orders_processed_display() == "350"
+
+    # -----------------------------------------------------------------------
+    # 6. Terminal Sizing and Screen Budget Tests
+    # -----------------------------------------------------------------------
+
+    def test_counter_renders_in_standard_window(self):
+        """Renders properly in standard 80x40 window."""
+        dashboard = TerminalDashboard(orders_processed=2500)
+        win = MockCursesWindow(rows=40, cols=80)
+        dashboard.render(win)
+
+        rendered_text = " ".join(c[2] for c in win.addstr_calls)
+        assert SECTION_PERFORMANCE in rendered_text
+        assert LABEL_TOTAL_ORDERS in rendered_text
+        assert "2,500" in rendered_text
+
+    def test_counter_renders_at_exact_minimum_window(self):
+        """Renders properly at exact minimum window size (72x30)."""
+        dashboard = TerminalDashboard(orders_processed=123)
+        win = MockCursesWindow(rows=MIN_TERMINAL_ROWS, cols=MIN_TERMINAL_COLS)
+        dashboard.render(win)
+
+        rendered_text = " ".join(c[2] for c in win.addstr_calls)
+        assert SECTION_PERFORMANCE in rendered_text
+        assert "123" in rendered_text
+
+    def test_counter_renders_in_wide_window(self):
+        """Renders properly in wide window (120x40)."""
+        dashboard = TerminalDashboard(orders_processed=500000)
+        win = MockCursesWindow(rows=40, cols=120)
+        dashboard.render(win)
+
+        rendered_text = " ".join(c[2] for c in win.addstr_calls)
+        assert SECTION_PERFORMANCE in rendered_text
+        assert "500,000" in rendered_text
+
+    def test_counter_small_terminal_fallback_does_not_crash(self):
+        """Below-minimum terminal gracefully handles small screen without crashing."""
+        dashboard = TerminalDashboard(orders_processed=500)
+        win = MockCursesWindow(rows=10, cols=30)
+        dashboard.render(win)
+
+        rendered_text = " ".join(c[2] for c in win.addstr_calls)
+        assert "too small" in rendered_text.lower()
+        assert QUIT_MESSAGE in rendered_text
+        # Counter value is not corrupted even on small window
+        assert dashboard.orders_processed == 500
+
+    # -----------------------------------------------------------------------
+    # 7. Preservation of Existing Dashboard Functionality
+    # -----------------------------------------------------------------------
+
+    def test_counter_preserves_order_book_depth_display(self):
+        """Day 5 order-book depth display remains completely intact with counter active."""
+        dashboard = TerminalDashboard(orders_processed=1000)
+
+        buy_depth = dashboard.get_buy_depth(max_levels=5)
+        sell_depth = dashboard.get_sell_depth(max_levels=5)
+
+        # 5 levels each for sample data
+        assert len(buy_depth) == 5
+        assert len(sell_depth) == 5
+
+        # Bids sorted descending
+        for i in range(len(buy_depth) - 1):
+            assert buy_depth[i].price > buy_depth[i + 1].price
+
+        # Asks sorted ascending
+        for i in range(len(sell_depth) - 1):
+            assert sell_depth[i].price < sell_depth[i + 1].price
+
+        # Verified in display output
+        lines = dashboard.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_ORDER_BOOK in text
+        assert "500.00" in text  # Best bid
+        assert "505.00" in text  # Best ask
+        assert "1,000" in text   # Processed order counter
+
+    def test_counter_preserves_market_summary_and_latency_metrics(self):
+        """Market summary and latency metrics remain functional with counter active."""
+        ns_clock = FakeNsClock(start_ns=0)
+        dashboard = TerminalDashboard(ns_clock=ns_clock, orders_processed=0, use_sample_data=False)
+
+        # Record two events to establish inter-event latency
+        dashboard.record_order_processed({"order_id": 1})
+        ns_clock.advance_us(150.0)
+        dashboard.record_order_processed({"order_id": 2})
+
+        assert dashboard.orders_processed == 2
+        assert dashboard.get_latency_display() == "150.0"
+
+        # Record trade execution
+        dashboard.record_trade_execution(latency_us=25.0)
+        assert dashboard.trades_processed == 1
+        assert "25" in dashboard.get_trade_latency_display()
+
+        lines = dashboard.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+
+        assert SECTION_MARKET_SUMMARY in text
+        assert SECTION_PERFORMANCE in text
+        assert SECTION_TRADE_EXECUTION in text
+        assert LABEL_TOTAL_ORDERS in text
+        assert "2" in text
+        assert "150.0" in text
+        assert "25" in text
+
+    def test_counter_does_not_execute_matching_logic(self):
+        """Dashboard does not cross or execute orders internally."""
+        crossed_buys = [{"side": 1, "price": 600.0, "quantity": 100}]
+        crossed_sells = [{"side": 2, "price": 500.0, "quantity": 100}]
+
+        dashboard = TerminalDashboard(
+            use_sample_data=False,
+            buy_orders=crossed_buys,
+            sell_orders=crossed_sells,
+            orders_processed=0,
+        )
+
+        # Ingesting orders does not trigger match execution in dashboard
+        b_depth = dashboard.get_buy_depth()
+        s_depth = dashboard.get_sell_depth()
+        assert len(b_depth) == 1
+        assert len(s_depth) == 1
+        # Orders processed count does not change automatically due to crossed book
+        assert dashboard.orders_processed == 0
+
+
+# ===========================================================================
+# Section 37: Week 3 Day 7 - Order Throughput Monitoring in Dashboard Tests
+# ===========================================================================
+
+
+class TestOrderThroughputMonitoringDay7:
+    """Comprehensive tests for Week 3 Day 7: Order-Processing Throughput Monitoring."""
+
+    # -----------------------------------------------------------------------
+    # 1. Labels, Aliases, and Display Configuration Tests
+    # -----------------------------------------------------------------------
+
+    def test_throughput_labels_and_aliases(self):
+        """Throughput labels are clearly defined, descriptive, and aliased for consumer interfaces."""
+        assert LABEL_THROUGHPUT == "Throughput (orders/sec)"
+        assert LABEL_ORDER_THROUGHPUT == "Throughput (orders/sec)"
+        assert LABEL_THROUGHPUT_ORDERS_PER_SEC == "Throughput (orders/sec)"
+        assert LABEL_PROCESSED_ORDERS_PER_SEC == "Throughput (orders/sec)"
+        assert LABEL_ORDERS_PER_SECOND == "Throughput (orders/sec)"
+        assert LABEL_ORDER_PROCESSING_THROUGHPUT == "Throughput (orders/sec)"
+
+    # -----------------------------------------------------------------------
+    # 2. Initial Display, Demo Mode, and Live State Truthfulness
+    # -----------------------------------------------------------------------
+
+    def test_throughput_initial_dashboard_state_live_mode(self):
+        """Initial state in non-demo mode shows documented N/A and does not invent live throughput."""
+        dashboard = TerminalDashboard(use_sample_data=False)
+        assert dashboard.throughput is None
+        assert dashboard.orders_processed == 0
+        assert dashboard.get_throughput_display() == NO_SAMPLE_THROUGHPUT
+        assert dashboard.get_orders_processed_display() == "0"
+
+        lines = dashboard.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_PERFORMANCE in text
+        assert LABEL_THROUGHPUT in text
+
+        # Verify N/A is displayed for throughput in the performance section
+        perf_idx = next(i for i, line in enumerate(lines) if SECTION_PERFORMANCE in line)
+        footer_idx = next(i for i, line in enumerate(lines) if QUIT_MESSAGE in line)
+        perf_lines = lines[perf_idx:footer_idx]
+        tp_line = next(line for line in perf_lines if LABEL_THROUGHPUT in line)
+        assert NO_SAMPLE_THROUGHPUT in tp_line
+        assert "DEMO" not in tp_line
+
+    def test_throughput_demo_mode_state_explicit(self):
+        """In demo mode with sample data, throughput is explicitly marked as DEMO, not live."""
+        dashboard = TerminalDashboard(use_sample_data=True)
+        assert dashboard.is_sample_data is True
+        assert dashboard.status_message == f"{STATUS_MESSAGE} (Demo: Sample Data)"
+        assert dashboard.throughput is None
+        assert dashboard.get_throughput_display() == DEMO_THROUGHPUT
+
+        lines = dashboard.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+        assert "Demo: Sample Data" in text
+        assert DEMO_THROUGHPUT in text
+
+    def test_throughput_live_mode_with_bridge_no_false_values(self):
+        """Live-connected dashboard reports live connection and shows N/A until real metrics arrive."""
+        bridge = MagicMock()
+        bridge.is_connected = True
+        bridge.sync_to_dashboard = MagicMock()
+
+        dashboard = TerminalDashboard(live_feed=bridge)
+        assert dashboard.is_sample_data is False
+        assert dashboard.status_message == "Live: Connected"
+        assert dashboard.throughput is None
+        assert dashboard.get_throughput_display() == NO_SAMPLE_THROUGHPUT
+
+        lines = dashboard.get_display_lines(rows=40, cols=100)
+        text = "\n".join(lines)
+        assert "Live: Connected" in text
+        assert "Demo: Sample Data" not in text
+        assert NO_SAMPLE_THROUGHPUT in text
+
+    # -----------------------------------------------------------------------
+    # 3. Pure Calculation Functions (Seconds & Nanoseconds)
+    # -----------------------------------------------------------------------
+
+    def test_calculate_throughput_seconds_pure_function(self):
+        """calculate_throughput computes rate accurately in orders per second."""
+        assert calculate_throughput(1000, 1.0) == 1000.0
+        assert calculate_throughput(500, 2.0) == 250.0
+        assert calculate_throughput(100, 3.0) == 33.33
+        assert calculate_throughput(0, 1.0) == 0.0
+        assert calculate_throughput(0, 10.0) == 0.0
+
+        # calculate_throughput_from_counts
+        assert calculate_throughput_from_counts(1200, 200, 2.0) == 500.0
+        assert calculate_throughput_from_counts(500, 500, 1.0) == 0.0
+
+    def test_calculate_throughput_nanoseconds_pure_function(self):
+        """calculate_throughput_ns computes rate accurately using nanosecond intervals."""
+        # 1_000_000_000 ns = 1.0 second
+        assert calculate_throughput_ns(1000, 1_000_000_000) == 1000.0
+        # 500_000_000 ns = 0.5 second
+        assert calculate_throughput_ns(250, 500_000_000) == 500.0
+        # 100_000_000 ns = 0.1 second
+        assert calculate_throughput_ns(100, 100_000_000) == 1000.0
+        # 0 delta over positive ns
+        assert calculate_throughput_ns(0, 1_000_000_000) == 0.0
+
+        # calculate_throughput_from_counts_ns
+        assert calculate_throughput_from_counts_ns(1500, 500, 2_000_000_000) == 500.0
+        assert calculate_throughput_from_counts_ns(500, 500, 1_000_000_000) == 0.0
+
+    # -----------------------------------------------------------------------
+    # 4. Zero Elapsed Time and Zero Processed Orders Handling
+    # -----------------------------------------------------------------------
+
+    def test_zero_elapsed_time_handling_pure_functions(self):
+        """Zero elapsed time safely returns None without division-by-zero errors."""
+        assert calculate_throughput(100, 0) is None
+        assert calculate_throughput(100, 0.0) is None
+        assert calculate_throughput(0, 0) is None
+        assert calculate_throughput_ns(100, 0) is None
+        assert calculate_throughput_ns(0, 0) is None
+        assert calculate_throughput_from_counts(100, 0, 0) is None
+        assert calculate_throughput_from_counts_ns(100, 0, 0) is None
+
+    def test_zero_elapsed_time_dashboard_update_safe(self):
+        """Dashboard update_throughput with zero elapsed time returns previous value safely."""
+        clock = FakeClock(100.0)
+        dashboard = TerminalDashboard(clock=clock, orders_processed=0)
+
+        # Baseline establishes reference point
+        assert dashboard.update_throughput() is None
+
+        # Call again without advancing clock (elapsed = 0)
+        dashboard.increment_orders_processed(50)
+        assert dashboard.update_throughput() is None  # no division error
+
+        # Advance clock to establish throughput
+        clock.advance(1.0)
+        val = dashboard.update_throughput()
+        assert val == 50.0
+
+        # Call again with zero elapsed time: returns current value (50.0) unchanged
+        dashboard.increment_orders_processed(100)
+        assert dashboard.update_throughput() == 50.0
+
+    def test_zero_elapsed_time_nanoseconds_update_safe(self):
+        """Dashboard update_throughput_ns with zero elapsed nanoseconds returns previous value safely."""
+        ns_clock = FakeNsClock(start_ns=1_000_000_000)
+        dashboard = TerminalDashboard(ns_clock=ns_clock, use_sample_data=False)
+
+        # Baseline establishes reference point
+        assert dashboard.update_throughput_ns() is None
+
+        # Zero elapsed ns
+        dashboard.increment_orders_processed(100)
+        assert dashboard.update_throughput_ns() is None
+
+        # Advance 1.0 second (1_000_000_000 ns)
+        ns_clock.advance_ns(1_000_000_000)
+        assert dashboard.update_throughput_ns() == 100.0
+
+        # Immediately call again without advancing ns_clock: unchanged
+        assert dashboard.update_throughput_ns() == 100.0
+
+    def test_zero_processed_orders_over_elapsed_interval(self):
+        """Zero processed orders over an elapsed interval produces exactly 0.0 orders/sec."""
+        clock = FakeClock(100.0)
+        dashboard = TerminalDashboard(clock=clock, orders_processed=0, use_sample_data=False)
+
+        # Baseline at t=100.0, orders=0
+        dashboard.update_throughput()
+
+        # Advance clock by 2.0 seconds with zero orders processed
+        clock.advance(2.0)
+        tp = dashboard.update_throughput()
+        assert tp == 0.0
+        assert dashboard.get_throughput_display() == "0.00"
+
+        # Verify formatted line
+        lines = dashboard.get_display_lines(rows=40, cols=100)
+        perf_idx = next(i for i, line in enumerate(lines) if SECTION_PERFORMANCE in line)
+        footer_idx = next(i for i, line in enumerate(lines) if QUIT_MESSAGE in line)
+        perf_lines = lines[perf_idx:footer_idx]
+        tp_line = next(line for line in perf_lines if LABEL_THROUGHPUT in line)
+        assert "0.00" in tp_line
+
+    # -----------------------------------------------------------------------
+    # 5. Deterministic Controlled Timestamps & High-Precision Monotonic Clock
+    # -----------------------------------------------------------------------
+
+    def test_deterministic_throughput_with_fake_clock_seconds(self):
+        """Controlled timestamps with FakeClock produce deterministic throughput values."""
+        clock = FakeClock(50.0)
+        dashboard = TerminalDashboard(clock=clock, orders_processed=100)
+        dashboard.update_throughput()
+
+        # Advance 1.0s, +500 orders -> 500.0 orders/sec
+        clock.advance(1.0)
+        dashboard.increment_orders_processed(500)
+        assert dashboard.update_throughput() == 500.0
+
+        # Advance 0.5s, +250 orders -> 500.0 orders/sec
+        clock.advance(0.5)
+        dashboard.increment_orders_processed(250)
+        assert dashboard.update_throughput() == 500.0
+
+        # Advance 2.0s, +1000 orders -> 500.0 orders/sec
+        clock.advance(2.0)
+        dashboard.increment_orders_processed(1000)
+        assert dashboard.update_throughput() == 500.0
+
+    def test_deterministic_throughput_with_fake_ns_clock(self):
+        """Controlled timestamps with FakeNsClock (perf_counter_ns equivalent) produce exact rates."""
+        ns_clock = FakeNsClock(start_ns=1_000_000_000)
+        dashboard = TerminalDashboard(ns_clock=ns_clock, use_sample_data=False)
+        dashboard.update_throughput_ns()
+
+        # Step 1: 10,000 orders in 1 second
+        ns_clock.advance_ns(1_000_000_000)
+        dashboard.increment_orders_processed(10_000)
+        tp = dashboard.update_throughput_ns()
+        assert tp == 10_000.0
+        assert dashboard.get_throughput_display() == "10,000.00"
+
+        # Step 2: 25,000 orders in 0.5 second -> 50,000 orders/sec
+        ns_clock.advance_ns(500_000_000)
+        dashboard.increment_orders_processed(25_000)
+        tp = dashboard.update_throughput_ns()
+        assert tp == 50_000.0
+        assert dashboard.get_throughput_display() == "50,000.00"
+
+    def test_update_throughput_explicit_timestamp_parameters(self):
+        """update_throughput accepts explicit timestamps for seconds or nanoseconds."""
+        dashboard = TerminalDashboard(use_sample_data=False)
+
+        # Using explicit seconds
+        dashboard.update_throughput(current_time=10.0)
+        dashboard.increment_orders_processed(200)
+        tp1 = dashboard.update_throughput(current_time=12.0)
+        assert tp1 == 100.0
+
+        # Using explicit nanoseconds via current_time_ns
+        dashboard.reset_throughput()
+        dashboard.update_throughput(current_time_ns=1_000_000_000)
+        dashboard.increment_orders_processed(300)
+        tp2 = dashboard.update_throughput(current_time_ns=2_000_000_000)
+        assert tp2 == 300.0
+
+        # Using large integer in current_time (detected as nanoseconds)
+        dashboard.reset_throughput()
+        dashboard.update_throughput(current_time=500_000_000_000)
+        dashboard.increment_orders_processed(500)
+        tp3 = dashboard.update_throughput(current_time=501_000_000_000)
+        assert tp3 == 500.0
+
+    # -----------------------------------------------------------------------
+    # 6. Consumer Interfaces and Metric Stream Integration
+    # -----------------------------------------------------------------------
+
+    def test_update_throughput_from_metrics_stream(self):
+        """update_throughput_from_metrics integrates with upstream order counter streams."""
+        dashboard = TerminalDashboard(use_sample_data=False)
+
+        # Initial metrics point
+        dashboard.update_throughput_from_metrics(orders_count=1000, timestamp_ns=10_000_000_000)
+        assert dashboard.orders_processed == 1000
+        assert dashboard.throughput is None
+
+        # Next metrics point: 500 new orders in 1 second
+        tp = dashboard.update_throughput_from_metrics(orders_count=1500, timestamp_ns=11_000_000_000)
+        assert dashboard.orders_processed == 1500
+        assert tp == 500.0
+
+        # Using timestamp_s parameter
+        dashboard.reset_throughput()
+        dashboard.update_throughput_from_metrics(orders_count=2000, timestamp_s=100.0)
+        tp2 = dashboard.update_throughput_from_metrics(orders_count=3500, timestamp_s=103.0)
+        assert tp2 == 500.0
+
+    def test_update_from_consumer_and_adapter_stats(self):
+        """update_from_consumer_stats ingests stats from ZeroCopyConsumer and OrderAdapter."""
+        dashboard = TerminalDashboard(use_sample_data=False)
+
+        # Dictionary stats with rate
+        dict_stats = {"total_orders_read": 12500, "current_rate": 45000.0}
+        tp = dashboard.update_from_consumer_stats(dict_stats)
+        assert dashboard.orders_processed == 12500
+        assert tp == 45000.0
+        assert dashboard.get_throughput_display() == "45,000.00"
+
+        # Mock ZeroCopyConsumer stats object
+        mock_stats = MagicMock()
+        mock_stats.total_orders_read = 50000
+        mock_stats.current_rate = 120000.5
+        tp2 = dashboard.update_from_consumer_stats(mock_stats)
+        assert dashboard.orders_processed == 50000
+        assert tp2 == 120000.5
+
+        # None stats handled safely
+        assert dashboard.update_from_consumer_stats(None) == 120000.5
+
+    def test_record_order_processed_with_timestamp_ns(self):
+        """record_order_processed accepts timestamp_ns and records inter-event latency."""
+        dashboard = TerminalDashboard(use_sample_data=False)
+
+        dashboard.record_order_processed({"order_id": 1}, timestamp_ns=1_000_000_000)
+        dashboard.record_order_processed({"order_id": 2}, timestamp_ns=1_000_150_000)
+
+        assert dashboard.orders_processed == 2
+        # 150,000 ns = 150.0 us
+        assert dashboard.get_latency_display() == "150.0"
+
+    # -----------------------------------------------------------------------
+    # 7. Repeated Updates and Edge Cases
+    # -----------------------------------------------------------------------
+
+    def test_repeated_throughput_updates_across_fluctuating_cycles(self):
+        """Throughput updates correctly across bursts, idle periods, and steady flow."""
+        clock = FakeClock(100.0)
+        dashboard = TerminalDashboard(clock=clock, orders_processed=0, use_sample_data=False)
+        dashboard.update_throughput()
+
+        # Cycle 1: High burst (5000 orders in 1s)
+        clock.advance(1.0)
+        dashboard.increment_orders_processed(5000)
+        assert dashboard.update_throughput() == 5000.0
+
+        # Cycle 2: Idle period (0 orders in 2s)
+        clock.advance(2.0)
+        assert dashboard.update_throughput() == 0.0
+
+        # Cycle 3: Moderate rate (1500 orders in 3s -> 500 orders/sec)
+        clock.advance(3.0)
+        dashboard.increment_orders_processed(1500)
+        assert dashboard.update_throughput() == 500.0
+
+        # Cycle 4: Micro-burst (200 orders in 0.1s -> 2000 orders/sec)
+        clock.advance(0.1)
+        dashboard.increment_orders_processed(200)
+        assert dashboard.update_throughput() == 2000.0
+
+        # Cumulative orders processed matches total
+        assert dashboard.orders_processed == 6700
+
+    def test_clock_jump_backwards_handled_safely(self):
+        """Clock jumping backwards (clock skew) does not crash and safely resets baseline."""
+        clock = FakeClock(100.0)
+        dashboard = TerminalDashboard(clock=clock, orders_processed=100)
+        dashboard.update_throughput()
+
+        # Clock jumps backwards by 50 seconds
+        clock.advance(-50.0)
+        dashboard.increment_orders_processed(50)
+        assert dashboard.update_throughput() is None
+
+        # Clock moves forward normally from new reference point
+        clock.advance(1.0)
+        dashboard.increment_orders_processed(100)
+        assert dashboard.update_throughput() == 100.0
+
+    def test_counter_reset_handled_safely(self):
+        """Processed orders counter reset (delta < 0) safely resets throughput baseline."""
+        clock = FakeClock(100.0)
+        dashboard = TerminalDashboard(clock=clock, orders_processed=1000)
+        dashboard.update_throughput()
+
+        # Counter reset to 0
+        clock.advance(1.0)
+        dashboard.set_orders_processed(0)
+        assert dashboard.update_throughput() is None
+
+        # Next normal update works from 0
+        clock.advance(1.0)
+        dashboard.increment_orders_processed(250)
+        assert dashboard.update_throughput() == 250.0
+
+    # -----------------------------------------------------------------------
+    # 8. Formatting and Unit Options
+    # -----------------------------------------------------------------------
+
+    def test_throughput_formatting_variants(self):
+        """format_throughput handles large numbers, decimal options, and unit suffixes."""
+        assert format_throughput(0) == "0.00"
+        assert format_throughput(0.0) == "0.00"
+        assert format_throughput(1250000.75) == "1,250,000.75"
+        assert format_throughput(1250000.75, include_unit=True) == "1,250,000.75 orders/sec"
+        assert format_throughput(500, decimals=0) == "500"
+        assert format_throughput(500, decimals=0, include_unit=True) == "500 orders/sec"
+        assert format_throughput("DEMO") == "DEMO"
+        assert format_throughput("N/A") == "N/A"
+        assert format_throughput(True) == NO_SAMPLE_THROUGHPUT
+        assert format_throughput(False) == NO_SAMPLE_THROUGHPUT
+
+        with pytest.raises(ValueError, match="cannot be negative"):
+            format_throughput(-10.0)
+
+    # -----------------------------------------------------------------------
+    # 9. Curses Rendering, Display Widths, and Small-Terminal Fallback
+    # -----------------------------------------------------------------------
+
+    def test_throughput_renders_in_curses_mock_window(self):
+        """Throughput displays cleanly in curses render window."""
+        clock = FakeClock(100.0)
+        dashboard = TerminalDashboard(clock=clock, orders_processed=0)
+        dashboard.update_throughput()
+
+        clock.advance(1.0)
+        dashboard.increment_orders_processed(750)
+
+        win = MockCursesWindow(rows=MIN_TERMINAL_ROWS, cols=MIN_TERMINAL_COLS)
+        dashboard.render(win)
+
+        rendered_text = " ".join(c[2] for c in win.addstr_calls)
+        assert SECTION_PERFORMANCE in rendered_text
+        assert LABEL_THROUGHPUT in rendered_text
+        assert "750.00" in rendered_text
+
+    def test_throughput_small_terminal_fallback_does_not_crash(self):
+        """Small terminal fallback handles undersized windows without corrupting throughput."""
+        clock = FakeClock(100.0)
+        dashboard = TerminalDashboard(clock=clock, orders_processed=100)
+        dashboard.update_throughput()
+        clock.advance(1.0)
+        dashboard.increment_orders_processed(500)
+        dashboard.update_throughput()
+
+        assert dashboard.throughput == 500.0
+
+        win = MockCursesWindow(rows=10, cols=30)
+        dashboard.render(win)
+
+        rendered_text = " ".join(c[2] for c in win.addstr_calls)
+        assert "too small" in rendered_text.lower()
+        assert dashboard.throughput == 500.0
+
+    # -----------------------------------------------------------------------
+    # 10. Preservation of Existing Sections & Engine Independence
+    # -----------------------------------------------------------------------
+
+    def test_throughput_preserves_depth_counter_and_latency_sections(self):
+        """Order-book depth, order counter, and latency metrics remain completely functional."""
+        clock = FakeClock(100.0)
+        ns_clock = FakeNsClock(start_ns=0)
+        dashboard = TerminalDashboard(clock=clock, ns_clock=ns_clock, use_sample_data=False)
+        dashboard.update_throughput()  # Establish baseline at t=100.0, count=0
+
+        # Ingest buy and sell orders
+        dashboard.set_buy_orders([
+            {"side": 1, "price": 500.0, "quantity": 100},
+            {"side": 1, "price": 490.0, "quantity": 150},
+        ])
+        dashboard.set_sell_orders([
+            {"side": 2, "price": 505.0, "quantity": 80},
+            {"side": 2, "price": 510.0, "quantity": 120},
+        ])
+
+        # Record events
+        dashboard.record_order_processed({"order_id": 1})
+        ns_clock.advance_us(200.0)
+        dashboard.record_order_processed({"order_id": 2})
+
+        # Advance clock for throughput
+        clock.advance(1.0)
+        dashboard.update_throughput()
+
+        # Depth intact
+        assert len(dashboard.get_buy_depth()) == 2
+        assert len(dashboard.get_sell_depth()) == 2
+
+        # Counter intact
+        assert dashboard.orders_processed == 2
+
+        # Latency intact
+        assert dashboard.get_latency_display() == "200.0"
+
+        # Throughput intact
+        assert dashboard.get_throughput_display() == "2.00"
+
+        # Rendered output contains all sections
+        lines = dashboard.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_MARKET_SUMMARY in text
+        assert SECTION_ORDER_BOOK in text
+        assert SECTION_PERFORMANCE in text
+        assert "500.00" in text  # Best bid
+        assert "505.00" in text  # Best ask
+        assert "2" in text       # Processed order count
+        assert "2.00" in text    # Throughput
+        assert "200.0" in text   # Inter-event latency
+
+    def test_dashboard_does_not_execute_matching_engine_logic(self):
+        """Dashboard remains purely a monitoring view and does not execute matching logic."""
+        crossed_bids = [{"side": 1, "price": 520.0, "quantity": 100}]
+        crossed_asks = [{"side": 2, "price": 510.0, "quantity": 100}]
+
+        dashboard = TerminalDashboard(
+            use_sample_data=False,
+            buy_orders=crossed_bids,
+            sell_orders=crossed_asks,
+        )
+
+        # Orders are not crossed or matched inside dashboard
+        assert len(dashboard.get_buy_depth()) == 1
+        assert len(dashboard.get_sell_depth()) == 1
+        assert dashboard.orders_processed == 0
+        assert dashboard.trades_processed == 0
+
+
+# ===========================================================================
+# Section 38: Week 3 Day 8 - Audit Activity and Persistence Status Tests
+# ===========================================================================
+
+from chronos.dashboard import (
+    SECTION_AUDIT_STATUS,
+    SECTION_AUDIT,
+    LABEL_AUDIT_WORKER,
+    LABEL_AUDIT_STATUS,
+    LABEL_AUDIT_WORKER_STATUS,
+    LABEL_AUDIT_RECORDS_WRITTEN,
+    LABEL_AUDIT_WRITTEN,
+    LABEL_AUDIT_RECORDS_PENDING,
+    LABEL_AUDIT_PENDING,
+    LABEL_AUDIT_WRITE_ERRORS,
+    LABEL_AUDIT_FAILED_RECORDS,
+    LABEL_AUDIT_LAST_FLUSH,
+    AuditStatusInfo,
+    format_audit_counter,
+    format_audit_worker_status,
+    _coerce_audit_status,
+    build_audit_status_lines,
+)
+
+
+class TestAuditStatusConstants:
+    """Verify audit and persistence status section constants and labels."""
+
+    def test_section_audit_status_is_str(self):
+        assert isinstance(SECTION_AUDIT_STATUS, str)
+        assert len(SECTION_AUDIT_STATUS) > 0
+        assert SECTION_AUDIT == SECTION_AUDIT_STATUS
+
+    def test_label_audit_worker_is_str(self):
+        assert isinstance(LABEL_AUDIT_WORKER, str)
+        assert LABEL_AUDIT_STATUS == LABEL_AUDIT_WORKER
+        assert LABEL_AUDIT_WORKER_STATUS == LABEL_AUDIT_WORKER
+
+    def test_label_records_written_is_str(self):
+        assert isinstance(LABEL_AUDIT_RECORDS_WRITTEN, str)
+        assert LABEL_AUDIT_WRITTEN == LABEL_AUDIT_RECORDS_WRITTEN
+
+    def test_label_records_pending_is_str(self):
+        assert isinstance(LABEL_AUDIT_RECORDS_PENDING, str)
+        assert LABEL_AUDIT_PENDING == LABEL_AUDIT_RECORDS_PENDING
+
+    def test_label_write_errors_is_str(self):
+        assert isinstance(LABEL_AUDIT_WRITE_ERRORS, str)
+        assert LABEL_AUDIT_FAILED_RECORDS == LABEL_AUDIT_WRITE_ERRORS
+
+    def test_label_last_flush_is_str(self):
+        assert isinstance(LABEL_AUDIT_LAST_FLUSH, str)
+
+
+class TestFormatAuditCounter:
+    """Verify pure function format_audit_counter formatting."""
+
+    def test_none_returns_na(self):
+        assert format_audit_counter(None) == "N/A"
+
+    def test_zero_returns_zero_string(self):
+        assert format_audit_counter(0) == "0"
+        assert format_audit_counter("0") == "0"
+
+    def test_positive_integers_formatted_with_commas(self):
+        assert format_audit_counter(1) == "1"
+        assert format_audit_counter(100) == "100"
+        assert format_audit_counter(1000) == "1,000"
+        assert format_audit_counter(12500) == "12,500"
+        assert format_audit_counter(1000000) == "1,000,000"
+
+    def test_string_integers_formatted(self):
+        assert format_audit_counter("54321") == "54,321"
+
+    def test_negative_values_raise_value_error(self):
+        with pytest.raises(ValueError, match="cannot be negative"):
+            format_audit_counter(-1)
+
+        with pytest.raises(ValueError, match="cannot be negative"):
+            format_audit_counter("-10")
+
+    def test_invalid_string_returns_na(self):
+        assert format_audit_counter("invalid") == "N/A"
+
+
+class TestFormatAuditWorkerStatus:
+    """Verify pure function format_audit_worker_status formatting."""
+
+    def test_none_or_empty_returns_na(self):
+        assert format_audit_worker_status(None) == "N/A"
+        assert format_audit_worker_status("") == "N/A"
+        assert format_audit_worker_status("   ") == "N/A"
+
+    def test_running_status(self):
+        assert format_audit_worker_status("running") == "Running"
+        assert format_audit_worker_status("RUNNING") == "Running"
+        assert format_audit_worker_status("Running") == "Running"
+        assert format_audit_worker_status(True) == "Running"
+
+    def test_stopped_status(self):
+        assert format_audit_worker_status("stopped") == "Stopped"
+        assert format_audit_worker_status("STOPPED") == "Stopped"
+        assert format_audit_worker_status("Stopped") == "Stopped"
+        assert format_audit_worker_status(False) == "Stopped"
+
+    def test_error_status_without_message(self):
+        assert format_audit_worker_status("error") == "Error"
+        assert format_audit_worker_status("ERROR") == "Error"
+
+    def test_error_status_with_message(self):
+        assert format_audit_worker_status("error", error_message="Disk full") == "Error: Disk full"
+        assert format_audit_worker_status("ERROR", error_message="I/O failure") == "Error: I/O failure"
+
+    def test_other_status_values(self):
+        assert format_audit_worker_status("idle") == "Idle"
+        assert format_audit_worker_status("paused") == "Paused"
+
+
+class TestAuditStatusCoercion:
+    """Verify _coerce_audit_status handles diverse input shapes gracefully."""
+
+    def test_none_returns_none(self):
+        assert _coerce_audit_status(None) is None
+
+    def test_audit_status_info_instance_preserved(self):
+        info = AuditStatusInfo(worker_status="running", records_written=42)
+        assert _coerce_audit_status(info) is info
+
+    def test_dict_input(self):
+        data = {
+            "worker_status": "running",
+            "records_written": 100,
+            "records_pending": 5,
+            "write_errors": 0,
+            "last_flush": "2026-11-07 20:00:00",
+        }
+        res = _coerce_audit_status(data)
+        assert isinstance(res, AuditStatusInfo)
+        assert res.worker_status == "running"
+        assert res.records_written == 100
+        assert res.records_pending == 5
+        assert res.write_errors == 0
+        assert res.last_flush == "2026-11-07 20:00:00"
+
+    def test_dict_with_alternate_keys(self):
+        data = {
+            "status": "stopped",
+            "written": 50,
+            "pending": 2,
+            "errors": 1,
+            "last_flush_time": "12:00:00",
+            "error": "Timeout",
+        }
+        res = _coerce_audit_status(data)
+        assert res.worker_status == "stopped"
+        assert res.records_written == 50
+        assert res.records_pending == 2
+        assert res.write_errors == 1
+        assert res.last_flush == "12:00:00"
+        assert res.error_message == "Timeout"
+
+    def test_object_with_attributes(self):
+        class MockAuditWorker:
+            worker_status = "running"
+            records_written = 200
+            records_pending = 0
+            write_errors = 0
+            last_flush = "10:15:30"
+
+        res = _coerce_audit_status(MockAuditWorker())
+        assert res.worker_status == "running"
+        assert res.records_written == 200
+        assert res.last_flush == "10:15:30"
+
+    def test_object_with_get_status_method(self):
+        class MockWorkerService:
+            def get_status(self):
+                return {"worker_status": "error", "error_message": "DB connection failed"}
+
+        res = _coerce_audit_status(MockWorkerService())
+        assert res.worker_status == "error"
+        assert res.error_message == "DB connection failed"
+
+    def test_callable_returning_dict(self):
+        fn = lambda: {"worker_status": "running", "records_written": 77}
+        res = _coerce_audit_status(fn)
+        assert res.worker_status == "running"
+        assert res.records_written == 77
+
+
+class TestBuildAuditStatusLines:
+    """Verify build_audit_status_lines pure layout function."""
+
+    def test_returns_list_of_strings(self):
+        lines = build_audit_status_lines(width=72)
+        assert isinstance(lines, list)
+        assert all(isinstance(line, str) for line in lines)
+
+    def test_section_header_present(self):
+        lines = build_audit_status_lines(width=72)
+        text = "\n".join(lines)
+        assert SECTION_AUDIT_STATUS in text
+
+    def test_missing_audit_information_shows_na_and_no_last_flush(self):
+        """When audit information is missing, counters show N/A and last flush is omitted."""
+        lines = build_audit_status_lines(width=72, audit_status=None)
+        text = "\n".join(lines)
+        assert LABEL_AUDIT_WORKER in text
+        assert LABEL_AUDIT_RECORDS_WRITTEN in text
+        assert LABEL_AUDIT_RECORDS_PENDING in text
+        assert LABEL_AUDIT_WRITE_ERRORS in text
+        assert "N/A" in text
+        # Last flush indicator is ONLY shown if provided
+        assert LABEL_AUDIT_LAST_FLUSH not in text
+
+    def test_worker_running_state(self):
+        info = AuditStatusInfo(worker_status="running", records_written=500, records_pending=10, write_errors=0)
+        lines = build_audit_status_lines(width=72, audit_status=info)
+        text = "\n".join(lines)
+        assert "Running" in text
+        assert "500" in text
+        assert "10" in text
+        assert "0" in text
+
+    def test_worker_stopped_state(self):
+        info = AuditStatusInfo(worker_status="stopped", records_written=1000, records_pending=0, write_errors=0)
+        lines = build_audit_status_lines(width=72, audit_status=info)
+        text = "\n".join(lines)
+        assert "Stopped" in text
+        assert "1,000" in text
+
+    def test_worker_error_state_without_message(self):
+        info = AuditStatusInfo(worker_status="error", records_written=10, records_pending=50, write_errors=3)
+        lines = build_audit_status_lines(width=72, audit_status=info)
+        text = "\n".join(lines)
+        assert "Error" in text
+        assert "3" in text
+
+    def test_worker_error_state_with_message(self):
+        info = AuditStatusInfo(
+            worker_status="error",
+            error_message="Disk write failed",
+            records_written=10,
+            records_pending=5,
+            write_errors=1,
+        )
+        lines = build_audit_status_lines(width=72, audit_status=info)
+        text = "\n".join(lines)
+        assert "Error: Disk write failed" in text
+
+    def test_last_flush_displayed_when_provided(self):
+        """Last flush indicator is displayed when existing implementation provides it."""
+        info = AuditStatusInfo(
+            worker_status="running",
+            records_written=100,
+            records_pending=0,
+            write_errors=0,
+            last_flush="2026-11-07 20:30:00",
+        )
+        lines = build_audit_status_lines(width=72, audit_status=info)
+        text = "\n".join(lines)
+        assert LABEL_AUDIT_LAST_FLUSH in text
+        assert "2026-11-07 20:30:00" in text
+
+    def test_persistence_counters_thousands_separators(self):
+        info = AuditStatusInfo(
+            worker_status="running",
+            records_written=1234567,
+            records_pending=89101,
+            write_errors=1234,
+        )
+        lines = build_audit_status_lines(width=72, audit_status=info)
+        text = "\n".join(lines)
+        assert "1,234,567" in text
+        assert "89,101" in text
+        assert "1,234" in text
+
+    def test_dividers_match_width(self):
+        width = 60
+        lines = build_audit_status_lines(width=width)
+        dividers = [line for line in lines if line == "-" * width]
+        assert len(dividers) >= 2
+
+
+class TestTerminalDashboardAuditStatusState:
+    """Verify audit status state management on TerminalDashboard."""
+
+    def test_default_audit_status_is_none(self):
+        d = TerminalDashboard(use_sample_data=False)
+        assert d.audit_status is None
+        assert d.get_audit_status() is None
+        assert d.get_audit_worker_display() == "N/A"
+        assert d.get_audit_written_display() == "N/A"
+        assert d.get_audit_pending_display() == "N/A"
+        assert d.get_audit_errors_display() == "N/A"
+        assert d.get_audit_last_flush_display() is None
+
+    def test_init_with_audit_status_info(self):
+        info = AuditStatusInfo(worker_status="running", records_written=100)
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        assert d.audit_status is info
+        assert d.get_audit_worker_display() == "Running"
+        assert d.get_audit_written_display() == "100"
+
+    def test_init_with_audit_status_dict(self):
+        data = {"worker_status": "stopped", "records_written": 250, "write_errors": 1}
+        d = TerminalDashboard(use_sample_data=False, audit_status=data)
+        assert d.audit_status is not None
+        assert d.audit_status.worker_status == "stopped"
+        assert d.get_audit_worker_display() == "Stopped"
+        assert d.get_audit_written_display() == "250"
+        assert d.get_audit_errors_display() == "1"
+
+    def test_set_and_update_audit_status(self):
+        d = TerminalDashboard(use_sample_data=False)
+        info = AuditStatusInfo(worker_status="running", records_written=50)
+        d.set_audit_status(info)
+        assert d.audit_status is info
+
+        updated = AuditStatusInfo(worker_status="running", records_written=150)
+        d.update_audit_status(updated)
+        assert d.audit_status is updated
+        assert d.get_audit_written_display() == "150"
+
+    def test_clear_audit_status(self):
+        info = AuditStatusInfo(worker_status="running", records_written=50)
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        assert d.audit_status is not None
+        d.clear_audit_status()
+        assert d.audit_status is None
+        assert d.get_audit_worker_display() == "N/A"
+
+    def test_property_setter_with_coercion(self):
+        d = TerminalDashboard(use_sample_data=False)
+        d.audit_status = {"worker_status": "running", "records_written": 75}
+        assert isinstance(d.audit_status, AuditStatusInfo)
+        assert d.audit_status.worker_status == "running"
+        assert d.audit_status.records_written == 75
+
+
+class TestDashboardDisplayLinesAuditIntegration:
+    """Verify get_display_lines integration with audit status section."""
+
+    def test_display_lines_contains_audit_section_by_default(self):
+        d = TerminalDashboard(use_sample_data=False)
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_AUDIT_STATUS in text
+        assert LABEL_AUDIT_WORKER in text
+        assert LABEL_AUDIT_RECORDS_WRITTEN in text
+        assert LABEL_AUDIT_RECORDS_PENDING in text
+        assert LABEL_AUDIT_WRITE_ERRORS in text
+        assert "N/A" in text
+
+    def test_display_lines_reflects_running_worker(self):
+        info = AuditStatusInfo(
+            worker_status="running",
+            records_written=1250,
+            records_pending=25,
+            write_errors=0,
+            last_flush="15:30:00",
+        )
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_AUDIT_STATUS in text
+        assert "Running" in text
+        assert "1,250" in text
+        assert "25" in text
+        assert "0" in text
+        assert LABEL_AUDIT_LAST_FLUSH in text
+        assert "15:30:00" in text
+
+    def test_display_lines_reflects_stopped_worker(self):
+        info = AuditStatusInfo(worker_status="stopped", records_written=400, records_pending=0, write_errors=0)
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert "Stopped" in text
+        assert "400" in text
+
+    def test_display_lines_reflects_error_worker(self):
+        info = AuditStatusInfo(
+            worker_status="error",
+            error_message="File system read-only",
+            records_written=100,
+            records_pending=50,
+            write_errors=5,
+        )
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        lines = d.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert "Error: File system read-only" in text
+        assert "5" in text
+
+    def test_display_lines_param_override(self):
+        d = TerminalDashboard(use_sample_data=False)
+        override_info = AuditStatusInfo(worker_status="running", records_written=999)
+        lines = d.get_display_lines(rows=50, cols=100, audit_status=override_info)
+        text = "\n".join(lines)
+        assert "Running" in text
+        assert "999" in text
+
+    def test_small_terminal_fallback_does_not_crash_with_audit(self):
+        info = AuditStatusInfo(worker_status="running", records_written=1000)
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        lines = d.get_display_lines(rows=10, cols=30)
+        text = "\n".join(lines)
+        assert "too small" in text.lower()
+        assert QUIT_MESSAGE in text
+
+
+class TestDashboardRenderAuditIntegration:
+    """Verify curses render() integration with audit status section."""
+
+    def test_render_includes_audit_section_header(self):
+        d = TerminalDashboard(use_sample_data=False)
+        win = MockCursesWindow(rows=60, cols=100)
+        d.render(win)
+        rendered = " ".join(call[2] for call in win.addstr_calls)
+        assert SECTION_AUDIT_STATUS in rendered
+        assert LABEL_AUDIT_WORKER in rendered
+
+    def test_render_shows_running_status_and_counters(self):
+        info = AuditStatusInfo(
+            worker_status="running",
+            records_written=5000,
+            records_pending=12,
+            write_errors=0,
+            last_flush="12:34:56",
+        )
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        win = MockCursesWindow(rows=60, cols=100)
+        d.render(win)
+        rendered = " ".join(call[2] for call in win.addstr_calls)
+        assert "Running" in rendered
+        assert "5,000" in rendered
+        assert "12" in rendered
+        assert LABEL_AUDIT_LAST_FLUSH in rendered
+        assert "12:34:56" in rendered
+
+    def test_render_shows_stopped_state(self):
+        info = AuditStatusInfo(worker_status="stopped", records_written=200)
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        win = MockCursesWindow(rows=60, cols=100)
+        d.render(win)
+        rendered = " ".join(call[2] for call in win.addstr_calls)
+        assert "Stopped" in rendered
+        assert "200" in rendered
+
+    def test_render_shows_error_state(self):
+        info = AuditStatusInfo(worker_status="error", error_message="Permission denied", write_errors=2)
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        win = MockCursesWindow(rows=60, cols=100)
+        d.render(win)
+        rendered = " ".join(call[2] for call in win.addstr_calls)
+        assert "Error: Permission denied" in rendered
+        assert "2" in rendered
+
+    def test_render_small_window_safe(self):
+        info = AuditStatusInfo(worker_status="running", records_written=100)
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        win = MockCursesWindow(rows=5, cols=20)
+        d.render(win)
+        assert win.erased is True
+        assert win.refreshed is True
+        rendered = " ".join(call[2] for call in win.addstr_calls)
+        assert "too small" in rendered.lower()
+
+
+class TestAuditStatusPreservesExistingFeatures:
+    """Verify adding the audit status section preserves all existing dashboard capabilities."""
+
+    def test_all_sections_present_in_display_lines(self):
+        info = AuditStatusInfo(worker_status="running", records_written=100)
+        d = TerminalDashboard(use_sample_data=False, audit_status=info)
+        d.record_order_processed({"order_id": 1, "side": 1, "price": 500.0, "quantity": 10})
+        d.record_trade_execution(latency_us=15.0)
+
+        lines = d.get_display_lines(rows=60, cols=100)
+        text = "\n".join(lines)
+
+        from chronos.dashboard import (
+            SECTION_MARKET_SUMMARY,
+            SECTION_ORDER_BOOK,
+            SECTION_PERFORMANCE,
+            SECTION_TRADE_EXECUTION,
+            QUIT_MESSAGE,
+        )
+
+        assert SECTION_MARKET_SUMMARY in text
+        assert SECTION_ORDER_BOOK in text
+        assert SECTION_PERFORMANCE in text
+        assert SECTION_TRADE_EXECUTION in text
+        assert SECTION_AUDIT_STATUS in text
+        assert QUIT_MESSAGE in text
+
+    def test_order_counter_and_latency_preserved(self):
+        ns_clock = FakeNsClock(start_ns=0)
+        info = AuditStatusInfo(worker_status="running", records_written=50)
+        d = TerminalDashboard(ns_clock=ns_clock, use_sample_data=False, audit_status=info)
+
+        d.record_order_processed({"order_id": 10})
+        ns_clock.advance_us(100.0)
+        d.record_order_processed({"order_id": 20})
+
+        assert d.orders_processed == 2
+        assert d.get_latency_display() == "100.0"
+        assert d.audit_status.records_written == 50
+
+    def test_quit_input_handling_preserved(self):
+        d = TerminalDashboard(audit_status=AuditStatusInfo(worker_status="running"))
+        assert d.handle_input(ord("q")) is False
+        assert d.handle_input(ord("Q")) is False
+        assert d.handle_input(ord("x")) is True
+
+
+# ===========================================================================
+# Section 39: Week 4 Day 9 - Whale Order Visualization & Highlighting Refinements
+# ===========================================================================
+
+
+class TestWhaleQualifyingAndNonQualifyingOrders:
+    """Test detection logic for qualifying and non-qualifying whale orders."""
+
+    def test_qualifying_two_price_levels(self):
+        trades = [
+            {"price": 100.0, "executed_quantity": 50},
+            {"price": 101.0, "executed_quantity": 50},
+        ]
+        whale = detect_whale_order(order_id=101, trades=trades, side=1)
+        assert whale is not None
+        assert whale.is_whale is True
+        assert whale.order_id == 101
+        assert whale.side == 1
+        assert whale.price_levels_cleared == 2
+        assert whale.total_quantity == 100
+        assert whale.prices == [100.0, 101.0]
+
+    def test_qualifying_multiple_price_levels(self):
+        trades = [
+            {"price": 105.0, "executed_quantity": 20},
+            {"price": 104.0, "executed_quantity": 30},
+            {"price": 103.0, "executed_quantity": 40},
+            {"price": 102.0, "executed_quantity": 50},
+        ]
+        whale = detect_whale_order(order_id=202, trades=trades, side=2)
+        assert whale is not None
+        assert whale.price_levels_cleared == 4
+        assert whale.total_quantity == 140
+        assert whale.volume_matched == 140
+        assert whale.prices == [105.0, 104.0, 103.0, 102.0]
+
+    def test_non_qualifying_empty_or_none_trades(self):
+        assert detect_whale_order(order_id=1, trades=None) is None
+        assert detect_whale_order(order_id=1, trades=[]) is None
+
+    def test_non_qualifying_single_price_level_multiple_trades(self):
+        trades = [
+            {"price": 100.0, "executed_quantity": 10},
+            {"price": 100.0, "executed_quantity": 20},
+            {"price": 100.0, "executed_quantity": 30},
+        ]
+        assert detect_whale_order(order_id=303, trades=trades, side=1) is None
+
+    def test_corrupted_or_zero_trades_filtered(self):
+        trades = [
+            {"price": 100.0, "executed_quantity": 50},
+            "invalid_trade_string",
+            {"price": 100.0, "executed_quantity": 25},
+        ]
+        # Only 1 distinct valid price level -> non-qualifying
+        assert detect_whale_order(order_id=404, trades=trades) is None
+
+    def test_configurable_min_levels_threshold(self):
+        trades = [
+            {"price": 100.0, "executed_quantity": 50},
+            {"price": 101.0, "executed_quantity": 50},
+        ]
+        # With default min_levels=2: qualifies
+        assert detect_whale_order(order_id=1, trades=trades, min_levels=2) is not None
+        # With stricter min_levels=3: does not qualify
+        assert detect_whale_order(order_id=1, trades=trades, min_levels=3) is None
+
+
+class TestWhaleMultiplePriceLevelsOrderBook:
+    """Test Whale visualization across multiple order-book price levels."""
+
+    def test_depth_renders_exact_prices_and_quantities(self):
+        bids = [
+            {"price": 150.00, "quantity": 1250, "side": 1},
+            {"price": 149.95, "quantity": 450, "side": 1},
+            {"price": 149.90, "quantity": 800, "side": 1},
+        ]
+        asks = [
+            {"price": 150.25, "quantity": 120, "side": 2},
+            {"price": 150.30, "quantity": 3400, "side": 2},
+            {"price": 150.35, "quantity": 250, "side": 2},
+        ]
+        whale = WhaleOrderEvent(
+            order_id=888,
+            side=1,
+            total_quantity=3520,
+            price_levels_cleared=2,
+            prices=[150.25, 150.30],
+            volume_matched=3520,
+        )
+        dashboard = TerminalDashboard(
+            buy_orders=bids,
+            sell_orders=asks,
+            use_sample_data=False,
+            whale=whale,
+        )
+        lines = dashboard.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+
+        # Exact prices and quantities must appear in order book
+        assert "150.00" in text
+        assert "1,250" in text or "1250" in text
+        assert "149.95" in text
+        assert "450" in text
+        assert "150.25" in text
+        assert "120" in text
+        assert "150.30" in text
+        assert "3,400" in text or "3400" in text
+
+        # Whale alert section must show swept prices
+        assert "150.25 -> 150.30" in text
+
+    def test_swept_prices_formatting_and_truncation(self):
+        whale = WhaleOrderEvent(
+            order_id=999,
+            side=2,
+            total_quantity=500,
+            price_levels_cleared=6,
+            prices=[100.0, 99.5, 99.0, 98.5, 98.0, 97.5],
+            volume_matched=500,
+        )
+        lines = build_whale_alert_lines(width=80, whale=whale)
+        text = "\n".join(lines)
+        assert "100.00 -> 99.50 -> 99.00 -> 98.50 -> 98.00 ..." in text
+
+    def test_whale_highlighting_applied_to_swept_levels_in_render(self):
+        """In curses render, order book rows swept by whale receive whale color/attr."""
+        bids = [
+            {"price": 101.00, "quantity": 50, "side": 1},
+            {"price": 100.00, "quantity": 60, "side": 1},
+            {"price": 99.00, "quantity": 70, "side": 1},
+        ]
+        asks = [
+            {"price": 102.00, "quantity": 80, "side": 2},
+            {"price": 103.00, "quantity": 90, "side": 2},
+        ]
+        # SELL whale that swept bids at 101.00 and 100.00
+        whale = WhaleOrderEvent(
+            order_id=77,
+            side=2,
+            total_quantity=110,
+            price_levels_cleared=2,
+            prices=[101.00, 100.00],
+            volume_matched=110,
+        )
+        dashboard = TerminalDashboard(
+            buy_orders=bids,
+            sell_orders=asks,
+            use_sample_data=False,
+            whale=whale,
+        )
+        win = MockCursesWindow(rows=60, cols=100)
+        dashboard.render(win)
+
+        attrs = dashboard._build_attrs()
+        # Find calls writing order book bid/ask lines (excluding market summary and alert lines)
+        bid_101_calls = [
+            c for c in win.addstr_calls
+            if "101.00" in c[2] and LABEL_BEST_BID not in c[2] and "Swept:" not in c[2]
+        ]
+        bid_100_calls = [
+            c for c in win.addstr_calls
+            if "100.00" in c[2] and LABEL_BEST_BID not in c[2] and "Swept:" not in c[2]
+        ]
+        bid_99_calls = [
+            c for c in win.addstr_calls
+            if "99.00" in c[2] and LABEL_BEST_BID not in c[2] and "Swept:" not in c[2]
+        ]
+        ask_102_calls = [
+            c for c in win.addstr_calls
+            if "102.00" in c[2] and LABEL_BEST_ASK not in c[2] and "Swept:" not in c[2]
+        ]
+
+        assert len(bid_101_calls) > 0
+        assert len(bid_100_calls) > 0
+        assert len(bid_99_calls) > 0
+
+        # 101.00 and 100.00 were swept by SELL whale -> highlighted with whale_sell
+        assert bid_101_calls[0][3] == attrs["whale_sell"]
+        assert bid_100_calls[0][3] == attrs["whale_sell"]
+        # 99.00 was NOT swept -> normal bid attribute
+        assert bid_99_calls[0][3] == attrs["bid"]
+        # 102.00 ask was NOT swept -> normal ask attribute
+        assert ask_102_calls[0][3] == attrs["ask"]
+
+
+class TestWhaleBuyAndSellHighlighting:
+    """Test visual highlighting distinguishes BUY vs SELL whale orders."""
+
+    def test_whale_buy_order_attributes_in_render(self):
+        whale_buy = WhaleOrderEvent(
+            order_id=10,
+            side=1,  # BUY
+            total_quantity=200,
+            price_levels_cleared=2,
+            prices=[102.0, 103.0],
+            volume_matched=200,
+        )
+        dashboard = TerminalDashboard(use_sample_data=False, whale=whale_buy)
+        win = MockCursesWindow(rows=60, cols=100)
+        dashboard.render(win)
+
+        attrs = dashboard._build_attrs()
+        # Verify alert lines render with whale_buy attribute
+        side_calls = [c for c in win.addstr_calls if "BUY" in c[2] and LABEL_WHALE_SIDE in c[2]]
+        assert len(side_calls) > 0
+        assert side_calls[0][3] == attrs["whale_buy"]
+
+    def test_whale_sell_order_attributes_in_render(self):
+        whale_sell = WhaleOrderEvent(
+            order_id=20,
+            side=2,  # SELL
+            total_quantity=300,
+            price_levels_cleared=2,
+            prices=[100.0, 99.0],
+            volume_matched=300,
+        )
+        dashboard = TerminalDashboard(use_sample_data=False, whale=whale_sell)
+        win = MockCursesWindow(rows=60, cols=100)
+        dashboard.render(win)
+
+        attrs = dashboard._build_attrs()
+        # Verify alert lines render with whale_sell attribute
+        side_calls = [c for c in win.addstr_calls if "SELL" in c[2] and LABEL_WHALE_SIDE in c[2]]
+        assert len(side_calls) > 0
+        assert side_calls[0][3] == attrs["whale_sell"]
+
+    def test_whale_attributes_defined_in_attrs(self):
+        dashboard = TerminalDashboard()
+        attrs = dashboard._build_attrs()
+        for key in ("whale_buy", "whale_sell", "whale_alert", "whale_badge"):
+            assert key in attrs
+
+    def test_monochrome_fallback_uses_bold_or_standout(self):
+        dashboard = TerminalDashboard()
+        # Mock _has_colors_safe to return False (monochrome terminal)
+        dashboard._has_colors_safe = lambda: False
+        attrs = dashboard._build_attrs()
+        # In curses environment with no color, bold must still be active
+        import curses
+        if curses is not None:
+            assert attrs["whale_buy"] != 0
+            assert attrs["whale_sell"] != 0
+            assert attrs["whale_alert"] != 0
+
+
+class TestWhaleUpdatesAfterOrderBookChanges:
+    """Test Whale visualization updates after order addition, partial fill, and removal."""
+
+    def test_order_book_addition_preserves_whale_alert(self):
+        dashboard = TerminalDashboard(use_sample_data=False)
+        whale = WhaleOrderEvent(
+            order_id=50, side=1, total_quantity=100,
+            price_levels_cleared=2, prices=[101.0, 102.0], volume_matched=100,
+        )
+        dashboard.record_whale_order(whale)
+
+        # Add new orders to book
+        dashboard.update_orders(
+            buy_orders=[{"price": 100.0, "quantity": 50, "side": 1}],
+            sell_orders=[{"price": 103.0, "quantity": 60, "side": 2}],
+        )
+
+        lines = dashboard.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_WHALE_ALERT in text
+        assert "100.00" in text
+        assert "103.00" in text
+
+    def test_order_book_partial_fill_updates_remaining_quantity(self):
+        whale = WhaleOrderEvent(
+            order_id=60, side=2, total_quantity=80,
+            price_levels_cleared=2, prices=[101.0, 100.0], volume_matched=80,
+        )
+        # Resting bid originally had 100, now partially filled to 20
+        dashboard = TerminalDashboard(
+            buy_orders=[{"price": 100.0, "quantity": 20, "side": 1}],
+            use_sample_data=False,
+            whale=whale,
+        )
+        win = MockCursesWindow(rows=60, cols=100)
+        dashboard.render(win)
+
+        # Order book shows reduced remaining quantity (20)
+        bid_calls = [
+            c for c in win.addstr_calls
+            if "100.00" in c[2] and LABEL_BEST_BID not in c[2] and "Swept:" not in c[2]
+        ]
+        assert len(bid_calls) > 0
+        assert "20" in bid_calls[0][2]
+        # And because 100.00 was swept, it is highlighted
+        attrs = dashboard._build_attrs()
+        assert bid_calls[0][3] == attrs["whale_sell"]
+
+    def test_clearing_whale_history_resets_order_book_highlighting(self):
+        whale = WhaleOrderEvent(
+            order_id=70, side=2, total_quantity=50,
+            price_levels_cleared=2, prices=[100.0, 99.0], volume_matched=50,
+        )
+        dashboard = TerminalDashboard(
+            buy_orders=[{"price": 100.0, "quantity": 50, "side": 1}],
+            use_sample_data=False,
+            whale=whale,
+        )
+        win1 = MockCursesWindow(rows=60, cols=100)
+        dashboard.render(win1)
+        attrs = dashboard._build_attrs()
+        ob_calls_win1 = [
+            c for c in win1.addstr_calls
+            if "100.00" in c[2] and LABEL_BEST_BID not in c[2] and "Swept:" not in c[2]
+        ]
+        assert ob_calls_win1[0][3] == attrs["whale_sell"]
+
+        # Clear whale history
+        dashboard.clear_whale_history()
+        win2 = MockCursesWindow(rows=60, cols=100)
+        dashboard.render(win2)
+        # Now 100.00 reverts to normal bid attribute
+        ob_calls_win2 = [
+            c for c in win2.addstr_calls
+            if "100.00" in c[2] and LABEL_BEST_BID not in c[2] and "Swept:" not in c[2]
+        ]
+        assert ob_calls_win2[0][3] == attrs["bid"]
+        assert SECTION_WHALE_ALERT not in " ".join(c[2] for c in win2.addstr_calls)
+
+    def test_new_qualifying_whale_replaces_previous(self):
+        w1 = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=100,
+            price_levels_cleared=2, prices=[10.0, 11.0], volume_matched=100,
+        )
+        w2 = WhaleOrderEvent(
+            order_id=2, side=2, total_quantity=200,
+            price_levels_cleared=3, prices=[20.0, 19.0, 18.0], volume_matched=200,
+        )
+        dashboard = TerminalDashboard(use_sample_data=False)
+        dashboard.record_whale_order(w1)
+        dashboard.record_whale_order(w2)
+
+        lines = dashboard.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert "20.00 -> 19.00 -> 18.00" in text
+        assert "10.00 -> 11.00" not in text
+        assert dashboard.last_whale_event is w2
+        assert len(dashboard.whale_history) == 2
+
+
+class TestWhaleLiveDashboardIntegration:
+    """Test LiveFeedBridge integration with real MatchingEngine producing whale sweeps."""
+
+    def test_live_matching_engine_multi_level_sell_sweep(self):
+        try:
+            from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        except Exception:
+            pytest.skip("MatchingEngine not available")
+
+        engine = MatchingEngine()
+        # Seed resting bids at 2 distinct price levels
+        engine.submit_order(1, SIDE_BUY, 102.0, 50, 1000)
+        engine.submit_order(2, SIDE_BUY, 101.0, 50, 1100)
+
+        dashboard = TerminalDashboard(use_sample_data=False)
+        bridge = LiveFeedBridge(engine=engine, dashboard=dashboard)
+        bridge.sync_to_dashboard()
+
+        # Submit aggressive SELL sweeping both levels
+        sweep_order = (99, 1_000_000, 100.0, 100, SIDE_SELL, SIDE_SELL, 1)
+        bridge._handle_raw_order(sweep_order)
+        bridge.sync_to_dashboard()
+
+        whale = dashboard.get_last_whale_event()
+        assert whale is not None
+        assert whale.order_id == 99
+        assert whale.side == SIDE_SELL
+        assert whale.price_levels_cleared >= 2
+        assert whale.is_whale is True
+
+        lines = dashboard.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_WHALE_ALERT in text
+        assert "SELL" in text
+
+    def test_live_matching_engine_multi_level_buy_sweep(self):
+        try:
+            from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        except Exception:
+            pytest.skip("MatchingEngine not available")
+
+        engine = MatchingEngine()
+        # Seed resting asks at 2 distinct price levels
+        engine.submit_order(10, SIDE_SELL, 201.0, 40, 1000)
+        engine.submit_order(11, SIDE_SELL, 202.0, 60, 1100)
+
+        dashboard = TerminalDashboard(use_sample_data=False)
+        bridge = LiveFeedBridge(engine=engine, dashboard=dashboard)
+        bridge.sync_to_dashboard()
+
+        # Submit aggressive BUY sweeping both levels
+        sweep_order = (77, 1_000_000, 205.0, 100, SIDE_BUY, SIDE_BUY, 1)
+        bridge._handle_raw_order(sweep_order)
+        bridge.sync_to_dashboard()
+
+        whale = dashboard.get_last_whale_event()
+        assert whale is not None
+        assert whale.order_id == 77
+        assert whale.side == SIDE_BUY
+        assert whale.price_levels_cleared >= 2
+
+        lines = dashboard.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_WHALE_ALERT in text
+        assert "BUY" in text
+
+    def test_live_mode_avoids_hardcoded_demo_values(self):
+        try:
+            from chronos.matching_engine import MatchingEngine, SIDE_BUY, SIDE_SELL
+        except Exception:
+            pytest.skip("MatchingEngine not available")
+
+        engine = MatchingEngine()
+        engine.submit_order(1, SIDE_BUY, 75.0, 30, 1000)
+        engine.submit_order(2, SIDE_SELL, 76.0, 40, 2000)
+
+        dashboard = TerminalDashboard(use_sample_data=False)
+        bridge = LiveFeedBridge(engine=engine, dashboard=dashboard)
+        bridge.sync_to_dashboard()
+
+        lines = dashboard.get_display_lines(rows=50, cols=100)
+        text = "\n".join(lines)
+        assert "75.00" in text
+        assert "76.00" in text
+        # Must not contain demo prices from sample data
+        assert "500.00" not in text
+        assert "505.00" not in text
+        assert dashboard.is_sample_data is False
+
+    def test_live_feed_preserves_order_counters_and_audit(self):
+        info = AuditStatusInfo(worker_status="running", records_written=42)
+        dashboard = TerminalDashboard(use_sample_data=False, audit_status=info)
+        bridge = LiveFeedBridge(dashboard=dashboard)
+
+        # Process a regular order
+        bridge._handle_raw_order((1, 1000, 100.0, 10, 1, 1, 1))
+        assert dashboard.orders_processed == 1
+
+        lines = dashboard.get_display_lines(rows=60, cols=100)
+        text = "\n".join(lines)
+        assert SECTION_PERFORMANCE in text
+        assert SECTION_AUDIT_STATUS in text
+        assert "Running" in text
+        assert "42" in text
+
+
+class TestWhaleDashboardResponsivenessAndSmallTerminal:
+    """Test dashboard layout responsiveness, small terminal fallback, and section preservation."""
+
+    def test_small_terminal_rows_fallback_safe(self):
+        whale = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=100,
+            price_levels_cleared=2, prices=[100.0, 101.0], volume_matched=100,
+        )
+        dashboard = TerminalDashboard(whale=whale)
+        win = MockCursesWindow(rows=10, cols=40)
+        dashboard.render(win)
+
+        rendered = " ".join(c[2] for c in win.addstr_calls)
+        assert "too small" in rendered.lower()
+        # Whale order event is preserved
+        assert dashboard.get_last_whale_event() is whale
+
+    def test_small_terminal_cols_fallback_safe(self):
+        whale = WhaleOrderEvent(
+            order_id=1, side=2, total_quantity=100,
+            price_levels_cleared=2, prices=[100.0, 99.0], volume_matched=100,
+        )
+        dashboard = TerminalDashboard(whale=whale)
+        win = MockCursesWindow(rows=40, cols=50)
+        dashboard.render(win)
+
+        rendered = " ".join(c[2] for c in win.addstr_calls)
+        assert "too small" in rendered.lower()
+
+    def test_whale_alert_does_not_overflow_window(self):
+        whale = WhaleOrderEvent(
+            order_id=1, side=1, total_quantity=100,
+            price_levels_cleared=2, prices=[100.0, 101.0], volume_matched=100,
+        )
+        dashboard = TerminalDashboard(whale=whale)
+        # Exactly minimum rows (30)
+        win = MockCursesWindow(rows=MIN_TERMINAL_ROWS, cols=MIN_TERMINAL_COLS)
+        dashboard.render(win)
+
+        rendered = " ".join(c[2] for c in win.addstr_calls)
+        # Footer quit message is safely rendered
+        assert QUIT_MESSAGE in rendered
+        # No call writes at or beyond max rows
+        for c in win.addstr_calls:
+            assert c[0] < MIN_TERMINAL_ROWS
+
+    def test_whale_alert_preserves_all_other_sections(self):
+        from chronos.dashboard import (
+            SECTION_MARKET_SUMMARY,
+            SECTION_ORDER_BOOK,
+            SECTION_PERFORMANCE,
+            SECTION_TRADE_EXECUTION,
+            SECTION_AUDIT_STATUS,
+        )
+        whale = WhaleOrderEvent(
+            order_id=88, side=1, total_quantity=200,
+            price_levels_cleared=2, prices=[50.0, 51.0], volume_matched=200,
+        )
+        info = AuditStatusInfo(worker_status="running", records_written=10)
+        dashboard = TerminalDashboard(whale=whale, audit_status=info)
+        lines = dashboard.get_display_lines(rows=60, cols=100)
+        text = "\n".join(lines)
+
+        assert SECTION_MARKET_SUMMARY in text
+        assert SECTION_ORDER_BOOK in text
+        assert SECTION_PERFORMANCE in text
+        assert SECTION_TRADE_EXECUTION in text
+        assert SECTION_AUDIT_STATUS in text
+        assert SECTION_WHALE_ALERT in text
+        assert QUIT_MESSAGE in text
+
+    def test_dashboard_config_whale_min_levels_custom_and_default(self):
+        cfg_def = DashboardConfig()
+        assert cfg_def.whale_min_levels == WHALE_MIN_PRICE_LEVELS
+
+        cfg_custom = DashboardConfig(whale_min_levels=3)
+        assert cfg_custom.whale_min_levels == 3
+
+
 

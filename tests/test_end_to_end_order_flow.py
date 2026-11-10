@@ -1301,4 +1301,3 @@ class TestPipelineErrorResilienceAndEdgeCases:
             buf.close()
             if os.path.exists(path):
                 os.remove(path)
-

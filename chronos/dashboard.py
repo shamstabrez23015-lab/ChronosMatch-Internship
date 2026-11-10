@@ -38,6 +38,24 @@ SECTION_ORDER_BOOK = "ORDER BOOK"
 SECTION_BUY_ORDERS = "BUY ORDERS (BIDS)"
 SECTION_SELL_ORDERS = "SELL ORDERS (ASKS)"
 SECTION_PERFORMANCE = "PERFORMANCE METRICS"
+SECTION_TRADE_EXECUTION = "TRADE EXECUTION METRICS"
+SECTION_TRADE_METRICS = SECTION_TRADE_EXECUTION
+SECTION_TRADE_LATENCY = "TRADE EXECUTION LATENCY"
+SECTION_TRADE_EXECUTION_LATENCY = "TRADE EXECUTION LATENCY"
+SECTION_AUDIT_STATUS = "AUDIT & PERSISTENCE STATUS"
+SECTION_AUDIT = SECTION_AUDIT_STATUS
+
+# Audit and persistence status field labels
+LABEL_AUDIT_WORKER = "Audit Worker"
+LABEL_AUDIT_STATUS = LABEL_AUDIT_WORKER
+LABEL_AUDIT_WORKER_STATUS = LABEL_AUDIT_WORKER
+LABEL_AUDIT_RECORDS_WRITTEN = "Records Written"
+LABEL_AUDIT_WRITTEN = LABEL_AUDIT_RECORDS_WRITTEN
+LABEL_AUDIT_RECORDS_PENDING = "Records Pending"
+LABEL_AUDIT_PENDING = LABEL_AUDIT_RECORDS_PENDING
+LABEL_AUDIT_WRITE_ERRORS = "Write Errors"
+LABEL_AUDIT_FAILED_RECORDS = LABEL_AUDIT_WRITE_ERRORS
+LABEL_AUDIT_LAST_FLUSH = "Last Flush"
 
 # Market summary field labels
 LABEL_BEST_BID = "Best Bid"
@@ -52,8 +70,34 @@ LABEL_BID_ASK_SPREAD = LABEL_SPREAD
 # Performance field labels
 LABEL_TOTAL_ORDERS = "Total Orders Processed"
 LABEL_ORDERS_PROCESSED = LABEL_TOTAL_ORDERS
+LABEL_PROCESSED_ORDERS = LABEL_TOTAL_ORDERS
 LABEL_THROUGHPUT = "Throughput (orders/sec)"
+LABEL_ORDER_THROUGHPUT = LABEL_THROUGHPUT
+LABEL_THROUGHPUT_ORDERS_PER_SEC = LABEL_THROUGHPUT
+LABEL_PROCESSED_ORDERS_PER_SEC = LABEL_THROUGHPUT
+LABEL_ORDERS_PER_SECOND = LABEL_THROUGHPUT
+LABEL_ORDER_PROCESSING_THROUGHPUT = LABEL_THROUGHPUT
 LABEL_LATENCY = "Latency (microseconds)"
+
+# Trade execution field labels
+LABEL_TRADES_PROCESSED = "Processed Trades"
+LABEL_TOTAL_TRADES = LABEL_TRADES_PROCESSED
+LABEL_TRADE_COUNT = "Trade Count"
+LABEL_TRADE_LATENCY = "Last Execution Latency (us)"
+LABEL_TRADE_LATENCY_LAST = LABEL_TRADE_LATENCY
+LABEL_TRADE_LATENCY_AVG = "Avg Execution Latency (us)"
+LABEL_TRADE_LATENCY_MIN = "Min Execution Latency (us)"
+LABEL_TRADE_LATENCY_MAX = "Max Execution Latency (us)"
+LABEL_AVG_LATENCY = "Average Latency"
+LABEL_MIN_LATENCY = "Minimum Latency"
+LABEL_MAX_LATENCY = "Maximum Latency"
+DEFAULT_TRADE_LATENCY_UNIT = "us"
+
+# Agreed metric field names for latency tracking interface
+METRIC_FIELD_TRADE_COUNT = "trade_count"
+METRIC_FIELD_AVG_LATENCY_NS = "avg_latency_ns"
+METRIC_FIELD_MIN_LATENCY_NS = "min_latency_ns"
+METRIC_FIELD_MAX_LATENCY_NS = "max_latency_ns"
 
 # Latency label detail: measures inter-event elapsed time between consecutive
 # record_order_processed() calls recorded by the dashboard. This reflects the
@@ -207,8 +251,19 @@ def _extract_order_price_qty(
                 return (float(order[1]), int(order[2]))
             except (ValueError, TypeError):
                 return None
-        if len(order) == 4:
+        if len(order) in (4, 5, 6):
             side = order[1]
+            if expected_side in buy_sides and side not in buy_sides:
+                return None
+            if expected_side in sell_sides and side not in sell_sides:
+                return None
+            try:
+                return (float(order[2]), int(order[3]))
+            except (ValueError, TypeError):
+                return None
+        if len(order) >= 7:
+            # Layout: (order_id, timestamp_ns, price, quantity, symbol_id, side, order_type, ...)
+            side = order[5]
             if expected_side in buy_sides and side not in buy_sides:
                 return None
             if expected_side in sell_sides and side not in sell_sides:
@@ -309,7 +364,7 @@ def aggregate_orders_by_price(
         parsed = _extract_order_price_qty(order, expected_side=expected_side)
         if parsed is not None:
             p, q = parsed
-            if p > 0 and q > 0:
+            if p > 0 and q > 0 and not math.isnan(p) and not math.isinf(p):
                 norm_p = round(p, 6)
                 aggregated[norm_p] = aggregated.get(norm_p, 0) + q
 
@@ -371,7 +426,7 @@ def calculate_sell_depth(
 
 
 def format_depth_rows(
-    depth: Optional[List[PriceLevel]],
+    depth: Optional[List[Any]],
     max_levels: int = 5,
     placeholder: str = PLACEHOLDER,
 ) -> List[Tuple[str, str]]:
@@ -380,17 +435,34 @@ def format_depth_rows(
     If depth contains fewer than max_levels, remaining rows are padded with placeholder.
 
     Args:
-        depth: List of PriceLevel instances.
+        depth: List of PriceLevel instances, tuples, or dicts.
         max_levels: Target number of display rows (default: 5).
         placeholder: String to display for empty levels (default: PLACEHOLDER).
 
     Returns:
         List of (price_str, quantity_str) tuples of length max_levels.
     """
+    if max_levels <= 0:
+        return []
+
     rows: List[Tuple[str, str]] = []
     levels = depth or []
     for level in levels[:max_levels]:
-        rows.append((format_price(level.price), str(level.quantity)))
+        if hasattr(level, "price") and hasattr(level, "quantity"):
+            p = getattr(level, "price")
+            q = getattr(level, "quantity")
+        elif isinstance(level, (tuple, list)) and len(level) >= 2:
+            p = level[0]
+            q = level[1]
+        elif isinstance(level, dict):
+            p = level.get("price", level.get("price_cents", 0))
+            q = level.get("quantity", level.get("qty", 0))
+        else:
+            continue
+        try:
+            rows.append((format_price(p), str(int(q))))
+        except (ValueError, TypeError):
+            rows.append((format_price(p), str(q)))
 
     while len(rows) < max_levels:
         rows.append((placeholder, placeholder))
@@ -520,6 +592,7 @@ def format_orders_processed(count: Optional[Union[int, str]]) -> str:
 
 # Alias matching total orders label
 format_total_orders = format_orders_processed
+format_processed_orders = format_orders_processed
 
 
 def get_sample_orders_processed() -> int:
@@ -579,6 +652,59 @@ def calculate_throughput_from_counts(
     return calculate_throughput(delta, elapsed_seconds)
 
 
+def calculate_throughput_ns(
+    delta_orders: Union[int, float],
+    elapsed_ns: Union[int, float],
+) -> Optional[float]:
+    """Calculate throughput as processed orders divided by elapsed nanoseconds.
+
+    Args:
+        delta_orders: Change in processed order count (must be non-negative).
+        elapsed_ns: Elapsed interval in nanoseconds (must be strictly positive).
+
+    Returns:
+        Throughput in orders/sec rounded to 2 decimal places, or None if
+        elapsed_ns <= 0, delta_orders < 0, or either input is invalid.
+    """
+    if delta_orders is None or elapsed_ns is None:
+        return None
+
+    try:
+        d_orders = float(delta_orders)
+        d_ns = float(elapsed_ns)
+    except (ValueError, TypeError):
+        return None
+
+    if math.isnan(d_orders) or math.isinf(d_orders) or math.isnan(d_ns) or math.isinf(d_ns):
+        return None
+
+    if d_ns <= 0 or d_orders < 0:
+        return None
+
+    if d_orders == 0.0:
+        return 0.0
+
+    elapsed_seconds = d_ns / 1_000_000_000.0
+    return calculate_throughput(d_orders, elapsed_seconds)
+
+
+def calculate_throughput_from_counts_ns(
+    current_count: Union[int, float],
+    previous_count: Union[int, float],
+    elapsed_ns: Union[int, float],
+) -> Optional[float]:
+    """Calculate throughput from current and previous order counts over elapsed nanoseconds."""
+    if current_count is None or previous_count is None:
+        return None
+    try:
+        c_curr = float(current_count)
+        c_prev = float(previous_count)
+    except (ValueError, TypeError):
+        return None
+    delta = c_curr - c_prev
+    return calculate_throughput_ns(delta, elapsed_ns)
+
+
 def format_throughput(
     throughput: Optional[Union[float, int, str]],
     is_demo: bool = False,
@@ -600,6 +726,9 @@ def format_throughput(
         ValueError: If throughput is a negative number.
     """
     if throughput is None:
+        return DEMO_THROUGHPUT if is_demo else NO_SAMPLE_THROUGHPUT
+
+    if isinstance(throughput, bool):
         return DEMO_THROUGHPUT if is_demo else NO_SAMPLE_THROUGHPUT
 
     if isinstance(throughput, str):
@@ -695,6 +824,642 @@ def format_latency(
     return f"{val:.{decimals}f}"
 
 
+def calculate_trade_latency_stats(
+    samples: Optional[List[Union[float, int]]],
+) -> Optional[Dict[str, float]]:
+    """Calculate trade execution latency statistics from recorded samples.
+
+    Args:
+        samples: List of non-negative latency measurements.
+
+    Returns:
+        Dict with keys 'last', 'avg', 'min', 'max' (and 'p95' when >= 20 samples),
+        or None if samples is empty, None, or contains no valid values.
+    """
+    if not samples:
+        return None
+    try:
+        valid = [
+            float(s)
+            for s in samples
+            if s is not None
+            and not math.isnan(float(s))
+            and not math.isinf(float(s))
+            and float(s) >= 0
+        ]
+    except (ValueError, TypeError):
+        return None
+    if not valid:
+        return None
+
+    result: Dict[str, float] = {
+        "last": valid[-1],
+        "avg": sum(valid) / len(valid),
+        "min": min(valid),
+        "max": max(valid),
+    }
+    if len(valid) >= _LATENCY_MIN_SAMPLES_FOR_P95:
+        sorted_vals = sorted(valid)
+        p95_idx = max(0, int(math.ceil(len(sorted_vals) * 0.95)) - 1)
+        result["p95"] = sorted_vals[p95_idx]
+    return result
+
+
+def format_trade_latency(
+    value: Optional[Union[float, int]],
+    unit: str = "us",
+    decimals: int = 1,
+) -> str:
+    """Format a trade execution latency value for display.
+
+    Args:
+        value: Latency in microseconds or nanoseconds (float, int), or None.
+        unit: Unit string ('us' or 'ns', default 'us').
+        decimals: Decimal places for microsecond formatting (default: 1).
+
+    Returns:
+        Formatted string (e.g., '123.4', '450', '1,200') or 'N/A' if None or invalid.
+    """
+    if value is None:
+        return NO_SAMPLE_LATENCY
+    try:
+        val = float(value)
+    except (ValueError, TypeError):
+        return NO_SAMPLE_LATENCY
+    if math.isnan(val) or math.isinf(val) or val < 0:
+        return NO_SAMPLE_LATENCY
+
+    if unit.lower() == "ns":
+        return f"{int(round(val)):,}"
+    return f"{val:.{decimals}f}"
+
+
+def format_trades_processed(count: Optional[Union[int, str]]) -> str:
+    """Format processed trades counter with thousands separators, or 'N/A' if None.
+
+    Args:
+        count: Non-negative integer count, integer-convertible string, or None.
+
+    Returns:
+        Formatted string (e.g., '0', '125', '12,500') or 'N/A' if None.
+
+    Raises:
+        ValueError: If count is negative.
+    """
+    if count is None:
+        return NO_SAMPLE_LATENCY
+    try:
+        val = int(count)
+    except (ValueError, TypeError):
+        return NO_SAMPLE_LATENCY
+    if val < 0:
+        raise ValueError(f"Trades processed count cannot be negative: {val}")
+    return f"{val:,}"
+
+
+@dataclass
+class TradeLatencyMetrics:
+    """Container representing agreed trade execution latency metrics.
+
+    Fields:
+      trade_count: Total count of executed trades.
+      avg_latency_ns: Mean execution latency in nanoseconds.
+      min_latency_ns: Minimum execution latency in nanoseconds.
+      max_latency_ns: Maximum execution latency in nanoseconds.
+      last_latency_ns: Last execution latency in nanoseconds.
+    """
+
+    trade_count: int = 0
+    avg_latency_ns: Optional[float] = None
+    min_latency_ns: Optional[float] = None
+    max_latency_ns: Optional[float] = None
+    last_latency_ns: Optional[float] = None
+
+
+def extract_trade_latency_metrics(tracker: Any) -> Optional[Dict[str, Any]]:
+    """Extract agreed trade latency metric fields from a latency tracking interface.
+
+    Accepts:
+      - Objects with trade_count, avg_latency_ns, min_latency_ns, max_latency_ns
+      - Objects with get_metrics() or get_stats() methods
+      - Dictionaries with agreed keys
+      - Callables returning metrics objects or dicts
+
+    Agreed fields:
+      trade_count (int)
+      avg_latency_ns (float / int)
+      min_latency_ns (float / int)
+      max_latency_ns (float / int)
+
+    Returns:
+      Dict with 'trade_count', 'avg_latency_ns', 'min_latency_ns', 'max_latency_ns',
+      'last_latency_ns', or None if tracker is None or unavailable.
+    """
+    if tracker is None:
+        return None
+
+    obj = tracker
+    if callable(obj) and not hasattr(obj, "trade_count") and not hasattr(obj, "avg_latency_ns"):
+        try:
+            obj = obj()
+        except Exception:
+            return None
+
+    if obj is None:
+        return None
+
+    if hasattr(obj, "get_metrics") and callable(getattr(obj, "get_metrics")):
+        try:
+            obj = obj.get_metrics()
+        except Exception:
+            return None
+    elif hasattr(obj, "get_stats") and callable(getattr(obj, "get_stats")):
+        try:
+            obj = obj.get_stats()
+        except Exception:
+            return None
+
+    if obj is None:
+        return None
+
+    def _get_val(source: Any, *keys: str) -> Any:
+        if isinstance(source, dict):
+            for k in keys:
+                if k in source and source[k] is not None:
+                    return source[k]
+        else:
+            for k in keys:
+                if hasattr(source, k):
+                    val = getattr(source, k)
+                    if val is not None:
+                        return val
+        return None
+
+    raw_count = _get_val(obj, "trade_count", "trades_processed", "total_trades")
+    raw_avg = _get_val(obj, "avg_latency_ns", "avg_execution_latency_ns", "mean_latency_ns")
+    raw_min = _get_val(obj, "min_latency_ns", "min_execution_latency_ns")
+    raw_max = _get_val(obj, "max_latency_ns", "max_execution_latency_ns")
+    raw_last = _get_val(obj, "last_latency_ns", "last_execution_latency_ns", "latency_ns")
+
+    # Fallback to microsecond equivalents if nanosecond metrics are omitted
+    if raw_avg is None:
+        avg_us = _get_val(obj, "avg_latency_us", "avg_execution_latency_us", "avg_latency")
+        if avg_us is not None:
+            try:
+                raw_avg = float(avg_us) * 1000.0
+            except (ValueError, TypeError):
+                pass
+    if raw_min is None:
+        min_us = _get_val(obj, "min_latency_us", "min_execution_latency_us", "min_latency")
+        if min_us is not None:
+            try:
+                raw_min = float(min_us) * 1000.0
+            except (ValueError, TypeError):
+                pass
+    if raw_max is None:
+        max_us = _get_val(obj, "max_latency_us", "max_execution_latency_us", "max_latency")
+        if max_us is not None:
+            try:
+                raw_max = float(max_us) * 1000.0
+            except (ValueError, TypeError):
+                pass
+    if raw_last is None:
+        last_us = _get_val(obj, "last_latency_us", "last_execution_latency_us", "latency_us", "latency")
+        if last_us is not None:
+            try:
+                raw_last = float(last_us) * 1000.0
+            except (ValueError, TypeError):
+                pass
+
+    trade_count = 0
+    if raw_count is not None:
+        try:
+            trade_count = max(0, int(raw_count))
+        except (ValueError, TypeError):
+            trade_count = 0
+
+    def _clean_lat(val: Any) -> Optional[float]:
+        if val is None:
+            return None
+        try:
+            f = float(val)
+        except (ValueError, TypeError):
+            return None
+        if math.isnan(f) or math.isinf(f) or f < 0:
+            return None
+        return f
+
+    avg_ns = _clean_lat(raw_avg)
+    min_ns = _clean_lat(raw_min)
+    max_ns = _clean_lat(raw_max)
+    last_ns = _clean_lat(raw_last)
+
+    # When no trades have been processed, latency metrics are unavailable (N/A)
+    if trade_count == 0:
+        avg_ns = None
+        min_ns = None
+        max_ns = None
+        last_ns = None
+
+    return {
+        "trade_count": trade_count,
+        "avg_latency_ns": avg_ns,
+        "min_latency_ns": min_ns,
+        "max_latency_ns": max_ns,
+        "last_latency_ns": last_ns,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Whale Order Detection
+# ---------------------------------------------------------------------------
+
+WHALE_MIN_PRICE_LEVELS: int = 2  # Minimum distinct price levels swept for whale classification
+
+SECTION_WHALE_ALERT: str = "\u26a1 WHALE ORDER DETECTED"
+LABEL_WHALE_LEVELS: str = "Price Levels Swept"
+LABEL_WHALE_VOLUME: str = "Volume Matched"
+LABEL_WHALE_ORDER_ID: str = "Order ID"
+LABEL_WHALE_SIDE: str = "Side"
+
+
+@dataclass
+class WhaleOrderEvent:
+    """Represents a detected whale order that swept multiple price levels.
+
+    A whale order is defined as a single aggressive order that executes
+    against two or more distinct price levels in the order book.
+    No arbitrary size threshold is used -- detection is based solely on
+    multi-level execution.
+
+    Fields:
+        order_id: ID of the aggressor order.
+        side: Aggressor side (1=BUY, 2=SELL, 0=unknown).
+        total_quantity: Sum of all executed quantities.
+        price_levels_cleared: Number of distinct price levels swept.
+        prices: Ordered list of distinct prices at which trades executed.
+        volume_matched: Total executed volume.
+        timestamp_ns: Optional nanosecond timestamp of detection.
+    """
+
+    order_id: int
+    side: int
+    total_quantity: int
+    price_levels_cleared: int
+    prices: List[float]
+    volume_matched: int
+    timestamp_ns: Optional[int] = None
+
+    @property
+    def is_whale(self) -> bool:
+        """Return True when this event meets the multi-level whale threshold."""
+        return self.price_levels_cleared >= WHALE_MIN_PRICE_LEVELS
+
+
+def detect_whale_order(
+    order_id: int,
+    trades: Optional[List[Any]],
+    side: Optional[int] = None,
+    min_levels: int = WHALE_MIN_PRICE_LEVELS,
+) -> Optional[WhaleOrderEvent]:
+    """Detect if an order executed across multiple price levels (whale sweep).
+
+    Detection is based exclusively on whether trades from a single order span
+    two or more distinct price levels.  No order-size threshold is applied.
+
+    Args:
+        order_id: ID of the order that was submitted.
+        trades: List of TradeResult objects from the matching engine.
+                Each item must expose a ``price`` attribute (or index 2) and
+                an ``executed_quantity`` attribute (or index 3).
+        side: Optional aggressor side (1=BUY, 2=SELL); stored for display only.
+        min_levels: Minimum distinct price levels to qualify as a whale sweep
+                    (default: WHALE_MIN_PRICE_LEVELS = 2).
+
+    Returns:
+        A :class:`WhaleOrderEvent` if 2+ distinct price levels were swept,
+        otherwise ``None``.
+    """
+    if not trades:
+        return None
+
+    prices: List[float] = []
+    total_volume: int = 0
+    for t in trades:
+        try:
+            if isinstance(t, dict):
+                p = float(t.get("price", t.get("execution_price", 0)))
+                q = int(t.get("executed_quantity", t.get("quantity", t.get("qty", 0))))
+            elif hasattr(t, "price"):
+                p = float(t.price)
+                q = int(t.executed_quantity if hasattr(t, "executed_quantity") else t.quantity)
+            elif hasattr(t, "execution_price"):
+                p = float(t.execution_price)
+                q = int(t.executed_quantity if hasattr(t, "executed_quantity") else t.quantity)
+            else:
+                p = float(t[2])
+                q = int(t[3])
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            continue
+        prices.append(p)
+        total_volume += q
+
+    # Deduplicate while preserving execution order
+    seen: dict = {}
+    for p in prices:
+        seen[p] = None
+    distinct_prices = list(seen.keys())
+
+    if len(distinct_prices) < min_levels:
+        return None
+
+    return WhaleOrderEvent(
+        order_id=order_id,
+        side=side if side is not None else 0,
+        total_quantity=total_volume,
+        price_levels_cleared=len(distinct_prices),
+        prices=distinct_prices,
+        volume_matched=total_volume,
+    )
+
+
+def build_whale_alert_lines(
+    width: int,
+    whale: Optional[WhaleOrderEvent] = None,
+) -> List[str]:
+    """Return whale order alert section lines, or an empty list if no whale.
+
+    Args:
+        width: Available content width in characters.
+        whale: A detected whale order event, or None.
+
+    Returns:
+        List of formatted strings to display the alert, or [] when *whale* is None.
+    """
+    if whale is None:
+        return []
+
+    divider = "-" * width
+    col_w = max(width - 4, 10)
+    side_str = "BUY" if whale.side in (1, "1", "BUY", "buy") else "SELL" if whale.side in (2, "2", "SELL", "sell") else "?"
+    levels_str = str(whale.price_levels_cleared)
+
+    formatted_prices: List[str] = []
+    for p in whale.prices[:5]:
+        try:
+            formatted_prices.append(f"{float(p):.2f}")
+        except (ValueError, TypeError):
+            formatted_prices.append(str(p))
+    prices_str = " -> ".join(formatted_prices)
+    if len(whale.prices) > 5:
+        prices_str += " ..."
+
+    return [
+        f"  {SECTION_WHALE_ALERT}",
+        divider,
+        f"  {LABEL_WHALE_ORDER_ID:<{col_w - 10}} {whale.order_id:>8}",
+        f"  {LABEL_WHALE_SIDE:<{col_w - 10}} {side_str:>8}",
+        f"  {LABEL_WHALE_LEVELS:<{col_w - 10}} {levels_str:>8}",
+        f"  {LABEL_WHALE_VOLUME:<{col_w - 10}} {whale.volume_matched:>8,}",
+        f"  Swept: {prices_str}",
+        divider,
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Audit Activity & Persistence Status structures and helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AuditStatusInfo:
+    """Container for audit worker status and persistence metrics.
+
+    Designed as a backward-compatible optional input. When Faizan's audit
+    worker is merged, it can provide this data; until then the dashboard
+    gracefully handles None or missing fields.
+
+    Fields:
+        worker_status: Current audit worker state ('running', 'stopped', 'error', or None/unknown).
+        error_message: Optional error description when worker_status is 'error'.
+        records_written: Count of records successfully persisted.
+        records_pending: Count of records waiting in queue to be written.
+        write_errors: Count of failed persistence write attempts.
+        last_flush: Optional human-readable timestamp or label of the last flush.
+    """
+
+    worker_status: Optional[Union[str, bool]] = None
+    records_written: Optional[int] = None
+    records_pending: Optional[int] = None
+    write_errors: Optional[int] = None
+    last_flush: Optional[Union[str, float, int]] = None
+    error_message: Optional[str] = None
+
+
+def format_audit_counter(count: Optional[Union[int, str]]) -> str:
+    """Format an audit record count with thousands separators or 'N/A' if None.
+
+    Args:
+        count: Non-negative integer count, integer-convertible string, or None.
+
+    Returns:
+        Formatted string (e.g., '0', '125', '12,500') or 'N/A' if None.
+
+    Raises:
+        ValueError: If count is negative.
+    """
+    if count is None:
+        return NO_SAMPLE_LATENCY
+    try:
+        val = int(count)
+    except (ValueError, TypeError):
+        return NO_SAMPLE_LATENCY
+    if val < 0:
+        raise ValueError(f"Audit counter cannot be negative: {val}")
+    return f"{val:,}"
+
+
+def format_audit_worker_status(
+    status: Optional[Union[str, bool]] = None,
+    error_message: Optional[str] = None,
+) -> str:
+    """Format audit worker status string for display.
+
+    Args:
+        status: Status string ('running', 'stopped', 'error', etc.), bool, or None.
+        error_message: Optional error message if status is 'error'.
+
+    Returns:
+        Formatted status string ('Running', 'Stopped', 'Error', 'Error: <msg>', or 'N/A').
+    """
+    if status is None:
+        return NO_SAMPLE_LATENCY
+    if isinstance(status, bool):
+        return "Running" if status else "Stopped"
+    s = str(status).strip()
+    if not s:
+        return NO_SAMPLE_LATENCY
+    s_lower = s.lower()
+    if s_lower == "running":
+        return "Running"
+    if s_lower == "stopped":
+        return "Stopped"
+    if s_lower == "error":
+        return f"Error: {error_message}" if error_message else "Error"
+    return s.capitalize() if len(s) > 1 else s.upper()
+
+
+def _coerce_audit_status(data: Any) -> Optional[AuditStatusInfo]:
+    """Coerce various audit status representations into AuditStatusInfo.
+
+    Supports:
+        - AuditStatusInfo instances directly
+        - Dicts with common keys
+        - Objects with attributes or inspection methods
+        - Callables returning dict or object
+    """
+    if data is None:
+        return None
+    if isinstance(data, AuditStatusInfo):
+        return data
+
+    obj = data
+    if callable(obj) and not isinstance(obj, type) and not hasattr(obj, "worker_status") and not hasattr(obj, "records_written"):
+        try:
+            obj = obj()
+        except Exception:
+            return None
+
+    if obj is None:
+        return None
+    if isinstance(obj, AuditStatusInfo):
+        return obj
+
+    if hasattr(obj, "get_status") and callable(getattr(obj, "get_status")):
+        try:
+            status_obj = obj.get_status()
+            if status_obj is not None:
+                obj = status_obj
+        except Exception:
+            pass
+    elif hasattr(obj, "get_metrics") and callable(getattr(obj, "get_metrics")):
+        try:
+            metrics_obj = obj.get_metrics()
+            if metrics_obj is not None:
+                obj = metrics_obj
+        except Exception:
+            pass
+
+    def _get_val(source: Any, *keys: str) -> Any:
+        if isinstance(source, dict):
+            for k in keys:
+                if k in source and source[k] is not None:
+                    return source[k]
+        else:
+            for k in keys:
+                if hasattr(source, k):
+                    val = getattr(source, k)
+                    if val is not None:
+                        return val
+        return None
+
+    status = _get_val(obj, "worker_status", "status", "state")
+    if status is None and hasattr(obj, "is_running"):
+        status = "running" if getattr(obj, "is_running") else "stopped"
+
+    written = _get_val(obj, "records_written", "written", "records_persisted", "total_written")
+    pending = _get_val(obj, "records_pending", "pending", "queue_size", "queued", "unflushed_records")
+    errors = _get_val(obj, "write_errors", "failed_records", "errors", "error_count", "failed_writes")
+    flush = _get_val(obj, "last_flush", "last_flush_time", "flush_timestamp", "last_flush_indicator")
+    err_msg = _get_val(obj, "error_message", "error", "last_error")
+
+    def _clean_int(val: Any) -> Optional[int]:
+        if val is None:
+            return None
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return None
+
+    return AuditStatusInfo(
+        worker_status=status,
+        records_written=_clean_int(written) if written is not None else None,
+        records_pending=_clean_int(pending) if pending is not None else None,
+        write_errors=_clean_int(errors) if errors is not None else None,
+        last_flush=str(flush) if flush is not None else None,
+        error_message=str(err_msg) if err_msg is not None else None,
+    )
+
+
+def build_audit_status_lines(
+    width: int,
+    audit_status: Optional[Union[AuditStatusInfo, Dict[str, Any], Any]] = None,
+    worker_status: Optional[str] = None,
+    records_written: Optional[Union[int, str]] = None,
+    records_pending: Optional[Union[int, str]] = None,
+    write_errors: Optional[Union[int, str]] = None,
+    last_flush: Optional[Union[str, float, int]] = None,
+    error_message: Optional[str] = None,
+) -> List[str]:
+    """Return Audit & Persistence Status section lines.
+
+    When audit_status is None (audit worker not connected) and no overrides are passed,
+    all available metrics display 'N/A'. No live values are invented.
+    Last-flush indicator is displayed only if provided.
+
+    Args:
+        width: Available content width in characters.
+        audit_status: Optional AuditStatusInfo or dict.
+        worker_status: Optional worker status override.
+        records_written: Optional records written override.
+        records_pending: Optional records pending override.
+        write_errors: Optional write errors override.
+        last_flush: Optional last flush indicator.
+        error_message: Optional error message.
+
+    Returns:
+        List of formatted strings for the audit status section.
+    """
+    info = _coerce_audit_status(audit_status) if audit_status is not None else None
+
+    # Resolve values with explicit overrides taking precedence
+    st = worker_status if worker_status is not None else (info.worker_status if info else None)
+    err = error_message if error_message is not None else (info.error_message if info else None)
+    wr = records_written if records_written is not None else (info.records_written if info else None)
+    pd = records_pending if records_pending is not None else (info.records_pending if info else None)
+    er = write_errors if write_errors is not None else (info.write_errors if info else None)
+    lf = last_flush if last_flush is not None else (info.last_flush if info else None)
+
+    worker_str = format_audit_worker_status(st, error_message=err)
+    written_str = format_audit_counter(wr)
+    pending_str = format_audit_counter(pd)
+    errors_str = format_audit_counter(er)
+
+    divider = "-" * width
+    col_w = max(width - 4, 10)
+
+    def _row(label: str, val_str: str) -> str:
+        val_w = max(len(val_str), 8)
+        label_w = max(col_w - val_w - 2, 10)
+        return f"  {label:<{label_w}} {val_str:>{val_w}}"
+
+    lines: List[str] = [
+        f"  {SECTION_AUDIT_STATUS}",
+        divider,
+        _row(LABEL_AUDIT_WORKER, worker_str),
+        _row(LABEL_AUDIT_RECORDS_WRITTEN, written_str),
+        _row(LABEL_AUDIT_RECORDS_PENDING, pending_str),
+        _row(LABEL_AUDIT_WRITE_ERRORS, errors_str),
+    ]
+
+    # Display last-flush indicator only if the implementation/input provides it
+    if lf is not None:
+        flush_str = str(lf)
+        lines.append(_row(LABEL_AUDIT_LAST_FLUSH, flush_str))
+
+    lines.append(divider)
+    return lines
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -707,6 +1472,8 @@ class DashboardConfig:
     refresh_interval_ms: int = DEFAULT_REFRESH_INTERVAL_MS
     min_rows: int = MIN_TERMINAL_ROWS
     min_cols: int = MIN_TERMINAL_COLS
+    trade_latency_unit: str = DEFAULT_TRADE_LATENCY_UNIT
+    whale_min_levels: int = WHALE_MIN_PRICE_LEVELS
 
 
 # ---------------------------------------------------------------------------
@@ -849,6 +1616,73 @@ def build_performance_lines(
     ]
 
 
+def build_trade_execution_lines(
+    width: int,
+    trades_processed: Optional[Union[str, int]] = 0,
+    latency: Optional[Union[str, float, int]] = None,
+    latency_avg: Optional[Union[str, float, int]] = None,
+    latency_min: Optional[Union[str, float, int]] = None,
+    latency_max: Optional[Union[str, float, int]] = None,
+    unit: str = DEFAULT_TRADE_LATENCY_UNIT,
+) -> List[str]:
+    """Return Trade Execution Metrics section lines.
+
+    Displays trade execution times, processed trade counts, and summary statistics.
+    When metrics are not available (None), displays NO_SAMPLE_LATENCY ('N/A').
+
+    Args:
+        width: Available content width in characters.
+        trades_processed: Total processed trades (integer, formatted string, or None).
+        latency: Last trade execution latency (number, formatted string, or None).
+        latency_avg: Average trade execution latency (number, formatted string, or None).
+        latency_min: Minimum trade execution latency (number, formatted string, or None).
+        latency_max: Maximum trade execution latency (number, formatted string, or None).
+        unit: Latency measurement unit ('us' for microseconds, 'ns' for nanoseconds).
+    """
+    if isinstance(trades_processed, int):
+        trades_str = format_trades_processed(trades_processed)
+    elif trades_processed is None:
+        trades_str = NO_SAMPLE_LATENCY
+    else:
+        trades_str = str(trades_processed)
+
+    def _fmt(val: Optional[Union[str, float, int]]) -> str:
+        if val is None:
+            return NO_SAMPLE_LATENCY
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return format_trade_latency(val, unit=unit)
+        return str(val)
+
+    last_str = _fmt(latency)
+    avg_str = _fmt(latency_avg)
+    min_str = _fmt(latency_min)
+    max_str = _fmt(latency_max)
+
+    if unit.lower() == "us":
+        lbl_last = LABEL_TRADE_LATENCY
+        lbl_avg = LABEL_TRADE_LATENCY_AVG
+        lbl_min = LABEL_TRADE_LATENCY_MIN
+        lbl_max = LABEL_TRADE_LATENCY_MAX
+    else:
+        lbl_last = f"Last Execution Latency ({unit})"
+        lbl_avg = f"Avg Execution Latency ({unit})"
+        lbl_min = f"Min Execution Latency ({unit})"
+        lbl_max = f"Max Execution Latency ({unit})"
+
+    divider = "-" * width
+    col_w = max(width - 4, 10)
+    return [
+        f"  {SECTION_TRADE_EXECUTION}",
+        divider,
+        f"  {LABEL_TRADES_PROCESSED:<{col_w - 10}} {trades_str:>8}",
+        f"  {lbl_last:<{col_w - 10}} {last_str:>8}",
+        f"  {lbl_avg:<{col_w - 10}} {avg_str:>8}",
+        f"  {lbl_min:<{col_w - 10}} {min_str:>8}",
+        f"  {lbl_max:<{col_w - 10}} {max_str:>8}",
+        divider,
+    ]
+
+
 def build_footer_lines(width: int) -> List[str]:
     """Return footer lines."""
     return [
@@ -876,6 +1710,10 @@ class TerminalDashboard:
         ns_clock: Optional[Callable[[], int]] = None,
         throughput: Optional[Union[float, int, str]] = None,
         live_feed: Optional[Any] = None,
+        trades_processed: Optional[int] = None,
+        trade_latency_unit: Optional[str] = None,
+        audit_status: Optional[Union[AuditStatusInfo, Dict[str, Any], Any]] = None,
+        whale: Optional[WhaleOrderEvent] = None,
     ) -> None:
         """Initialize the dashboard.
 
@@ -947,7 +1785,10 @@ class TerminalDashboard:
 
         self._clock: Callable[[], float] = clock if clock is not None else time.monotonic
         self._ns_clock: Callable[[], int] = ns_clock if ns_clock is not None else time.perf_counter_ns
+        self._has_custom_clock: bool = clock is not None
+        self._has_custom_ns_clock: bool = ns_clock is not None
         self._last_throughput_time: Optional[float] = None
+        self._last_throughput_time_ns: Optional[int] = None
         self._last_orders_count: Optional[int] = None
         self._throughput: Optional[float] = None
         self._throughput_override: Optional[str] = None
@@ -973,12 +1814,41 @@ class TerminalDashboard:
         _MAX_LATENCY_SAMPLES = 1000
         self._max_latency_samples: int = _MAX_LATENCY_SAMPLES
 
+        # Trade execution metrics tracking state
+        self._trade_latency_unit: str = (
+            trade_latency_unit
+            if trade_latency_unit is not None
+            else getattr(self.config, "trade_latency_unit", DEFAULT_TRADE_LATENCY_UNIT)
+        )
+        self._trades_processed: int = 0
+        if trades_processed is not None:
+            self.trades_processed = trades_processed
+
+        self._trade_latency_last_us: Optional[float] = None
+        self._trade_latency_samples: List[float] = []
+        _MAX_TRADE_LATENCY_SAMPLES = 1000
+        self._max_trade_latency_samples: int = _MAX_TRADE_LATENCY_SAMPLES
+
         # Trade latency metrics snapshot state (Week 3 Day 3)
         self._trade_count: int = 0
         self._trade_avg_latency_ns: float = 0.0
         self._trade_min_latency_ns: int = 0
         self._trade_max_latency_ns: int = 0
         self._trade_latency_snapshot: Optional[Any] = None
+
+        # Whale order detection state
+        self._last_whale_event: Optional[WhaleOrderEvent] = None
+        self._whale_history: List[WhaleOrderEvent] = []
+        self._max_whale_history: int = 10
+        if whale is not None:
+            self.record_whale_order(whale)
+
+        # Audit activity & persistence tracking state
+        self._audit_status: Optional[AuditStatusInfo] = (
+            _coerce_audit_status(audit_status)
+            if audit_status is not None and not isinstance(audit_status, AuditStatusInfo)
+            else audit_status
+        )
 
     @property
     def orders_processed(self) -> int:
@@ -1011,6 +1881,14 @@ class TerminalDashboard:
         """Alias for set_orders_processed, ready for live engine snapshot integration."""
         self.set_orders_processed(count)
 
+    def get_orders_processed(self) -> int:
+        """Return the current number of processed orders."""
+        return self.orders_processed
+
+    def get_orders_processed_display(self) -> str:
+        """Return the formatted processed orders count for display."""
+        return format_orders_processed(self.orders_processed)
+
     def increment_orders_processed(self, delta: int = 1) -> int:
         """Increment the processed orders counter by delta.
 
@@ -1032,7 +1910,11 @@ class TerminalDashboard:
         self.orders_processed += int_delta
         return self.orders_processed
 
-    def record_order_processed(self, order: Optional[Any] = None) -> int:
+    def record_order_processed(
+        self,
+        order: Optional[Any] = None,
+        timestamp_ns: Optional[int] = None,
+    ) -> int:
         """Record a single processed order event and update latency metrics.
 
         The counter represents the number of orders accepted or processed by the engine,
@@ -1047,6 +1929,7 @@ class TerminalDashboard:
         Args:
             order: Optional order representation (dict, object, tuple, or None).
                    If an order_id is present, duplicate events for the same order are ignored.
+            timestamp_ns: Optional nanosecond timestamp of processing event.
 
         Returns:
             The updated orders_processed count.
@@ -1059,23 +1942,27 @@ class TerminalDashboard:
 
         # Measure inter-event latency BEFORE incrementing the counter.
         # Done on real processing events, not in the render loop.
-        self._record_latency_sample()
+        self._record_latency_sample(timestamp_ns=timestamp_ns)
 
         self.increment_orders_processed(1)
         return self.orders_processed
 
-    def on_order_processed(self, order: Optional[Any] = None) -> int:
+    def on_order_processed(
+        self,
+        order: Optional[Any] = None,
+        timestamp_ns: Optional[int] = None,
+    ) -> int:
         """Event handler callback for order processed events (alias for record_order_processed)."""
-        return self.record_order_processed(order)
+        return self.record_order_processed(order, timestamp_ns=timestamp_ns)
 
-    def _record_latency_sample(self) -> None:
+    def _record_latency_sample(self, timestamp_ns: Optional[int] = None) -> None:
         """Record one inter-event latency sample using the nanosecond clock.
 
         Called only from record_order_processed() — never from the render loop.
         Safe when ns_clock raises or returns invalid values.
         """
         try:
-            now_ns = int(self._ns_clock())
+            now_ns = int(timestamp_ns) if timestamp_ns is not None else int(self._ns_clock())
         except Exception:
             return
 
@@ -1186,6 +2073,264 @@ class TerminalDashboard:
         self._processed_order_ids.clear()
         self.reset_throughput()
         self.reset_latency()
+        self.reset_trade_metrics()
+
+    # ------------------------------------------------------------------
+    # Trade execution metrics management
+    # ------------------------------------------------------------------
+
+    @property
+    def trades_processed(self) -> int:
+        """Return the current number of processed trades."""
+        return self._trades_processed
+
+    @trades_processed.setter
+    def trades_processed(self, value: int) -> None:
+        """Set the processed trades counter, rejecting negative values."""
+        try:
+            int_val = int(value)
+        except (ValueError, TypeError) as err:
+            raise ValueError(
+                f"Trades processed count must be an integer, got: {value}"
+            ) from err
+        if int_val < 0:
+            raise ValueError(f"Trades processed count cannot be negative: {value}")
+        self._trades_processed = int_val
+
+    def set_trades_processed(self, count: int) -> None:
+        """Explicitly set the processed trades count.
+
+        Args:
+            count: Non-negative integer count.
+
+        Raises:
+            ValueError: If count is negative.
+        """
+        self.trades_processed = count
+
+    def update_trades_processed(self, count: int) -> None:
+        """Update processed trades count from live engine/adapter snapshot."""
+        self.set_trades_processed(count)
+
+    def increment_trades_processed(self, delta: int = 1) -> int:
+        """Increment the processed trades counter by delta.
+
+        Args:
+            delta: Non-negative integer to increment by (default: 1).
+
+        Returns:
+            The updated counter value.
+
+        Raises:
+            ValueError: If delta is negative.
+        """
+        try:
+            int_delta = int(delta)
+        except (ValueError, TypeError) as err:
+            raise ValueError(f"Increment delta must be an integer, got: {delta}") from err
+        if int_delta < 0:
+            raise ValueError(f"Increment delta cannot be negative: {delta}")
+        self.trades_processed += int_delta
+        return self.trades_processed
+
+    def record_trade_execution(
+        self,
+        latency_us: Optional[Union[float, int]] = None,
+        latency_ns: Optional[Union[float, int]] = None,
+        count: int = 1,
+    ) -> int:
+        """Record a trade execution event and optional execution latency sample.
+
+        Args:
+            latency_us: Measured trade execution latency in microseconds.
+            latency_ns: Measured trade execution latency in nanoseconds.
+            count: Number of executed trades (default: 1).
+
+        Returns:
+            The updated trades_processed count.
+        """
+        self.increment_trades_processed(count)
+
+        sample_us: Optional[float] = None
+        if latency_us is not None:
+            try:
+                sample_us = float(latency_us)
+            except (ValueError, TypeError):
+                sample_us = None
+        elif latency_ns is not None:
+            try:
+                sample_us = float(latency_ns) / 1000.0
+            except (ValueError, TypeError):
+                sample_us = None
+
+        if sample_us is not None and sample_us >= 0 and not (math.isnan(sample_us) or math.isinf(sample_us)):
+            self._trade_latency_last_us = sample_us
+            if len(self._trade_latency_samples) >= self._max_trade_latency_samples:
+                self._trade_latency_samples.pop(0)
+            self._trade_latency_samples.append(sample_us)
+
+        return self.trades_processed
+
+    def get_trade_latency_stats(self) -> Optional[Dict[str, float]]:
+        """Return trade execution latency statistics computed from recorded samples.
+
+        Returns:
+            Dict with 'last', 'avg', 'min', 'max' (and 'p95' when >= 20 samples),
+            all in microseconds. Returns None if no samples have been recorded.
+        """
+        return calculate_trade_latency_stats(self._trade_latency_samples)
+
+    def get_trade_latency_display(self, decimals: int = 1) -> str:
+        """Return formatted last trade execution latency for display."""
+        if self._trade_latency_last_us is not None:
+            val = (
+                self._trade_latency_last_us * 1000.0
+                if self._trade_latency_unit.lower() == "ns"
+                else self._trade_latency_last_us
+            )
+            return format_trade_latency(val, unit=self._trade_latency_unit, decimals=decimals)
+        return NO_SAMPLE_LATENCY
+
+    def get_trade_latency_avg_display(self, decimals: int = 1) -> str:
+        """Return formatted average trade execution latency for display."""
+        stats = self.get_trade_latency_stats()
+        if stats is not None and "avg" in stats:
+            val = (
+                stats["avg"] * 1000.0
+                if self._trade_latency_unit.lower() == "ns"
+                else stats["avg"]
+            )
+            return format_trade_latency(val, unit=self._trade_latency_unit, decimals=decimals)
+        return NO_SAMPLE_LATENCY
+
+    # ------------------------------------------------------------------
+    # Whale order detection state management
+    # ------------------------------------------------------------------
+
+    def record_whale_order(self, whale: "WhaleOrderEvent") -> None:
+        """Record a detected whale order event for dashboard display.
+
+        Keeps the most recent event plus a bounded history ring.
+
+        Args:
+            whale: The whale order event to record.
+        """
+        self._last_whale_event = whale
+        if len(self._whale_history) >= self._max_whale_history:
+            self._whale_history.pop(0)
+        self._whale_history.append(whale)
+
+    def get_last_whale_event(self) -> "Optional[WhaleOrderEvent]":
+        """Return the most recently detected whale order event, or None."""
+        return self._last_whale_event
+
+    @property
+    def last_whale_event(self) -> "Optional[WhaleOrderEvent]":
+        """Return the most recently detected whale order event, or None."""
+        return self._last_whale_event
+
+    @property
+    def whale_history(self) -> List["WhaleOrderEvent"]:
+        """Return a copy of recent whale order events."""
+        return list(self._whale_history)
+
+    def clear_whale_history(self) -> None:
+        """Clear the whale order tracking state (last event and full history)."""
+        self._last_whale_event = None
+        self._whale_history.clear()
+
+    # ------------------------------------------------------------------
+    # Audit & persistence status state management
+    # ------------------------------------------------------------------
+
+    @property
+    def audit_status(self) -> Optional[AuditStatusInfo]:
+        """Return the current audit status info, or None if unavailable."""
+        return self._audit_status
+
+    @audit_status.setter
+    def audit_status(self, value: Optional[Union[AuditStatusInfo, Dict[str, Any], Any]]) -> None:
+        """Set or update the audit status info."""
+        self._audit_status = _coerce_audit_status(value) if value is not None else None
+
+    def set_audit_status(self, status: Optional[Union[AuditStatusInfo, Dict[str, Any], Any]]) -> None:
+        """Explicitly set or update the audit status from an audit worker or monitor."""
+        self.audit_status = status
+
+    def update_audit_status(self, status: Optional[Union[AuditStatusInfo, Dict[str, Any], Any]]) -> None:
+        """Update audit status (alias for set_audit_status)."""
+        self.set_audit_status(status)
+
+    def clear_audit_status(self) -> None:
+        """Clear audit status info (set to None / unavailable)."""
+        self._audit_status = None
+
+    def get_audit_status(self) -> Optional[AuditStatusInfo]:
+        """Return the current audit status info."""
+        return self._audit_status
+
+    def get_audit_worker_display(self) -> str:
+        """Return formatted audit worker status string for display."""
+        if self._audit_status is not None:
+            return format_audit_worker_status(
+                self._audit_status.worker_status,
+                error_message=self._audit_status.error_message,
+            )
+        return NO_SAMPLE_LATENCY
+
+    def get_audit_written_display(self) -> str:
+        """Return formatted records written count for display."""
+        if self._audit_status is not None and self._audit_status.records_written is not None:
+            return format_audit_counter(self._audit_status.records_written)
+        return NO_SAMPLE_LATENCY
+
+    def get_audit_pending_display(self) -> str:
+        """Return formatted records pending count for display."""
+        if self._audit_status is not None and self._audit_status.records_pending is not None:
+            return format_audit_counter(self._audit_status.records_pending)
+        return NO_SAMPLE_LATENCY
+
+    def get_audit_errors_display(self) -> str:
+        """Return formatted write errors count for display."""
+        if self._audit_status is not None and self._audit_status.write_errors is not None:
+            return format_audit_counter(self._audit_status.write_errors)
+        return NO_SAMPLE_LATENCY
+
+    def get_audit_last_flush_display(self) -> Optional[str]:
+        """Return formatted last flush indicator string, or None if not provided."""
+        if self._audit_status is not None and self._audit_status.last_flush is not None:
+            return str(self._audit_status.last_flush)
+        return None
+
+    def get_trade_latency_min_display(self, decimals: int = 1) -> str:
+        """Return formatted minimum trade execution latency for display."""
+        stats = self.get_trade_latency_stats()
+        if stats is not None and "min" in stats:
+            val = (
+                stats["min"] * 1000.0
+                if self._trade_latency_unit.lower() == "ns"
+                else stats["min"]
+            )
+            return format_trade_latency(val, unit=self._trade_latency_unit, decimals=decimals)
+        return NO_SAMPLE_LATENCY
+
+    def get_trade_latency_max_display(self, decimals: int = 1) -> str:
+        """Return formatted maximum trade execution latency for display."""
+        stats = self.get_trade_latency_stats()
+        if stats is not None and "max" in stats:
+            val = (
+                stats["max"] * 1000.0
+                if self._trade_latency_unit.lower() == "ns"
+                else stats["max"]
+            )
+            return format_trade_latency(val, unit=self._trade_latency_unit, decimals=decimals)
+        return NO_SAMPLE_LATENCY
+
+    def reset_trade_metrics(self) -> None:
+        """Reset trade metrics and recorded trade latency samples."""
+        self._trades_processed = 0
+        self._trade_latency_last_us = None
+        self._trade_latency_samples.clear()
 
     @property
     def throughput(self) -> Optional[float]:
@@ -1220,17 +2365,84 @@ class TerminalDashboard:
         else:
             self.throughput = value
 
-    def update_throughput(self, current_time: Optional[float] = None) -> Optional[float]:
+    def _update_throughput_ns(self, now_ns: int) -> Optional[float]:
+        """Internal helper to calculate throughput using nanosecond timestamps."""
+        if self._last_throughput_time_ns is None:
+            self._last_throughput_time_ns = now_ns
+            self._last_orders_count = self.orders_processed
+            return self._throughput
+
+        elapsed_ns = now_ns - self._last_throughput_time_ns
+
+        # Invalid interval (e.g. clock jumped backwards): handle safely without crashing
+        if elapsed_ns < 0:
+            self._last_throughput_time_ns = now_ns
+            self._last_orders_count = self.orders_processed
+            return self._throughput
+
+        # Zero elapsed time: avoid division by zero, return current value unchanged
+        if elapsed_ns == 0:
+            return self._throughput
+
+        # Elapsed > 0: compute delta orders
+        last_count = self._last_orders_count if self._last_orders_count is not None else 0
+        delta_orders = self.orders_processed - last_count
+        if delta_orders < 0:
+            # Counter was reset or moved backwards; reset reference point safely
+            self._last_orders_count = self.orders_processed
+            self._last_throughput_time_ns = now_ns
+            return self._throughput
+
+        calc = calculate_throughput_ns(delta_orders, elapsed_ns)
+        self._throughput = calc
+        self._last_orders_count = self.orders_processed
+        self._last_throughput_time_ns = now_ns
+        return self._throughput
+
+    def update_throughput_ns(self, current_time_ns: Optional[int] = None) -> Optional[float]:
+        """Update throughput using monotonic nanosecond timestamps.
+
+        Args:
+            current_time_ns: Optional nanosecond timestamp override. If None, uses self._ns_clock().
+
+        Returns:
+            Updated throughput in orders/sec, or current throughput if elapsed_ns == 0.
+        """
+        if self._throughput_override is not None:
+            return self._throughput
+
+        try:
+            now_ns = int(current_time_ns) if current_time_ns is not None else int(self._ns_clock())
+        except Exception:
+            return self._throughput
+
+        return self._update_throughput_ns(now_ns)
+
+    def update_throughput(
+        self,
+        current_time: Optional[Union[float, int]] = None,
+        current_time_ns: Optional[int] = None,
+    ) -> Optional[float]:
         """Calculate and update throughput based on processed orders delta and elapsed time.
 
         Args:
-            current_time: Optional timestamp override in seconds. If None, uses self._clock().
+            current_time: Optional timestamp override in seconds (or nanoseconds if large integer).
+            current_time_ns: Optional timestamp override in nanoseconds.
 
         Returns:
             The updated throughput value, or current value if elapsed time is zero.
         """
         if self._throughput_override is not None:
             return self._throughput
+
+        if current_time_ns is not None:
+            return self.update_throughput_ns(current_time_ns)
+
+        if current_time is not None and isinstance(current_time, int) and current_time > 100_000_000_000:
+            return self.update_throughput_ns(current_time)
+
+        if self._has_custom_ns_clock and not self._has_custom_clock and current_time is None:
+            return self.update_throughput_ns()
 
         try:
             now = float(current_time) if current_time is not None else float(self._clock())
@@ -1269,6 +2481,73 @@ class TerminalDashboard:
         self._last_throughput_time = now
         return self._throughput
 
+    def update_throughput_from_metrics(
+        self,
+        orders_count: int,
+        timestamp_ns: Optional[int] = None,
+        timestamp_s: Optional[float] = None,
+    ) -> Optional[float]:
+        """Update processed orders count and calculate throughput from supplied timestamp.
+
+        Args:
+            orders_count: Current cumulative count of processed orders.
+            timestamp_ns: Optional nanosecond monotonic timestamp.
+            timestamp_s: Optional second monotonic timestamp.
+
+        Returns:
+            Updated throughput in orders/sec.
+        """
+        self.set_orders_processed(orders_count)
+        if timestamp_ns is not None:
+            return self.update_throughput_ns(timestamp_ns)
+        if timestamp_s is not None:
+            return self.update_throughput(current_time=timestamp_s)
+        return self.update_throughput()
+
+    def update_from_consumer_stats(self, stats: Any) -> Optional[float]:
+        """Update orders processed and throughput from consumer or adapter stats.
+
+        Accepts objects or dicts exposing total_orders_read / orders_processed and
+        rate or timestamp information.
+        """
+        if stats is None:
+            return self._throughput
+
+        orders = None
+        if isinstance(stats, dict):
+            orders = stats.get("total_orders_read", stats.get("orders_processed", stats.get("total_orders")))
+        else:
+            for attr in ("total_orders_read", "orders_processed", "total_orders"):
+                if hasattr(stats, attr):
+                    orders = getattr(stats, attr)
+                    break
+
+        if orders is not None:
+            try:
+                self.set_orders_processed(int(orders))
+            except (ValueError, TypeError):
+                pass
+
+        rate = None
+        if isinstance(stats, dict):
+            rate = stats.get("current_rate", stats.get("throughput", stats.get("avg_rate")))
+        else:
+            for attr in ("current_rate", "throughput", "avg_rate"):
+                if hasattr(stats, attr):
+                    rate = getattr(stats, attr)
+                    break
+
+        if rate is not None:
+            try:
+                f_rate = float(rate)
+                if f_rate >= 0 and not (math.isnan(f_rate) or math.isinf(f_rate)):
+                    self.throughput = round(f_rate, 2)
+                    return self._throughput
+            except (ValueError, TypeError):
+                pass
+
+        return self.update_throughput()
+
     def get_throughput(self) -> Optional[float]:
         """Return the current throughput in orders/sec."""
         return self._throughput
@@ -1288,6 +2567,7 @@ class TerminalDashboard:
         self._throughput = None
         self._throughput_override = None
         self._last_throughput_time = None
+        self._last_throughput_time_ns = None
         self._last_orders_count = None
 
     @property
@@ -1328,6 +2608,35 @@ class TerminalDashboard:
         """Alias for set_sell_orders, ready for live engine snapshot integration."""
         self.set_sell_orders(orders, is_sample=is_sample)
 
+    def update_orders(
+        self,
+        buy_orders: Optional[List[Any]] = None,
+        sell_orders: Optional[List[Any]] = None,
+        is_sample: bool = False,
+    ) -> None:
+        """Update buy and/or sell orders in a single call."""
+        if buy_orders is not None:
+            self.set_buy_orders(buy_orders, is_sample=is_sample)
+        if sell_orders is not None:
+            self.set_sell_orders(sell_orders, is_sample=is_sample)
+
+    def get_buy_depth(self, max_levels: int = 5) -> List[PriceLevel]:
+        """Return the current top BUY order-book depth up to max_levels levels (highest price first)."""
+        return calculate_buy_depth(self.buy_orders, max_levels=max_levels)
+
+    def get_sell_depth(self, max_levels: int = 5) -> List[PriceLevel]:
+        """Return the current top SELL order-book depth up to max_levels levels (lowest price first)."""
+        return calculate_sell_depth(self.sell_orders, max_levels=max_levels)
+
+    def get_depth_rows(
+        self, max_levels: int = 5
+    ) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+        """Return formatted (bid_rows, ask_rows) for the top max_levels depth."""
+        return (
+            format_depth_rows(self.get_buy_depth(max_levels=max_levels), max_levels=max_levels),
+            format_depth_rows(self.get_sell_depth(max_levels=max_levels), max_levels=max_levels),
+        )
+
     # ------------------------------------------------------------------
     # Size checking
     # ------------------------------------------------------------------
@@ -1366,6 +2675,14 @@ class TerminalDashboard:
         sell_orders: Optional[List[Any]] = None,
         orders_processed: Optional[int] = None,
         throughput: Optional[Union[float, int, str]] = None,
+        trades_processed: Optional[Union[int, str]] = None,
+        trade_latency: Optional[Union[float, int, str]] = None,
+        trade_latency_avg: Optional[Union[float, int, str]] = None,
+        trade_latency_min: Optional[Union[float, int, str]] = None,
+        trade_latency_max: Optional[Union[float, int, str]] = None,
+        trade_latency_unit: Optional[str] = None,
+        audit_status: Optional[Union[AuditStatusInfo, Dict[str, Any], Any]] = None,
+        whale: Optional[WhaleOrderEvent] = None,
     ) -> List[str]:
         """Generate all display lines for the current state.
 
@@ -1389,6 +2706,7 @@ class TerminalDashboard:
 
         b_orders = self.buy_orders if buy_orders is None else buy_orders
         s_orders = self.sell_orders if sell_orders is None else sell_orders
+        _whale = whale if whale is not None else self._last_whale_event
 
         best_bid_obj = calculate_best_bid(b_orders)
         best_bid_str = format_best_bid_price(best_bid_obj.price)
@@ -1438,6 +2756,52 @@ class TerminalDashboard:
         lines.append("")
         lines += build_order_book_lines(width, bid_rows=bid_rows, ask_rows=ask_rows)
         lines.append("")
+        # Trade execution metrics
+        trades_cnt = self.trades_processed if trades_processed is None else trades_processed
+        if isinstance(trades_cnt, int):
+            trades_str = format_trades_processed(trades_cnt)
+        elif trades_cnt is None:
+            trades_str = NO_SAMPLE_LATENCY
+        else:
+            trades_str = str(trades_cnt)
+
+        t_unit = trade_latency_unit or self._trade_latency_unit
+        if trade_latency is not None:
+            trade_lat_str = (
+                format_trade_latency(trade_latency, unit=t_unit)
+                if isinstance(trade_latency, (int, float)) and not isinstance(trade_latency, bool)
+                else str(trade_latency)
+            )
+        else:
+            trade_lat_str = self.get_trade_latency_display()
+
+        if trade_latency_avg is not None:
+            trade_lat_avg_str = (
+                format_trade_latency(trade_latency_avg, unit=t_unit)
+                if isinstance(trade_latency_avg, (int, float)) and not isinstance(trade_latency_avg, bool)
+                else str(trade_latency_avg)
+            )
+        else:
+            trade_lat_avg_str = self.get_trade_latency_avg_display()
+
+        if trade_latency_min is not None:
+            trade_lat_min_str = (
+                format_trade_latency(trade_latency_min, unit=t_unit)
+                if isinstance(trade_latency_min, (int, float)) and not isinstance(trade_latency_min, bool)
+                else str(trade_latency_min)
+            )
+        else:
+            trade_lat_min_str = self.get_trade_latency_min_display()
+
+        if trade_latency_max is not None:
+            trade_lat_max_str = (
+                format_trade_latency(trade_latency_max, unit=t_unit)
+                if isinstance(trade_latency_max, (int, float)) and not isinstance(trade_latency_max, bool)
+                else str(trade_latency_max)
+            )
+        else:
+            trade_lat_max_str = self.get_trade_latency_max_display()
+
         lines += build_performance_lines(
             width,
             total_orders=total_orders_str,
@@ -1446,6 +2810,24 @@ class TerminalDashboard:
             latency_avg=latency_avg_str,
         )
         lines.append("")
+        lines += build_trade_execution_lines(
+            width,
+            trades_processed=trades_str,
+            latency=trade_lat_str,
+            latency_avg=trade_lat_avg_str,
+            latency_min=trade_lat_min_str,
+            latency_max=trade_lat_max_str,
+            unit=t_unit,
+        )
+        lines.append("")
+        eff_audit = audit_status if audit_status is not None else self._audit_status
+        lines += build_audit_status_lines(width, audit_status=eff_audit)
+        lines.append("")
+        eff_whale = whale if whale is not None else self._last_whale_event
+        whale_lines = build_whale_alert_lines(width, whale=eff_whale)
+        if whale_lines:
+            lines += whale_lines
+            lines.append("")
         lines += build_footer_lines(width)
         return lines
 
@@ -1527,16 +2909,23 @@ class TerminalDashboard:
             "title": 0, "subtitle": 0, "border": 0,
             "section": 0, "label": 0, "value": 0,
             "bid": 0, "ask": 0, "quit": 0,
+            "whale_buy": 0, "whale_sell": 0,
+            "whale_alert": 0, "whale_badge": 0,
         }
         if curses is None:
             return attrs
 
         bold = getattr(curses, "A_BOLD", 0)
         dim = getattr(curses, "A_DIM", 0)
+        standout = getattr(curses, "A_STANDOUT", bold)
         attrs["title"] = bold
         attrs["section"] = bold
         attrs["border"] = dim
         attrs["quit"] = dim
+        attrs["whale_buy"] = bold
+        attrs["whale_sell"] = bold
+        attrs["whale_alert"] = bold
+        attrs["whale_badge"] = standout
 
         if self._has_colors_safe():
             try:
@@ -1548,6 +2937,10 @@ class TerminalDashboard:
                 attrs["bid"] = curses.color_pair(6)
                 attrs["ask"] = curses.color_pair(7)
                 attrs["quit"] = dim | curses.color_pair(3)
+                attrs["whale_buy"] = bold | curses.color_pair(2)
+                attrs["whale_sell"] = bold | curses.color_pair(7)
+                attrs["whale_alert"] = bold | curses.color_pair(3)
+                attrs["whale_badge"] = bold | curses.color_pair(3)
             except Exception:
                 pass
         return attrs
@@ -1559,6 +2952,14 @@ class TerminalDashboard:
         sell_orders: Optional[List[Any]] = None,
         orders_processed: Optional[int] = None,
         throughput: Optional[Union[float, int, str]] = None,
+        trades_processed: Optional[Union[int, str]] = None,
+        trade_latency: Optional[Union[float, int, str]] = None,
+        trade_latency_avg: Optional[Union[float, int, str]] = None,
+        trade_latency_min: Optional[Union[float, int, str]] = None,
+        trade_latency_max: Optional[Union[float, int, str]] = None,
+        trade_latency_unit: Optional[str] = None,
+        audit_status: Optional[Union[AuditStatusInfo, Dict[str, Any], Any]] = None,
+        whale: Optional[WhaleOrderEvent] = None,
     ) -> None:
         """Render a single frame of the dashboard onto the curses window."""
         try:
@@ -1580,6 +2981,14 @@ class TerminalDashboard:
                 sell_orders=sell_orders,
                 orders_processed=orders_processed,
                 throughput=throughput,
+                trades_processed=trades_processed,
+                trade_latency=trade_latency,
+                trade_latency_avg=trade_latency_avg,
+                trade_latency_min=trade_latency_min,
+                trade_latency_max=trade_latency_max,
+                trade_latency_unit=trade_latency_unit,
+                audit_status=audit_status,
+                whale=whale,
             )
             for idx, line in enumerate(lines):
                 self._safe_addstr(stdscr, idx, 0, line)
@@ -1597,6 +3006,7 @@ class TerminalDashboard:
 
         b_orders = self.buy_orders if buy_orders is None else buy_orders
         s_orders = self.sell_orders if sell_orders is None else sell_orders
+        _whale = whale if whale is not None else self._last_whale_event
 
         best_bid_obj = calculate_best_bid(b_orders)
         best_bid_str = format_best_bid_price(best_bid_obj.price)
@@ -1627,7 +3037,8 @@ class TerminalDashboard:
 
         def blank() -> None:
             nonlocal y
-            y += 1
+            if max_y >= 45:
+                y += 1
 
         border = "=" * width
         divider = "-" * width
@@ -1667,13 +3078,41 @@ class TerminalDashboard:
         put(sub_hdr, attrs["label"])
 
         max_rows = max(len(bid_rows), len(ask_rows))
+        swept_prices: set = set()
+        if _whale is not None and getattr(_whale, "prices", None):
+            try:
+                swept_prices = {round(float(p), 6) for p in _whale.prices}
+            except Exception:
+                swept_prices = set()
+
         for i in range(max_rows):
             bp, bq = bid_rows[i] if i < len(bid_rows) else (PLACEHOLDER, PLACEHOLDER)
             ap, aq = ask_rows[i] if i < len(ask_rows) else (PLACEHOLDER, PLACEHOLDER)
             bid_cell = f"  {bp:>8}  {bq:>6}"
             ask_cell = f"  {ap:>8}  {aq:>6}"
-            self._safe_addstr(stdscr, y, start_x, f"{bid_cell:<{half + 2}}", attrs["bid"])
-            self._safe_addstr(stdscr, y, start_x + half + 2, ask_cell, attrs["ask"])
+
+            bid_attr = attrs["bid"]
+            if swept_prices and bp != PLACEHOLDER:
+                try:
+                    if round(float(bp), 6) in swept_prices:
+                        bid_attr = (
+                            attrs["whale_sell"] if _whale.side == 2 else attrs["whale_buy"]
+                        ) | (curses.A_BOLD if curses is not None else 0)
+                except (ValueError, TypeError):
+                    pass
+
+            ask_attr = attrs["ask"]
+            if swept_prices and ap != PLACEHOLDER:
+                try:
+                    if round(float(ap), 6) in swept_prices:
+                        ask_attr = (
+                            attrs["whale_buy"] if _whale.side == 1 else attrs["whale_sell"]
+                        ) | (curses.A_BOLD if curses is not None else 0)
+                except (ValueError, TypeError):
+                    pass
+
+            self._safe_addstr(stdscr, y, start_x, f"{bid_cell:<{half + 2}}", bid_attr)
+            self._safe_addstr(stdscr, y, start_x + half + 2, ask_cell, ask_attr)
             y += 1
 
         put(divider, attrs["border"])
@@ -1695,6 +3134,63 @@ class TerminalDashboard:
         latency_str = self.get_latency_display()
         latency_avg_str = self.get_latency_avg_display()
 
+        # Trade execution strings
+        trades_cnt = self.trades_processed if trades_processed is None else trades_processed
+        if isinstance(trades_cnt, int):
+            trades_str = format_trades_processed(trades_cnt)
+        elif trades_cnt is None:
+            trades_str = NO_SAMPLE_LATENCY
+        else:
+            trades_str = str(trades_cnt)
+
+        t_unit = trade_latency_unit or self._trade_latency_unit
+        if trade_latency is not None:
+            trade_lat_str = (
+                format_trade_latency(trade_latency, unit=t_unit)
+                if isinstance(trade_latency, (int, float)) and not isinstance(trade_latency, bool)
+                else str(trade_latency)
+            )
+        else:
+            trade_lat_str = self.get_trade_latency_display()
+
+        if trade_latency_avg is not None:
+            trade_lat_avg_str = (
+                format_trade_latency(trade_latency_avg, unit=t_unit)
+                if isinstance(trade_latency_avg, (int, float)) and not isinstance(trade_latency_avg, bool)
+                else str(trade_latency_avg)
+            )
+        else:
+            trade_lat_avg_str = self.get_trade_latency_avg_display()
+
+        if trade_latency_min is not None:
+            trade_lat_min_str = (
+                format_trade_latency(trade_latency_min, unit=t_unit)
+                if isinstance(trade_latency_min, (int, float)) and not isinstance(trade_latency_min, bool)
+                else str(trade_latency_min)
+            )
+        else:
+            trade_lat_min_str = self.get_trade_latency_min_display()
+
+        if trade_latency_max is not None:
+            trade_lat_max_str = (
+                format_trade_latency(trade_latency_max, unit=t_unit)
+                if isinstance(trade_latency_max, (int, float)) and not isinstance(trade_latency_max, bool)
+                else str(trade_latency_max)
+            )
+        else:
+            trade_lat_max_str = self.get_trade_latency_max_display()
+
+        if t_unit.lower() == "us":
+            lbl_trade_last = LABEL_TRADE_LATENCY
+            lbl_trade_avg = LABEL_TRADE_LATENCY_AVG
+            lbl_trade_min = LABEL_TRADE_LATENCY_MIN
+            lbl_trade_max = LABEL_TRADE_LATENCY_MAX
+        else:
+            lbl_trade_last = f"Last Execution Latency ({t_unit})"
+            lbl_trade_avg = f"Avg Execution Latency ({t_unit})"
+            lbl_trade_min = f"Min Execution Latency ({t_unit})"
+            lbl_trade_max = f"Max Execution Latency ({t_unit})"
+
         # ---- Performance Metrics ----
         put(f"  {SECTION_PERFORMANCE}", attrs["section"])
         put(divider, attrs["border"])
@@ -1705,7 +3201,72 @@ class TerminalDashboard:
         put(divider, attrs["border"])
         blank()
 
+        # ---- Trade Execution Metrics ----
+        put(f"  {SECTION_TRADE_EXECUTION}", attrs["section"])
+        put(divider, attrs["border"])
+        put(f"  {LABEL_TRADES_PROCESSED:<{col_w - 10}} {trades_str:>8}", attrs["label"])
+        put(f"  {lbl_trade_last:<{col_w - 10}} {trade_lat_str:>8}", attrs["label"])
+        put(f"  {lbl_trade_avg:<{col_w - 10}} {trade_lat_avg_str:>8}", attrs["label"])
+        put(f"  {lbl_trade_min:<{col_w - 10}} {trade_lat_min_str:>8}", attrs["label"])
+        put(f"  {lbl_trade_max:<{col_w - 10}} {trade_lat_max_str:>8}", attrs["label"])
+        put(divider, attrs["border"])
+        blank()
+
+        # ---- Audit & Persistence Status ----
+        eff_audit = audit_status if audit_status is not None else self._audit_status
+        _audit_lines = build_audit_status_lines(width, audit_status=eff_audit)
+        for _al in _audit_lines:
+            _stripped = _al.strip()
+            if _stripped.startswith("-") or _stripped.startswith("="):
+                put(_al, attrs["border"])
+            elif SECTION_AUDIT_STATUS in _stripped:
+                put(_al, attrs["section"])
+            else:
+                put(_al, attrs["label"])
+        blank()
+
+        # ---- Whale Order Alert ----
+        if _whale is not None:
+            _whale_lines = build_whale_alert_lines(width, whale=_whale)
+            is_buy = _whale.side in (1, "1", "BUY", "buy")
+            is_sell = _whale.side in (2, "2", "SELL", "sell")
+            side_attr = (
+                attrs["whale_buy"]
+                if is_buy
+                else attrs["whale_sell"]
+                if is_sell
+                else attrs["whale_alert"]
+            )
+            for _wl in _whale_lines:
+                if y >= max_y - 2:
+                    break
+                _stripped = _wl.strip()
+                if _stripped.startswith("\u26a1") or SECTION_WHALE_ALERT in _wl:
+                    header_attr = (
+                        attrs["whale_buy"]
+                        if is_buy
+                        else attrs["whale_sell"]
+                        if is_sell
+                        else attrs["whale_alert"]
+                    )
+                    put(_wl, header_attr | (curses.A_BOLD if curses is not None else 0))
+                elif _stripped.startswith("-") or _stripped.startswith("="):
+                    put(_wl, attrs["border"])
+                elif LABEL_WHALE_SIDE in _wl:
+                    put(_wl, side_attr | (curses.A_BOLD if curses is not None else 0))
+                elif (
+                    LABEL_WHALE_LEVELS in _wl
+                    or LABEL_WHALE_VOLUME in _wl
+                    or "Swept:" in _wl
+                ):
+                    put(_wl, side_attr)
+                else:
+                    put(_wl, attrs["value"])
+            blank()
+
         # ---- Footer ----
+        if y + 2 > max_y:
+            y = max_y - 2
         put(f"  {QUIT_MESSAGE}", attrs["quit"])
         put(border, attrs["border"])
 
