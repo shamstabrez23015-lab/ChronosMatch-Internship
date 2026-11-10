@@ -138,7 +138,9 @@ class LiveFeedBridge:
         if self.dashboard is not None and trades:
             _raw_side = None
             try:
-                if hasattr(raw_order, "side"):
+                if isinstance(raw_order, dict):
+                    _raw_side = raw_order.get("side")
+                elif hasattr(raw_order, "side"):
                     _raw_side = raw_order.side
                 elif isinstance(raw_order, (tuple, list)) and len(raw_order) >= 6:
                     _raw_side = raw_order[5]
