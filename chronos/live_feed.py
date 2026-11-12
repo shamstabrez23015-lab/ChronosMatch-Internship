@@ -146,10 +146,14 @@ class LiveFeedBridge:
                     _raw_side = raw_order[5]
             except Exception:
                 _raw_side = None
+            _min_levels = 2
+            if self.dashboard is not None and hasattr(self.dashboard, "config"):
+                _min_levels = getattr(self.dashboard.config, "whale_min_levels", 2)
             _whale = detect_whale_order(
                 order_id=order_id if order_id is not None else 0,
                 trades=trades,
                 side=_raw_side,
+                min_levels=_min_levels,
             )
             if _whale is not None and hasattr(self.dashboard, "record_whale_order"):
                 self.dashboard.record_whale_order(_whale)
@@ -180,6 +184,12 @@ class LiveFeedBridge:
                 self.dashboard.update_trade_latency(
                     self.adapter.get_trade_latency_snapshot()
                 )
+            except Exception:
+                pass
+            try:
+                if hasattr(self.adapter, "audit_worker") and self.adapter.audit_worker is not None:
+                    if hasattr(self.dashboard, "update_audit_status"):
+                        self.dashboard.update_audit_status(self.adapter.audit_worker)
             except Exception:
                 pass
 
